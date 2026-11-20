@@ -27,17 +27,29 @@ namespace MiniCAD
         float maxDepth = 1.0f;
     };
 
-    enum class PaintTintMode : uint8_t { None = 0, Monochrome = 1 };
-    enum class PaintBlendMode : uint8_t { Alpha = 0, Screen = 1 };
-
     struct PaintStyle
     {
-        PaintTintMode  TintMode  = PaintTintMode::None;
-        PaintBlendMode BlendMode = PaintBlendMode::Alpha;
-        float TintR   = 1.0f;
-        float TintG   = 1.0f;
-        float TintB   = 1.0f;
         float Opacity = 1.0f;
+    };
+
+    // 双离屏底片三态差异合成参数：
+    //   - 两图重合像素按 OverlapRGB * OverlapOpacity 混合（0 = 隐藏相同部分，只看纯差异）
+    //   - 仅主图覆盖像素按 MainRGB * MainOpacity 混合
+    //   - 仅对比图覆盖像素按 CompareRGB * CompareOpacity 混合
+    struct CompareCompositeStyle
+    {
+        float MainR          = 0.133f;
+        float MainG          = 0.827f;
+        float MainB          = 0.478f;
+        float MainOpacity    = 1.0f;
+        float CompareR       = 1.000f;
+        float CompareG       = 0.361f;
+        float CompareB       = 0.361f;
+        float CompareOpacity = 1.0f;
+        float OverlapR       = 0.612f;
+        float OverlapG       = 0.639f;
+        float OverlapB       = 0.686f;
+        float OverlapOpacity = 0.40f;
     };
 
     struct ScissorRect
@@ -170,6 +182,13 @@ namespace MiniCAD
         virtual std::unique_ptr<IRenderTarget> CreateLayerTarget() { return nullptr; }
         // 把缓存层的内容原样复制到当前帧的渲染目标（BeginFrame 之后调用，尺寸必须相同）
         virtual void DrawLayer(IRenderTarget& layer) { (void)layer; }
+        // 把两张透明离屏底片（主图、对比图）按覆盖关系做三态差异合成并叠画到当前渲染目标
+        virtual bool CompositeCompareLayers(IRenderTarget& mainLayer, IRenderTarget& compareLayer,
+                                            const CompareCompositeStyle& style)
+        {
+            (void)mainLayer; (void)compareLayer; (void)style;
+            return false;
+        }
 
         // 背景深浅（AutoCAD 的 7 号色语义）：浅色背景时纯白顶点画成纯黑，深色背景时纯黑画成纯白，
         // 白色的实体、图层颜色、十字光标在两种背景下都看得见。只影响线 / 三角形 / 文字，不影响光栅图像

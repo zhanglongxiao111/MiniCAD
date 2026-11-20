@@ -47,6 +47,8 @@ namespace MiniCAD
 
         std::unique_ptr<IRenderTarget> CreateLayerTarget() override;
         void  DrawLayer(IRenderTarget& layer) override;
+        bool  CompositeCompareLayers(IRenderTarget& mainLayer, IRenderTarget& compareLayer,
+                                     const CompareCompositeStyle& style) override;
         void  SetLightBackground(bool light) override { m_lightBackground = light; }
         void  SetPaintStyle(const PaintStyle& style) override { m_paintStyle = style; }
         void  SetScissorRect(const ScissorRect& rect) override;
@@ -60,11 +62,19 @@ namespace MiniCAD
 
         struct ProgramInfo
         {
-            GLuint program   = 0;
-            GLint  viewProj  = -1;
-            GLint  light     = -1;
-            GLint  paintMode = -1;
-            GLint  tintColor = -1;
+            GLuint program  = 0;
+            GLint  viewProj = -1;
+            GLint  light    = -1;
+            GLint  opacity  = -1;
+        };
+
+        struct CompareProgramInfo
+        {
+            GLuint program      = 0;
+            GLint  mainColor    = -1;
+            GLint  compColor    = -1;
+            GLint  overlapColor = -1;
+            GLuint vao          = 0;
         };
 
         // 一个顶点数组对象 + 顶点缓冲（持久缓存或每帧流式上传）
@@ -85,8 +95,9 @@ namespace MiniCAD
         VertexBuffer& Cached(std::unordered_map<uint32_t, VertexBuffer>& cache, uint32_t slot, bool textured);
 
     private:
-        ProgramInfo  m_programs[4];
-        VertexBuffer m_stream;          // Vertex_P3_C4，每次提交重新上传
+        ProgramInfo        m_programs[4];
+        CompareProgramInfo m_compareProgram;
+        VertexBuffer       m_stream;          // Vertex_P3_C4，每次提交重新上传
         VertexBuffer m_textStream;      // Vertex_P3_C4_UV
         std::unordered_map<uint32_t, VertexBuffer> m_cached;
         std::unordered_map<uint32_t, VertexBuffer> m_cachedText;

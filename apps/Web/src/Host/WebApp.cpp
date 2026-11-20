@@ -629,10 +629,10 @@ namespace MiniCAD
             return g_app && searchRoot ? g_app->GetFrame().EmbedReloadCompareXrefs(searchRoot) : 0;
         }
 
-        EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_SetCompareState(int mode, double scale, double dx, double dy, float opacity, float splitRatio, int soloCompare)
+        EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_SetCompareState(int mode, double scale, double dx, double dy, float overlapOpacity, float splitRatio, int soloCompare, int showMain, int showCompare)
         {
             if (g_app)
-                g_app->GetFrame().EmbedSetCompareState(mode, scale, dx, dy, opacity, splitRatio, soloCompare != 0);
+                g_app->GetFrame().EmbedSetCompareState(mode, scale, dx, dy, overlapOpacity, splitRatio, soloCompare != 0, showMain != 0, showCompare != 0);
         }
 
         EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_StartPickPoint(int seq, int target)

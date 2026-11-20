@@ -196,19 +196,28 @@ namespace MiniCAD
 
         const uint64_t sceneVersion = resolveSceneVersion(viewState, 0);
         const bool hasCompare = compare && compare->State && compare->Mode != CompareDisplayMode::Off;
-        const bool forceDarkCompare = hasCompare && (compare->Mode == CompareDisplayMode::Blend || compare->Mode == CompareDisplayMode::AlignPickMain);
-        const bool effectiveLight = forceDarkCompare ? false : m_lightBackground;
+        const bool effectiveLight = m_lightBackground;
         renderer.SetLightBackground(effectiveLight);
-        if (hasCompare)
+        auto applyBackgroundClear = [&]
         {
-            if (effectiveLight)
-                renderer.SetClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+            if (hasCompare)
+            {
+                if (effectiveLight)
+                    renderer.SetClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+                else
+                    renderer.SetClearColor(30.0f / 255.0f, 31.0f / 255.0f, 34.0f / 255.0f, 1.0f);
+            }
             else
-                renderer.SetClearColor(30.0f / 255.0f, 31.0f / 255.0f, 34.0f / 255.0f, 1.0f);
-        }
-        else
+            {
+                renderer.SetClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        };
+        if (!hasCompare)
         {
-            renderer.SetClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            m_compareMainLayer.reset();
+            m_compareOtherLayer.reset();
+            m_compareMainValid  = false;
+            m_compareOtherValid = false;
         }
         uint64_t compSceneVersion = 0;
         Math::Mat4 compVp = vpWorld, compVpLines = vpWorldLines, compVpSilhouettes = vpWorldSilhouettes;
@@ -255,6 +264,156 @@ namespace MiniCAD
         };
 
         const int pw = static_cast<int>(m_width), ph = static_cast<int>(m_height);
+        const bool useDiffComposite = hasCompare
+            && (compare->Mode == CompareDisplayMode::Blend || compare->Mode == CompareDisplayMode::AlignPickMain);
+
+        // ── 缓存层：键 = 场景版本 + 视图版本（相机 / 尺寸 / 开关）+ 字体纹理 + 对比状态 ──
+        if (!m_layerTried)
+        {
+            m_layerTried = true;
+            m_sceneLayer = renderer.CreateLayerTarget();
+        }
+        uint64_t key = 1469598103934665603ull;
+        bool needSceneRedraw = true;
+        if (m_sceneLayer && pw > 0 && ph > 0)
+        {
+            if (m_sceneLayer->GetWidth() != pw || m_sceneLayer->GetHeight() != ph)
+            {
+                m_sceneLayer->Resize(pw, ph);
+                m_layerValid = false;
+            }
+            key = HashCombine(key, &sceneVersion, sizeof(sceneVersion));
+            key = HashCombine(key, &viewState.SceneDynVersion, sizeof(viewState.SceneDynVersion));
+            key = HashCombine(key, &viewState.GlyphMeshes.Version, sizeof(viewState.GlyphMeshes.Version));
+            key = HashCombine(key, &viewState.SceneGlyphVersion, sizeof(viewState.SceneGlyphVersion));
+            key = HashCombine(key, &m_viewVersion, sizeof(m_viewVersion));
+            key = HashCombine(key, &viewState.FontTexture, sizeof(viewState.FontTexture));
+            key = HashCombine(key, &effectiveLight, sizeof(effectiveLight));
+            key = HashCombine(key, &viewState.ShadedVersion, sizeof(viewState.ShadedVersion));
+            key = HashCombine(key, &viewState.RenderOrigin, sizeof(viewState.RenderOrigin));
+            const unsigned char compFlag = hasCompare ? 1 : 0;
+            key = HashCombine(key, &compFlag, sizeof(compFlag));
+            if (hasCompare)
+            {
+                key = HashCombine(key, &compare->Mode, sizeof(compare->Mode));
+                key = HashCombine(key, &compare->Dx, sizeof(compare->Dx));
+                key = HashCombine(key, &compare->Dy, sizeof(compare->Dy));
+                key = HashCombine(key, &compare->Scale, sizeof(compare->Scale));
+                key = HashCombine(key, &compare->OverlapOpacity, sizeof(compare->OverlapOpacity));
+                key = HashCombine(key, &compare->ShowMain, sizeof(compare->ShowMain));
+                key = HashCombine(key, &compare->ShowCompare, sizeof(compare->ShowCompare));
+                key = HashCombine(key, &compare->SplitX, sizeof(compare->SplitX));
+                key = HashCombine(key, &compare->SoloCompare, sizeof(compare->SoloCompare));
+                key = HashCombine(key, &compSceneVersion, sizeof(compSceneVersion));
+                key = HashCombine(key, &compare->State->SceneDynVersion, sizeof(compare->State->SceneDynVersion));
+                key = HashCombine(key, &compare->State->GlyphMeshes.Version, sizeof(compare->State->GlyphMeshes.Version));
+                key = HashCombine(key, &compare->State->SceneGlyphVersion, sizeof(compare->State->SceneGlyphVersion));
+                key = HashCombine(key, &compare->State->FontTexture, sizeof(compare->State->FontTexture));
+                key = HashCombine(key, &compare->State->ShadedVersion, sizeof(compare->State->ShadedVersion));
+                key = HashCombine(key, &compare->State->RenderOrigin, sizeof(compare->State->RenderOrigin));
+            }
+            needSceneRedraw = (!m_layerValid || key != m_layerKey);
+        }
+
+        // 双离屏三态底片：仅在需要重画合成帧时按主/副图各自键独立刷新
+        if (needSceneRedraw && useDiffComposite && pw > 0 && ph > 0)
+        {
+            if (!m_compareMainLayer)  m_compareMainLayer  = renderer.CreateLayerTarget();
+            if (!m_compareOtherLayer) m_compareOtherLayer = renderer.CreateLayerTarget();
+            if (m_compareMainLayer && m_compareOtherLayer)
+            {
+                if (m_compareMainLayer->GetWidth() != pw || m_compareMainLayer->GetHeight() != ph)
+                {
+                    m_compareMainLayer->Resize(pw, ph);
+                    m_compareMainValid = false;
+                }
+                if (m_compareOtherLayer->GetWidth() != pw || m_compareOtherLayer->GetHeight() != ph)
+                {
+                    m_compareOtherLayer->Resize(pw, ph);
+                    m_compareOtherValid = false;
+                }
+
+                uint64_t mainKey = 1469598103934665603ull;
+                mainKey = HashCombine(mainKey, &sceneVersion, sizeof(sceneVersion));
+                mainKey = HashCombine(mainKey, &viewState.SceneDynVersion, sizeof(viewState.SceneDynVersion));
+                mainKey = HashCombine(mainKey, &viewState.GlyphMeshes.Version, sizeof(viewState.GlyphMeshes.Version));
+                mainKey = HashCombine(mainKey, &viewState.SceneGlyphVersion, sizeof(viewState.SceneGlyphVersion));
+                mainKey = HashCombine(mainKey, &m_viewVersion, sizeof(m_viewVersion));
+                mainKey = HashCombine(mainKey, &viewState.FontTexture, sizeof(viewState.FontTexture));
+                mainKey = HashCombine(mainKey, &viewState.ShadedVersion, sizeof(viewState.ShadedVersion));
+                mainKey = HashCombine(mainKey, &viewState.RenderOrigin, sizeof(viewState.RenderOrigin));
+
+                if (!m_compareMainValid || mainKey != m_compareMainKey)
+                {
+                    renderer.SetClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                    renderer.BeginFrame(*m_compareMainLayer, m_viewportDesc);
+                    renderer.SetScissorRect({});
+                    renderer.SetPaintStyle({});
+                    drawScenePass(viewState, sceneVersion, 0, vp, vpLines, vpSilhouettes, false);
+                    renderer.EndFrame();
+                    m_compareMainKey   = mainKey;
+                    m_compareMainValid = true;
+                }
+
+                uint64_t otherKey = 1469598103934665603ull;
+                otherKey = HashCombine(otherKey, &compSceneVersion, sizeof(compSceneVersion));
+                otherKey = HashCombine(otherKey, &compare->State->SceneDynVersion, sizeof(compare->State->SceneDynVersion));
+                otherKey = HashCombine(otherKey, &compare->State->GlyphMeshes.Version, sizeof(compare->State->GlyphMeshes.Version));
+                otherKey = HashCombine(otherKey, &compare->State->SceneGlyphVersion, sizeof(compare->State->SceneGlyphVersion));
+                otherKey = HashCombine(otherKey, &m_viewVersion, sizeof(m_viewVersion));
+                otherKey = HashCombine(otherKey, &compare->State->FontTexture, sizeof(compare->State->FontTexture));
+                otherKey = HashCombine(otherKey, &compare->State->ShadedVersion, sizeof(compare->State->ShadedVersion));
+                otherKey = HashCombine(otherKey, &compare->State->RenderOrigin, sizeof(compare->State->RenderOrigin));
+                otherKey = HashCombine(otherKey, &compare->Dx, sizeof(compare->Dx));
+                otherKey = HashCombine(otherKey, &compare->Dy, sizeof(compare->Dy));
+                otherKey = HashCombine(otherKey, &compare->Scale, sizeof(compare->Scale));
+
+                if (!m_compareOtherValid || otherKey != m_compareOtherKey)
+                {
+                    renderer.SetClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                    renderer.BeginFrame(*m_compareOtherLayer, m_viewportDesc);
+                    renderer.SetScissorRect({});
+                    renderer.SetPaintStyle({});
+                    drawScenePass(*compare->State, compSceneVersion, kCompareSlotOffset, compVp, compVpLines, compVpSilhouettes, false);
+                    renderer.EndFrame();
+                    m_compareOtherKey   = otherKey;
+                    m_compareOtherValid = true;
+                }
+            }
+        }
+
+        auto buildCompositeStyle = [&](bool aligning) -> CompareCompositeStyle
+        {
+            CompareCompositeStyle style{};
+            if (effectiveLight)
+            {
+                // 浅色背景：深翠绿（当前图）/ 正红（对比图）/ 清淡铅笔灰（相同重合）
+                style.MainR    = 0.059f; style.MainG    = 0.616f; style.MainB    = 0.345f;
+                style.CompareR = 0.863f; style.CompareG = 0.149f; style.CompareB = 0.149f;
+                style.OverlapR = 0.420f; style.OverlapG = 0.447f; style.OverlapB = 0.502f;
+            }
+            else
+            {
+                // 深色背景：翠绿（当前图）/ 珊瑚红（对比图）/ 低调暗灰（相同重合）
+                style.MainR    = 0.133f; style.MainG    = 0.827f; style.MainB    = 0.478f;
+                style.CompareR = 1.000f; style.CompareG = 0.361f; style.CompareB = 0.361f;
+                style.OverlapR = 0.612f; style.OverlapG = 0.639f; style.OverlapB = 0.686f;
+            }
+            if (aligning)
+            {
+                style.MainOpacity    = 1.0f;
+                style.CompareOpacity = 1.0f;
+                style.OverlapOpacity = 0.42f;
+            }
+            else
+            {
+                style.MainOpacity    = compare->ShowMain    ? 1.0f : 0.0f;
+                style.CompareOpacity = compare->ShowCompare ? 1.0f : 0.0f;
+                style.OverlapOpacity = std::clamp(compare->OverlapOpacity, 0.0f, 1.0f);
+            }
+            return style;
+        };
+
         auto drawStatic = [&]
         {
             renderer.SetScissorRect({});
@@ -272,15 +431,7 @@ namespace MiniCAD
                 return;
             }
 
-            constexpr PaintStyle kMainBlendStyle{ PaintTintMode::Monochrome, PaintBlendMode::Alpha, 0.0f, 0.90f, 1.0f, 1.0f };
-            const PaintStyle compBlendStyle{
-                PaintTintMode::Monochrome, PaintBlendMode::Screen, 1.0f, 0.28f, 0.16f,
-                std::clamp(compare->CompareOpacity, 0.0f, 1.0f)
-            };
-            const PaintStyle compAlignStyle{
-                PaintTintMode::Monochrome, PaintBlendMode::Screen, 1.0f, 0.28f, 0.16f, 0.82f
-            };
-            constexpr PaintStyle kDimMainStyle{ PaintTintMode::None, PaintBlendMode::Alpha, 1.0f, 1.0f, 1.0f, 0.22f };
+            constexpr PaintStyle kDimMainStyle{ 0.22f };
 
             switch (compare->Mode)
             {
@@ -291,14 +442,19 @@ namespace MiniCAD
                 drawScenePass(*compare->State, compSceneVersion, kCompareSlotOffset, compVp, compVpLines, compVpSilhouettes, false);
                 break;
             case CompareDisplayMode::Blend:
-                renderer.SetPaintStyle(kMainBlendStyle);
-                drawScenePass(viewState, sceneVersion, 0, vp, vpLines, vpSilhouettes, true);
-                if (compBlendStyle.Opacity > 0.001f)
+            case CompareDisplayMode::AlignPickMain:
+            {
+                const bool aligning = (compare->Mode == CompareDisplayMode::AlignPickMain);
+                if (m_compareMainLayer && m_compareOtherLayer
+                    && renderer.CompositeCompareLayers(*m_compareMainLayer, *m_compareOtherLayer, buildCompositeStyle(aligning)))
                 {
-                    renderer.SetPaintStyle(compBlendStyle);
-                    drawScenePass(*compare->State, compSceneVersion, kCompareSlotOffset, compVp, compVpLines, compVpSilhouettes, false);
+                    break;
                 }
+                drawScenePass(viewState, sceneVersion, 0, vp, vpLines, vpSilhouettes, true);
+                renderer.SetPaintStyle(PaintStyle{ 0.65f });
+                drawScenePass(*compare->State, compSceneVersion, kCompareSlotOffset, compVp, compVpLines, compVpSilhouettes, false);
                 break;
+            }
             case CompareDisplayMode::Split:
             {
                 const int sx = std::clamp(compare->SplitX, 0, pw);
@@ -324,12 +480,6 @@ namespace MiniCAD
                 renderer.SetPaintStyle({});
                 drawScenePass(*compare->State, compSceneVersion, kCompareSlotOffset, compVp, compVpLines, compVpSilhouettes, false);
                 break;
-            case CompareDisplayMode::AlignPickMain:
-                renderer.SetPaintStyle({});
-                drawScenePass(viewState, sceneVersion, 0, vp, vpLines, vpSilhouettes, true);
-                renderer.SetPaintStyle(compAlignStyle);
-                drawScenePass(*compare->State, compSceneVersion, kCompareSlotOffset, compVp, compVpLines, compVpSilhouettes, false);
-                break;
             default:
                 drawScenePass(viewState, sceneVersion, 0, vp, vpLines, vpSilhouettes, true);
                 break;
@@ -338,56 +488,15 @@ namespace MiniCAD
             renderer.SetPaintStyle({});
         };
 
-        // ── 缓存层：键 = 场景版本 + 视图版本（相机 / 尺寸 / 开关）+ 字体纹理 + 对比状态 ──
-        if (!m_layerTried)
+        applyBackgroundClear();
+        if (m_sceneLayer && pw > 0 && ph > 0 && needSceneRedraw)
         {
-            m_layerTried = true;
-            m_sceneLayer = renderer.CreateLayerTarget();
-        }
-        if (m_sceneLayer && pw > 0 && ph > 0)
-        {
-            if (m_sceneLayer->GetWidth() != pw || m_sceneLayer->GetHeight() != ph)
-            {
-                m_sceneLayer->Resize(pw, ph);
-                m_layerValid = false;
-            }
-            uint64_t key = 1469598103934665603ull;
-            key = HashCombine(key, &sceneVersion, sizeof(sceneVersion));
-            key = HashCombine(key, &viewState.SceneDynVersion, sizeof(viewState.SceneDynVersion));
-            key = HashCombine(key, &viewState.GlyphMeshes.Version, sizeof(viewState.GlyphMeshes.Version));
-            key = HashCombine(key, &viewState.SceneGlyphVersion, sizeof(viewState.SceneGlyphVersion));
-            key = HashCombine(key, &m_viewVersion, sizeof(m_viewVersion));
-            key = HashCombine(key, &viewState.FontTexture, sizeof(viewState.FontTexture));
-            key = HashCombine(key, &effectiveLight, sizeof(effectiveLight));
-            key = HashCombine(key, &viewState.ShadedVersion, sizeof(viewState.ShadedVersion));
-            const unsigned char compFlag = hasCompare ? 1 : 0;
-            key = HashCombine(key, &compFlag, sizeof(compFlag));
-            if (hasCompare)
-            {
-                key = HashCombine(key, &compare->Mode, sizeof(compare->Mode));
-                key = HashCombine(key, &compare->Dx, sizeof(compare->Dx));
-                key = HashCombine(key, &compare->Dy, sizeof(compare->Dy));
-                key = HashCombine(key, &compare->Scale, sizeof(compare->Scale));
-                key = HashCombine(key, &compare->CompareOpacity, sizeof(compare->CompareOpacity));
-                key = HashCombine(key, &compare->SplitX, sizeof(compare->SplitX));
-                key = HashCombine(key, &compare->SoloCompare, sizeof(compare->SoloCompare));
-                key = HashCombine(key, &compSceneVersion, sizeof(compSceneVersion));
-                key = HashCombine(key, &compare->State->SceneDynVersion, sizeof(compare->State->SceneDynVersion));
-                key = HashCombine(key, &compare->State->GlyphMeshes.Version, sizeof(compare->State->GlyphMeshes.Version));
-                key = HashCombine(key, &compare->State->SceneGlyphVersion, sizeof(compare->State->SceneGlyphVersion));
-                key = HashCombine(key, &compare->State->FontTexture, sizeof(compare->State->FontTexture));
-                key = HashCombine(key, &compare->State->ShadedVersion, sizeof(compare->State->ShadedVersion));
-                key = HashCombine(key, &compare->State->RenderOrigin, sizeof(compare->State->RenderOrigin));
-            }
-            if (!m_layerValid || key != m_layerKey)
-            {
-                renderer.BeginFrame(*m_sceneLayer, m_viewportDesc);
-                drawStatic();
-                renderer.EndFrame();
-                m_layerKey   = key;
-                m_layerValid = true;
-                ++m_layerRedraws;
-            }
+            renderer.BeginFrame(*m_sceneLayer, m_viewportDesc);
+            drawStatic();
+            renderer.EndFrame();
+            m_layerKey   = key;
+            m_layerValid = true;
+            ++m_layerRedraws;
         }
 
         renderer.BeginFrame(target, m_viewportDesc);

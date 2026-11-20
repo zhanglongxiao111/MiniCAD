@@ -101,39 +101,61 @@ namespace MiniCAD
             })";
 
         #define MINICAD_GL_APPLY_PAINT \
-            "uniform float uPaintMode;\n" \
-            "uniform vec4 uTintColor;\n" \
-            "vec4 ApplyPaint(vec4 c, bool isImage) {\n" \
-            "    float a = clamp(c.a * uTintColor.a, 0.0, 1.0);\n" \
-            "    vec3 rgb = c.rgb;\n" \
-            "    if (uPaintMode == 1.0 || uPaintMode == 3.0) {\n" \
-            "        float maxC = max(rgb.r, max(rgb.g, rgb.b));\n" \
-            "        float rawLum = clamp(max(dot(rgb, vec3(0.299, 0.587, 0.114)), maxC), 0.0, 1.0);\n" \
-            "        float lum = isImage ? clamp(dot(rgb, vec3(0.299, 0.587, 0.114)), 0.0, 1.0) : (0.80 + 0.20 * rawLum);\n" \
-            "        rgb = uTintColor.rgb * lum;\n" \
-            "    }\n" \
-            "    if (uPaintMode >= 1.5) return vec4(rgb * a, a);\n" \
-            "    return vec4(rgb, a);\n" \
+            "uniform float uOpacity;\n" \
+            "vec4 ApplyPaint(vec4 c) {\n" \
+            "    return vec4(c.rgb, clamp(c.a * uOpacity, 0.0, 1.0));\n" \
             "}\n"
 
         const char* kFragmentColor =
             "#version 300 es\nprecision mediump float;\n"
             MINICAD_GL_APPLY_PAINT
             "in vec4 vColor;\nout vec4 outColor;\n"
-            "void main() { outColor = ApplyPaint(vColor, false); }";
+            "void main() { outColor = ApplyPaint(vColor); }";
 
         // 文字：字形图集只用 alpha
         const char* kFragmentText =
             "#version 300 es\nprecision mediump float;\nuniform sampler2D uTex;\n"
             MINICAD_GL_APPLY_PAINT
             "in vec4 vColor;\nin vec2 vUV;\nout vec4 outColor;\n"
-            "void main() { outColor = ApplyPaint(vec4(vColor.rgb, vColor.a * texture(uTex, vUV).a), false); }";
+            "void main() { outColor = ApplyPaint(vec4(vColor.rgb, vColor.a * texture(uTex, vUV).a)); }";
 
         const char* kFragmentImage =
             "#version 300 es\nprecision mediump float;\nuniform sampler2D uTex;\n"
             MINICAD_GL_APPLY_PAINT
             "in vec4 vColor;\nin vec2 vUV;\nout vec4 outColor;\n"
-            "void main() { outColor = ApplyPaint(texture(uTex, vUV) * vColor, true); }";
+            "void main() { outColor = ApplyPaint(texture(uTex, vUV) * vColor); }";
+
+        // 全屏三角形：双离屏底片三态差异合成（按像素覆盖度判定 重合 / 仅主图 / 仅对比图）
+        const char* kVertexCompare = R"(#version 300 es
+            void main()
+            {
+                vec2 p = vec2((gl_VertexID == 1) ? 3.0 : -1.0, (gl_VertexID == 2) ? 3.0 : -1.0);
+                gl_Position = vec4(p, 0.0, 1.0);
+            })";
+
+        const char* kFragmentCompare = R"(#version 300 es
+            precision mediump float;
+            uniform sampler2D uMainTex;
+            uniform sampler2D uCompTex;
+            uniform vec4 uMainColor;
+            uniform vec4 uCompColor;
+            uniform vec4 uOverlapColor;
+            out vec4 outColor;
+            void main()
+            {
+                ivec2 dims = textureSize(uMainTex, 0);
+                ivec2 c = clamp(ivec2(gl_FragCoord.xy), ivec2(0), max(dims - ivec2(1), ivec2(0)));
+                float a = texelFetch(uMainTex, c, 0).a;
+                float b = texelFetch(uCompTex, c, 0).a;
+                float wOverlap = min(a, b) * uOverlapColor.a;
+                float wMain    = max(0.0, a - b) * uMainColor.a;
+                float wComp    = max(0.0, b - a) * uCompColor.a;
+                float totalW   = wOverlap + wMain + wComp;
+                if (totalW < 0.0005)
+                    discard;
+                vec3 rgb = (uOverlapColor.rgb * wOverlap + uMainColor.rgb * wMain + uCompColor.rgb * wComp) / totalW;
+                outColor = vec4(rgb, clamp(totalW, 0.0, 1.0));
+            })";
 
         GLuint Compile(GLenum type, const char* source)
         {
@@ -184,11 +206,10 @@ namespace MiniCAD
         for (int i = 0; i < 3; ++i)
         {
             ProgramInfo& info = m_programs[i];
-            info.program   = Link(i == 0 ? kVertexColor : kVertexTextured, fragments[i]);
-            info.viewProj  = glGetUniformLocation(info.program, "uViewProj");
-            info.light     = glGetUniformLocation(info.program, "uLight");
-            info.paintMode = glGetUniformLocation(info.program, "uPaintMode");
-            info.tintColor = glGetUniformLocation(info.program, "uTintColor");
+            info.program  = Link(i == 0 ? kVertexColor : kVertexTextured, fragments[i]);
+            info.viewProj = glGetUniformLocation(info.program, "uViewProj");
+            info.light    = glGetUniformLocation(info.program, "uLight");
+            info.opacity  = glGetUniformLocation(info.program, "uOpacity");
             if (i != 0)
             {
                 glUseProgram(info.program);
@@ -197,11 +218,10 @@ namespace MiniCAD
         }
         {
             ProgramInfo& info = m_programs[static_cast<int>(Program::Glyph)];
-            info.program   = Link(kVertexGlyph, kFragmentColor);
-            info.viewProj  = glGetUniformLocation(info.program, "uViewProj");
-            info.light     = glGetUniformLocation(info.program, "uLight");
-            info.paintMode = glGetUniformLocation(info.program, "uPaintMode");
-            info.tintColor = glGetUniformLocation(info.program, "uTintColor");
+            info.program  = Link(kVertexGlyph, kFragmentColor);
+            info.viewProj = glGetUniformLocation(info.program, "uViewProj");
+            info.light    = glGetUniformLocation(info.program, "uLight");
+            info.opacity  = glGetUniformLocation(info.program, "uOpacity");
         }
         InitVertexBuffer(m_stream, false);
         InitVertexBuffer(m_textStream, true);
@@ -226,6 +246,10 @@ namespace MiniCAD
                 glDeleteTextures(1, &im.tex);
         for (ProgramInfo& p : m_programs)
             glDeleteProgram(p.program);
+        if (m_compareProgram.program)
+            glDeleteProgram(m_compareProgram.program);
+        if (m_compareProgram.vao)
+            glDeleteVertexArrays(1, &m_compareProgram.vao);
     }
 
     void GLES3Renderer::ReleaseCachedResources()
@@ -367,15 +391,12 @@ namespace MiniCAD
         float m[16];
         for (int i = 0; i < 16; ++i)
             m[i] = static_cast<float>(viewProj.m[i]);
-        const float pm = (m_paintStyle.TintMode == PaintTintMode::Monochrome ? 1.0f : 0.0f)
-                       + (m_paintStyle.BlendMode == PaintBlendMode::Screen ? 2.0f : 0.0f);
-        const bool effectiveBlend = blend || (m_paintStyle.BlendMode == PaintBlendMode::Screen) || (m_paintStyle.Opacity < 0.999f);
+        const bool effectiveBlend = blend || (m_paintStyle.Opacity < 0.999f);
 
         glUseProgram(info.program);
         glUniformMatrix4fv(info.viewProj, 1, GL_FALSE, m);
         glUniform1f(info.light, p == Program::Image ? -1.0f : (m_lightBackground ? 1.0f : 0.0f));
-        glUniform1f(info.paintMode, pm);
-        glUniform4f(info.tintColor, m_paintStyle.TintR, m_paintStyle.TintG, m_paintStyle.TintB, m_paintStyle.Opacity);
+        glUniform1f(info.opacity, m_paintStyle.Opacity);
 
         // 深度：与 D3D11Renderer 相同——不测试 / 混合的只测试不写入 / 不混合的测试并写入（三维视图的着色面）
         if (!depth)
@@ -391,10 +412,7 @@ namespace MiniCAD
         {
             glEnable(GL_BLEND);
             glBlendEquation(GL_FUNC_ADD);
-            if (m_paintStyle.BlendMode == PaintBlendMode::Screen)
-                glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_COLOR, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-            else
-                glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         }
         else
         {
@@ -688,5 +706,61 @@ namespace MiniCAD
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst);
         glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
         glBindFramebuffer(GL_FRAMEBUFFER, dst);
+    }
+
+    bool GLES3Renderer::CompositeCompareLayers(IRenderTarget& mainLayer, IRenderTarget& compareLayer,
+                                               const CompareCompositeStyle& style)
+    {
+        if (!m_currentTarget || &mainLayer == m_currentTarget || &compareLayer == m_currentTarget || m_scissorEmpty)
+            return false;
+        const int w = m_currentTarget->GetWidth();
+        const int h = m_currentTarget->GetHeight();
+        if (w <= 0 || h <= 0 || mainLayer.GetWidth() != w || mainLayer.GetHeight() != h
+            || compareLayer.GetWidth() != w || compareLayer.GetHeight() != h)
+            return false;
+
+        if (!m_compareProgram.program)
+        {
+            m_compareProgram.program      = Link(kVertexCompare, kFragmentCompare);
+            m_compareProgram.mainColor    = glGetUniformLocation(m_compareProgram.program, "uMainColor");
+            m_compareProgram.compColor    = glGetUniformLocation(m_compareProgram.program, "uCompColor");
+            m_compareProgram.overlapColor = glGetUniformLocation(m_compareProgram.program, "uOverlapColor");
+            glUseProgram(m_compareProgram.program);
+            glUniform1i(glGetUniformLocation(m_compareProgram.program, "uMainTex"), 0);
+            glUniform1i(glGetUniformLocation(m_compareProgram.program, "uCompTex"), 1);
+            glGenVertexArrays(1, &m_compareProgram.vao);
+        }
+        if (!m_compareProgram.program)
+            return false;
+
+        const GLuint mainTex = static_cast<GLRenderTarget&>(mainLayer).GetTexture();
+        const GLuint compTex = static_cast<GLRenderTarget&>(compareLayer).GetTexture();
+        if (!mainTex || !compTex)
+            return false;
+
+        glUseProgram(m_compareProgram.program);
+        glUniform4f(m_compareProgram.mainColor,    style.MainR,    style.MainG,    style.MainB,    std::clamp(style.MainOpacity, 0.0f, 1.0f));
+        glUniform4f(m_compareProgram.compColor,    style.CompareR, style.CompareG, style.CompareB, std::clamp(style.CompareOpacity, 0.0f, 1.0f));
+        glUniform4f(m_compareProgram.overlapColor, style.OverlapR, style.OverlapG, style.OverlapB, std::clamp(style.OverlapOpacity, 0.0f, 1.0f));
+
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glEnable(GL_BLEND);
+        glBlendEquation(GL_FUNC_ADD);
+        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, mainTex);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, compTex);
+
+        glBindVertexArray(m_compareProgram.vao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glBindVertexArray(0);
+
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        return true;
     }
 }

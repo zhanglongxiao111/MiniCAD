@@ -851,20 +851,24 @@ namespace MiniCAD
         if (fsPath.empty())
             return;
         const CompareDisplayMode keepMode = m_compareDisplayMode;
-        const double keepScale = m_compareScale;
-        const double keepDx    = m_compareDx;
-        const double keepDy    = m_compareDy;
-        const float  keepOp    = m_compareOpacity;
-        const float  keepSplit = m_compareSplitRatio;
-        const bool   keepSolo  = m_compareSolo;
+        const double keepScale    = m_compareScale;
+        const double keepDx       = m_compareDx;
+        const double keepDy       = m_compareDy;
+        const float  keepOverlap  = m_compareOverlapOpacity;
+        const float  keepSplit    = m_compareSplitRatio;
+        const bool   keepSolo     = m_compareSolo;
+        const bool   keepShowMain = m_compareShowMain;
+        const bool   keepShowComp = m_compareShowCompare;
         EmbedCloseCompareDrawing();
-        m_compareDisplayMode = keepMode;
-        m_compareScale       = keepScale;
-        m_compareDx          = keepDx;
-        m_compareDy          = keepDy;
-        m_compareOpacity     = keepOp;
-        m_compareSplitRatio  = keepSplit;
-        m_compareSolo        = keepSolo;
+        m_compareDisplayMode    = keepMode;
+        m_compareScale          = keepScale;
+        m_compareDx             = keepDx;
+        m_compareDy             = keepDy;
+        m_compareOverlapOpacity = keepOverlap;
+        m_compareSplitRatio     = keepSplit;
+        m_compareSolo           = keepSolo;
+        m_compareShowMain       = keepShowMain;
+        m_compareShowCompare    = keepShowComp;
 
         auto job  = std::make_shared<OpenJob>();
         job->path = fsPath;
@@ -938,16 +942,18 @@ namespace MiniCAD
         return n;
     }
 
-    void MainFrame::EmbedSetCompareState(int mode, double scale, double dx, double dy, float opacity, float splitRatio, bool soloCompare)
+    void MainFrame::EmbedSetCompareState(int mode, double scale, double dx, double dy, float overlapOpacity, float splitRatio, bool soloCompare, bool showMain, bool showCompare)
     {
         const int clamped = std::clamp(mode, 0, static_cast<int>(CompareDisplayMode::AlignPickMain));
-        m_compareDisplayMode = static_cast<CompareDisplayMode>(clamped);
-        m_compareScale       = (std::isfinite(scale) && scale > 1e-9) ? scale : 1.0;
-        m_compareDx          = std::isfinite(dx) ? dx : 0.0;
-        m_compareDy          = std::isfinite(dy) ? dy : 0.0;
-        m_compareOpacity     = std::clamp(opacity, 0.0f, 1.0f);
-        m_compareSplitRatio  = std::clamp(splitRatio, 0.0f, 1.0f);
-        m_compareSolo        = soloCompare;
+        m_compareDisplayMode    = static_cast<CompareDisplayMode>(clamped);
+        m_compareScale          = (std::isfinite(scale) && scale > 1e-9) ? scale : 1.0;
+        m_compareDx             = std::isfinite(dx) ? dx : 0.0;
+        m_compareDy             = std::isfinite(dy) ? dy : 0.0;
+        m_compareOverlapOpacity = std::clamp(overlapOpacity, 0.0f, 1.0f);
+        m_compareSplitRatio     = std::clamp(splitRatio, 0.0f, 1.0f);
+        m_compareSolo           = soloCompare;
+        m_compareShowMain       = showMain;
+        m_compareShowCompare    = showCompare;
         SyncCompareCamera();
         RequestRenderAll();
     }
@@ -2363,8 +2369,7 @@ namespace MiniCAD
                 && !(m_compareDisplayMode == CompareDisplayMode::AlignPickBase && m_compareSolo)
                 && !(m_compareDisplayMode == CompareDisplayMode::Split && splitX <= 0));
             const bool compDrawn = useCompare && m_compareDisplayMode != CompareDisplayMode::CurrentOnly
-                && !(m_compareDisplayMode == CompareDisplayMode::Split && splitX >= pixelWidth)
-                && !(m_compareDisplayMode == CompareDisplayMode::Blend && m_compareOpacity <= 0.001f);
+                && !(m_compareDisplayMode == CompareDisplayMode::Split && splitX >= pixelWidth);
 
             editor.EnsureSceneCached(renderer, 0);
             editor.SetCursorHidden(m_compact || (useCompare && m_pickPointTarget == 1));
@@ -2385,10 +2390,12 @@ namespace MiniCAD
                 cp.Scale          = m_compareScale;
                 cp.Dx             = m_compareDx;
                 cp.Dy             = m_compareDy;
-                cp.CompareOpacity = m_compareOpacity;
+                cp.OverlapOpacity = m_compareOverlapOpacity;
                 cp.SplitX         = splitX;
                 cp.SoloCompare    = m_compareSolo;
                 cp.PickCompare    = (m_pickPointTarget == 1);
+                cp.ShowMain       = m_compareShowMain;
+                cp.ShowCompare    = m_compareShowCompare;
                 cp.State          = &compVs;
                 vp.Render(renderer, target, vs, &cp);
 

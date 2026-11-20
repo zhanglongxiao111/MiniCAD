@@ -18,8 +18,8 @@
 1. **单引擎同相机叠图对比**
    - 主图与对比底图共用同一个 MiniCAD WASM 实例、主相机、主视口与帧缓冲，避免双实例缩放不同步与双倍内存开销。
    - GPU 缓冲与光栅图片纹理按槽位隔离（主图 `0..31`，对比图 `32..63`）；关闭对比图或切换主图时按槽位范围精准释放渲染缓冲、GPU 纹理、文档与堆内存（`ReleaseFreeMemory()`）。
-   - `WebGPURenderer` 与 `GLES3Renderer` 统一扩展 `PaintStyle`（单色染色、透明度、`Alpha`/`Screen` 混合）、`SetClearColor` 与 `ScissorRect` 裁剪；修复字体网格多槽位串槽、Uniform 96 字节对齐与透明边缘打穿帧缓冲问题。
-   - `Viewport` 在同一通道内支持 `current`、`compare`、`blend`、`split`、`align-pick-base`、`align-pick-main` 六种模式，双精度平差矩阵消除大坐标抖动，并支持在对比底图上做对象捕捉拾点。
+   - `WebGPURenderer` 与 `GLES3Renderer` 统一提供双离屏底片三态差异合成（`CompositeCompareLayers`）：主/副图各自渲染到独立缓存的透明离屏纹理，逐像素按覆盖度判定“重合退灰（可调浓度 0%–100%，0% 即隐藏相同部分） / 仅主图翠绿 / 仅对比图珊瑚红”，深浅背景自适应，并配合 `SetClearColor`、`ScissorRect` 卷帘裁剪与 `PaintStyle` 透明度控制；同时修复字体网格多槽位串槽与 Uniform 对齐问题。
+   - `Viewport` 在同一通道内支持 `current`、`compare`、`blend`（三态差异叠图）、`split`（卷帘分屏）、`align-pick-base`、`align-pick-main`（三态实时跟随，对齐处重合线即时变灰）六种模式，双精度平差矩阵消除大坐标抖动，并支持在对比底图上做对象捕捉拾点。
 2. **宿主嵌入与浏览/批注双模式**
    - `?chrome=viewer|canvas` 嵌入外观与布局裁剪；浏览/批注双模式命令白名单与撤销栈否决钩子。
    - 导出红色云线批注 DWG、主图与对比图外部参照列举及按目录重载、容器隐藏时启停渲染轮询、嵌入态非阻塞报错回传。

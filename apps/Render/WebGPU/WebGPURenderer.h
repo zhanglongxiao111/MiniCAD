@@ -55,6 +55,8 @@ namespace MiniCAD
 
         std::unique_ptr<IRenderTarget> CreateLayerTarget() override;
         void  DrawLayer(IRenderTarget& layer) override;
+        bool  CompositeCompareLayers(IRenderTarget& mainLayer, IRenderTarget& compareLayer,
+                                     const CompareCompositeStyle& style) override;
         void  SetLightBackground(bool light) override { m_lightBackground = light; }
         void  SetPaintStyle(const PaintStyle& style) override { m_paintStyle = style; }
         void  SetScissorRect(const ScissorRect& rect) override;
@@ -66,7 +68,7 @@ namespace MiniCAD
     private:
         enum class Program   { Color, Text, Image, Glyph, Count };
         enum class DepthMode { Off, Test, TestWrite };      // 与 GL / D3D11 相同：不测试 / 混合的只测试不写入 / 不混合的测试并写入
-        enum class BlendSlot { Off = 0, Alpha = 1, Screen = 2, Count = 3 };
+        enum class BlendSlot { Off = 0, Alpha = 1, Count = 2 };
 
         // 持久缓存的顶点缓冲（或字形实例缓冲）
         struct GpuBuffer
@@ -98,6 +100,7 @@ namespace MiniCAD
         };
 
         void CreateLayouts();
+        void EnsureComparePipeline();
         WGPURenderPipeline GetPipeline(Program p, PrimitiveType type, DepthMode depth, BlendSlot blend);
         void BeginPass(bool clear);
         void EndPass();
@@ -122,7 +125,17 @@ namespace MiniCAD
         WGPUPipelineLayout  m_colorPipeLayout = nullptr;
         WGPUPipelineLayout  m_texPipeLayout   = nullptr;
         WGPUSampler         m_sampler         = nullptr;
-        std::array<WGPURenderPipeline, 4 * 3 * 3 * 3> m_pipelines{};
+        std::array<WGPURenderPipeline, 4 * 3 * 3 * 2> m_pipelines{};
+
+        // 双离屏底片三态差异合成管线（按需惰性创建）
+        WGPUShaderModule    m_compareShader     = nullptr;
+        WGPUBindGroupLayout m_compareLayout     = nullptr;
+        WGPUPipelineLayout  m_comparePipeLayout = nullptr;
+        WGPURenderPipeline  m_comparePipeline   = nullptr;
+        WGPUBuffer          m_compareUniformBuf = nullptr;
+        WGPUBindGroup       m_compareBindGroup  = nullptr;
+        WGPUTextureView     m_compareMainView   = nullptr;
+        WGPUTextureView     m_compareOtherView  = nullptr;
 
         FrameBuffer   m_uniforms;
         WGPUBindGroup m_uniformGroup = nullptr;

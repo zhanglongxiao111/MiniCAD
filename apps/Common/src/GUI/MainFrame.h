@@ -153,7 +153,7 @@ namespace MiniCAD
         void EmbedCloseCompareDrawing();
         std::vector<std::pair<std::string, std::string>> EmbedListCompareXrefs() const;
         int  EmbedReloadCompareXrefs(const std::string& searchRoot);
-        void EmbedSetCompareState(int mode, double scale, double dx, double dy, float opacity, float splitRatio, bool soloCompare);
+        void EmbedSetCompareState(int mode, double scale, double dx, double dy, float overlapOpacity, float splitRatio, bool soloCompare, bool showMain = true, bool showCompare = true);
         void EmbedZoomCompareAll();
         // 叠图对基点：target 0 = 主图，1 = 底图
         bool EmbedStartPickPoint(int seq, int target, std::function<void(int, double, double)> onPicked, std::function<void(int)> onCancelled);
@@ -641,9 +641,11 @@ namespace MiniCAD
         double                     m_compareScale       = 1.0;
         double                     m_compareDx          = 0.0;
         double                     m_compareDy          = 0.0;
-        float                      m_compareOpacity     = 0.85f;
-        float                      m_compareSplitRatio  = 0.5f;
-        bool                       m_compareSolo        = false;
+        float                      m_compareOverlapOpacity = 0.40f;
+        float                      m_compareSplitRatio     = 0.5f;
+        bool                       m_compareSolo           = false;
+        bool                       m_compareShowMain       = true;
+        bool                       m_compareShowCompare    = true;
         int                        m_pickPointTarget    = -1;   // -1 = 未拾取，0 = 主图，1 = 底图
 
         // ── 视口指针状态（物理像素，视口内坐标）──────────────────

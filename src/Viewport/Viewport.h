@@ -33,12 +33,12 @@ namespace MiniCAD
     enum class CompareDisplayMode : uint8_t
     {
         Off           = 0,
-        Blend         = 1,   // 主图青色 + 对比图橙红色 Screen 混色（重合处发白）
+        Blend         = 1,   // 双离屏三态差异合成：相同退灰、主图翠绿、对比图珊瑚红
         Split         = 2,   // 卷帘分屏：SplitX 左侧主图原色，右侧对比图原色
         CurrentOnly   = 3,   // 只看主图原色
         CompareOnly   = 4,   // 只看对比图原色
         AlignPickBase = 5,   // 抓对比图基点：主图 22% 淡化原色 + 对比图原色置顶（或 SoloCompare 时仅显示对比图）
-        AlignPickMain = 6    // 抓主图目标点：主图原色 + 对比图橙红半透明实时跟随
+        AlignPickMain = 6    // 抓主图目标点：三态实时差异跟随，对齐处重合线即时变灰
     };
 
     struct CompareRenderPass
@@ -48,10 +48,12 @@ namespace MiniCAD
         double             Dx             = 0.0;   // p_base = p_main * Scale + (Dx, Dy)
         double             Dy             = 0.0;
         double             Scale          = 1.0;
-        float              CompareOpacity = 0.8f;
+        float              OverlapOpacity = 0.40f; // 相同重合部分灰阶浓度（0 = 隐藏相同部分，只看纯差异）
         int                SplitX         = 0;     // 物理像素分割线
         bool               SoloCompare    = false;
         bool               PickCompare    = false; // true 时动态捕捉标记使用对比图的 Snap
+        bool               ShowMain       = true;  // Blend 模式下是否显示仅主图差异
+        bool               ShowCompare    = true;  // Blend 模式下是否显示仅对比图差异
     };
 
     class Viewport
@@ -144,6 +146,14 @@ namespace MiniCAD
         uint64_t m_layerKey     = 0;
         bool     m_layerValid   = false;
         uint64_t m_layerRedraws = 0;
+
+        // 双离屏三态对比底片：按需创建、退出对比即释放，主/副图各自独立缓存
+        std::unique_ptr<IRenderTarget> m_compareMainLayer;
+        std::unique_ptr<IRenderTarget> m_compareOtherLayer;
+        uint64_t m_compareMainKey    = 0;
+        bool     m_compareMainValid  = false;
+        uint64_t m_compareOtherKey   = 0;
+        bool     m_compareOtherValid = false;
 
         bool m_lightBackground = false;
         bool m_showGizmo = true;

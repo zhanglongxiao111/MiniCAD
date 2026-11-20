@@ -16,11 +16,10 @@ namespace MiniCAD
         const char* kShader = R"(
             struct Uniforms
             {
-                viewProj  : mat4x4<f32>,
-                light     : f32,         // 1 浅色背景，0 深色背景，-1 不换色（光栅图像）
-                paintMode : f32,         // bit0: Monochrome 染色, bit1: Screen 预乘
-                _pad0     : vec2<f32>,
-                tintColor : vec4<f32>,   // rgb = 染色色值, a = 透明度
+                viewProj : mat4x4<f32>,
+                light    : f32,         // 1 浅色背景，0 深色背景，-1 不换色（光栅图像）
+                opacity  : f32,         // 整体透明度（对齐淡化用）
+                _pad0    : vec2<f32>,
             };
             @group(0) @binding(0) var<uniform> u : Uniforms;
             @group(1) @binding(0) var tex  : texture_2d<f32>;
@@ -79,38 +78,64 @@ namespace MiniCAD
                 return o;
             }
 
-            fn ApplyPaint(c : vec4<f32>, isImage : bool) -> vec4<f32>
+            fn ApplyPaint(c : vec4<f32>) -> vec4<f32>
             {
-                let a = clamp(c.a * u.tintColor.a, 0.0, 1.0);
-                var rgb = c.rgb;
-                if (u.paintMode == 1.0 || u.paintMode == 3.0)
-                {
-                    let maxC = max(rgb.r, max(rgb.g, rgb.b));
-                    let rawLum = clamp(max(dot(rgb, vec3<f32>(0.299, 0.587, 0.114)), maxC), 0.0, 1.0);
-                    let lum = select(0.80 + 0.20 * rawLum, clamp(dot(rgb, vec3<f32>(0.299, 0.587, 0.114)), 0.0, 1.0), isImage);
-                    rgb = u.tintColor.rgb * lum;
-                }
-                if (u.paintMode >= 1.5)
-                {
-                    return vec4<f32>(rgb * a, a);
-                }
-                return vec4<f32>(rgb, a);
+                return vec4<f32>(c.rgb, clamp(c.a * u.opacity, 0.0, 1.0));
             }
 
             @fragment fn fsColor(i : VOut) -> @location(0) vec4<f32>
             {
-                return ApplyPaint(i.color, false);
+                return ApplyPaint(i.color);
             }
 
             // 文字：字形图集只用 alpha
             @fragment fn fsText(i : VOut) -> @location(0) vec4<f32>
             {
-                return ApplyPaint(vec4<f32>(i.color.rgb, i.color.a * textureSample(tex, samp, i.uv).a), false);
+                return ApplyPaint(vec4<f32>(i.color.rgb, i.color.a * textureSample(tex, samp, i.uv).a));
             }
 
             @fragment fn fsImage(i : VOut) -> @location(0) vec4<f32>
             {
-                return ApplyPaint(textureSample(tex, samp, i.uv) * i.color, true);
+                return ApplyPaint(textureSample(tex, samp, i.uv) * i.color);
+            }
+        )";
+
+        // 双离屏底片三态差异合成着色器：按像素覆盖度区分 重合 / 仅主图 / 仅对比图
+        const char* kCompareShader = R"(
+            struct CompareUniforms
+            {
+                mainColor    : vec4<f32>,
+                compColor    : vec4<f32>,
+                overlapColor : vec4<f32>,
+            };
+            @group(0) @binding(0) var<uniform> cu : CompareUniforms;
+            @group(0) @binding(1) var mainTex : texture_2d<f32>;
+            @group(0) @binding(2) var compTex : texture_2d<f32>;
+
+            @vertex fn vsCompare(@builtin(vertex_index) vid : u32) -> @builtin(position) vec4<f32>
+            {
+                let x = select(-1.0, 3.0, vid == 1u);
+                let y = select(-1.0, 3.0, vid == 2u);
+                return vec4<f32>(x, y, 0.0, 1.0);
+            }
+
+            @fragment fn fsCompare(@builtin(position) pos : vec4<f32>) -> @location(0) vec4<f32>
+            {
+                let dims = vec2<i32>(textureDimensions(mainTex, 0));
+                let maxC = max(dims - vec2<i32>(1, 1), vec2<i32>(0, 0));
+                let c = clamp(vec2<i32>(i32(pos.x), i32(pos.y)), vec2<i32>(0, 0), maxC);
+                let a = textureLoad(mainTex, c, 0).a;
+                let b = textureLoad(compTex, c, 0).a;
+                let wOverlap = min(a, b) * cu.overlapColor.a;
+                let wMain    = max(0.0, a - b) * cu.mainColor.a;
+                let wComp    = max(0.0, b - a) * cu.compColor.a;
+                let totalW   = wOverlap + wMain + wComp;
+                if (totalW < 0.0005)
+                {
+                    discard;
+                }
+                let rgb = (cu.overlapColor.rgb * wOverlap + cu.mainColor.rgb * wMain + cu.compColor.rgb * wComp) / totalW;
+                return vec4<f32>(rgb, clamp(totalW, 0.0, 1.0));
             }
         )";
 
@@ -118,11 +143,18 @@ namespace MiniCAD
         {
             float viewProj[16];
             float light;
-            float paintMode;
+            float opacity;
             float pad0[2];
-            float tintColor[4];
         };
-        static_assert(sizeof(Uniforms) == 96);
+        static_assert(sizeof(Uniforms) == 80);
+
+        struct CompareUniforms
+        {
+            float mainColor[4];
+            float compColor[4];
+            float overlapColor[4];
+        };
+        static_assert(sizeof(CompareUniforms) == 48);
 
         constexpr uint64_t kUniformStride   = 256;          // minUniformBufferOffsetAlignment 的上限，所有设备都满足
         constexpr uint64_t kInitialUniforms = 256 * kUniformStride;
@@ -168,6 +200,12 @@ namespace MiniCAD
         DestroyBuffer(m_uniforms.buffer);
         DestroyBuffer(m_stream.buffer);
         if (m_uniformGroup) wgpuBindGroupRelease(m_uniformGroup);
+        if (m_compareBindGroup)  wgpuBindGroupRelease(m_compareBindGroup);
+        DestroyBuffer(m_compareUniformBuf);
+        if (m_comparePipeline)   wgpuRenderPipelineRelease(m_comparePipeline);
+        if (m_comparePipeLayout) wgpuPipelineLayoutRelease(m_comparePipeLayout);
+        if (m_compareLayout)     wgpuBindGroupLayoutRelease(m_compareLayout);
+        if (m_compareShader)     wgpuShaderModuleRelease(m_compareShader);
         for (WGPURenderPipeline p : m_pipelines)
             if (p) wgpuRenderPipelineRelease(p);
         wgpuSamplerRelease(m_sampler);
@@ -217,7 +255,7 @@ namespace MiniCAD
 
     WGPURenderPipeline WebGPURenderer::GetPipeline(Program p, PrimitiveType type, DepthMode depth, BlendSlot blend)
     {
-        const size_t index = ((static_cast<size_t>(p) * 3 + static_cast<size_t>(type)) * 3 + static_cast<size_t>(depth)) * 3 + static_cast<size_t>(blend);
+        const size_t index = ((static_cast<size_t>(p) * 3 + static_cast<size_t>(type)) * 3 + static_cast<size_t>(depth)) * 2 + static_cast<size_t>(blend);
         WGPURenderPipeline& pipeline = m_pipelines[index];
         if (pipeline)
             return pipeline;
@@ -282,16 +320,8 @@ namespace MiniCAD
 
         // ── 混合：与 D3D11Renderer 相同，颜色按 alpha 混合，alpha 直接写入 ──
         WGPUBlendState blendState = WGPU_BLEND_STATE_INIT;
-        if (blend == BlendSlot::Screen)
-        {
-            blendState.color = { WGPUBlendOperation_Add, WGPUBlendFactor_One, WGPUBlendFactor_OneMinusSrc };
-            blendState.alpha = { WGPUBlendOperation_Add, WGPUBlendFactor_One, WGPUBlendFactor_OneMinusSrcAlpha };
-        }
-        else
-        {
-            blendState.color = { WGPUBlendOperation_Add, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha };
-            blendState.alpha = { WGPUBlendOperation_Add, WGPUBlendFactor_One,      WGPUBlendFactor_OneMinusSrcAlpha };
-        }
+        blendState.color = { WGPUBlendOperation_Add, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha };
+        blendState.alpha = { WGPUBlendOperation_Add, WGPUBlendFactor_One,      WGPUBlendFactor_OneMinusSrcAlpha };
         WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
         target.format    = WebGPURenderTarget::kColorFormat;
         target.blend     = blend != BlendSlot::Off ? &blendState : nullptr;
@@ -482,20 +512,13 @@ namespace MiniCAD
         Uniforms u{};
         for (int i = 0; i < 16; ++i)
             u.viewProj[i] = static_cast<float>(viewProj.m[i]);
-        u.light        = p == Program::Image ? -1.0f : (m_lightBackground ? 1.0f : 0.0f);
-        u.paintMode    = (m_paintStyle.TintMode == PaintTintMode::Monochrome ? 1.0f : 0.0f)
-                       + (m_paintStyle.BlendMode == PaintBlendMode::Screen ? 2.0f : 0.0f);
-        u.tintColor[0] = m_paintStyle.TintR;
-        u.tintColor[1] = m_paintStyle.TintG;
-        u.tintColor[2] = m_paintStyle.TintB;
-        u.tintColor[3] = m_paintStyle.Opacity;
+        u.light   = p == Program::Image ? -1.0f : (m_lightBackground ? 1.0f : 0.0f);
+        u.opacity = m_paintStyle.Opacity;
         const uint64_t offset = m_uniforms.used;
         wgpuQueueWriteBuffer(m_queue, m_uniforms.buffer, offset, &u, sizeof(u));
         m_uniforms.used += kUniformStride;
 
-        const BlendSlot blendSlot = (m_paintStyle.BlendMode == PaintBlendMode::Screen)
-            ? BlendSlot::Screen
-            : ((blend || m_paintStyle.Opacity < 0.999f) ? BlendSlot::Alpha : BlendSlot::Off);
+        const BlendSlot blendSlot = (blend || m_paintStyle.Opacity < 0.999f) ? BlendSlot::Alpha : BlendSlot::Off;
         const DepthMode mode = !depth ? DepthMode::Off : (blendSlot != BlendSlot::Off ? DepthMode::Test : DepthMode::TestWrite);
         wgpuRenderPassEncoderSetPipeline(m_pass, GetPipeline(p, type, mode, blendSlot));
         const uint32_t dynamicOffset = static_cast<uint32_t>(offset);
@@ -564,10 +587,26 @@ namespace MiniCAD
         for (auto& [view, group] : m_textGroups)
             wgpuBindGroupRelease(group);
         m_textGroups.clear();
+        if (m_compareBindGroup)
+        {
+            if (m_encoder) m_retired.bindGroups.push_back(m_compareBindGroup);
+            else           wgpuBindGroupRelease(m_compareBindGroup);
+            m_compareBindGroup = nullptr;
+            m_compareMainView  = nullptr;
+            m_compareOtherView = nullptr;
+        }
     }
 
     void WebGPURenderer::ReleaseSlotRange(uint32_t firstSlot, uint32_t lastSlot)
     {
+        if (m_compareBindGroup)
+        {
+            if (m_encoder) m_retired.bindGroups.push_back(m_compareBindGroup);
+            else           wgpuBindGroupRelease(m_compareBindGroup);
+            m_compareBindGroup = nullptr;
+            m_compareMainView  = nullptr;
+            m_compareOtherView = nullptr;
+        }
         auto eraseBuffers = [&](std::unordered_map<uint32_t, GpuBuffer>& cache)
         {
             for (auto it = cache.begin(); it != cache.end();)
@@ -849,5 +888,144 @@ namespace MiniCAD
         const WGPUExtent3D size{ static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1 };
         wgpuCommandEncoderCopyTextureToTexture(m_encoder, &from, &to, &size);
         BeginPass(false);
+    }
+
+    void WebGPURenderer::EnsureComparePipeline()
+    {
+        if (m_comparePipeline)
+            return;
+        m_compareShader     = CreateShader(m_device, kCompareShader, "MiniCAD compare composite shader");
+        m_compareUniformBuf = CreateBuffer(m_device, sizeof(CompareUniforms), WGPUBufferUsage_Uniform);
+
+        WGPUBindGroupLayoutEntry entries[3] = {
+            WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT,
+            WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT,
+            WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT,
+        };
+        entries[0].binding               = 0;
+        entries[0].visibility            = WGPUShaderStage_Fragment;
+        entries[0].buffer.type           = WGPUBufferBindingType_Uniform;
+        entries[0].buffer.minBindingSize = sizeof(CompareUniforms);
+
+        entries[1].binding               = 1;
+        entries[1].visibility            = WGPUShaderStage_Fragment;
+        entries[1].texture.sampleType    = WGPUTextureSampleType_Float;
+        entries[1].texture.viewDimension = WGPUTextureViewDimension_2D;
+
+        entries[2].binding               = 2;
+        entries[2].visibility            = WGPUShaderStage_Fragment;
+        entries[2].texture.sampleType    = WGPUTextureSampleType_Float;
+        entries[2].texture.viewDimension = WGPUTextureViewDimension_2D;
+
+        WGPUBindGroupLayoutDescriptor ld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+        ld.entryCount = 3;
+        ld.entries    = entries;
+        m_compareLayout = wgpuDeviceCreateBindGroupLayout(m_device, &ld);
+
+        WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+        pld.bindGroupLayoutCount = 1;
+        pld.bindGroupLayouts     = &m_compareLayout;
+        m_comparePipeLayout = wgpuDeviceCreatePipelineLayout(m_device, &pld);
+
+        WGPUBlendState blendState = WGPU_BLEND_STATE_INIT;
+        blendState.color = { WGPUBlendOperation_Add, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha };
+        blendState.alpha = { WGPUBlendOperation_Add, WGPUBlendFactor_One,      WGPUBlendFactor_OneMinusSrcAlpha };
+
+        WGPUColorTargetState colorTarget = WGPU_COLOR_TARGET_STATE_INIT;
+        colorTarget.format    = WebGPURenderTarget::kColorFormat;
+        colorTarget.blend     = &blendState;
+        colorTarget.writeMask = WGPUColorWriteMask_All;
+
+        WGPUFragmentState frag = WGPU_FRAGMENT_STATE_INIT;
+        frag.module      = m_compareShader;
+        frag.entryPoint  = Str("fsCompare");
+        frag.targetCount = 1;
+        frag.targets     = &colorTarget;
+
+        WGPUDepthStencilState ds = WGPU_DEPTH_STENCIL_STATE_INIT;
+        ds.format            = WebGPURenderTarget::kDepthFormat;
+        ds.depthCompare      = WGPUCompareFunction_Always;
+        ds.depthWriteEnabled = WGPUOptionalBool_False;
+
+        WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+        desc.label               = Str("MiniCAD compare composite pipeline");
+        desc.layout              = m_comparePipeLayout;
+        desc.vertex.module       = m_compareShader;
+        desc.vertex.entryPoint   = Str("vsCompare");
+        desc.vertex.bufferCount  = 0;
+        desc.vertex.buffers      = nullptr;
+        desc.primitive.topology  = WGPUPrimitiveTopology_TriangleList;
+        desc.primitive.cullMode  = WGPUCullMode_None;
+        desc.depthStencil        = &ds;
+        desc.fragment            = &frag;
+        m_comparePipeline = wgpuDeviceCreateRenderPipeline(m_device, &desc);
+    }
+
+    bool WebGPURenderer::CompositeCompareLayers(IRenderTarget& mainLayer, IRenderTarget& compareLayer,
+                                                const CompareCompositeStyle& style)
+    {
+        if (!m_pass || !m_target || m_scissorEmpty || &mainLayer == m_target || &compareLayer == m_target)
+            return false;
+        auto& mainRt = static_cast<WebGPURenderTarget&>(mainLayer);
+        auto& compRt = static_cast<WebGPURenderTarget&>(compareLayer);
+        const int w = m_target->GetWidth();
+        const int h = m_target->GetHeight();
+        if (w <= 0 || h <= 0 || mainRt.GetWidth() != w || mainRt.GetHeight() != h
+            || compRt.GetWidth() != w || compRt.GetHeight() != h)
+            return false;
+        WGPUTextureView mainView = mainRt.GetColorView();
+        WGPUTextureView compView = compRt.GetColorView();
+        if (!mainView || !compView)
+            return false;
+
+        EnsureComparePipeline();
+        if (!m_comparePipeline)
+            return false;
+
+        CompareUniforms cu{};
+        cu.mainColor[0]    = style.MainR;
+        cu.mainColor[1]    = style.MainG;
+        cu.mainColor[2]    = style.MainB;
+        cu.mainColor[3]    = std::clamp(style.MainOpacity, 0.0f, 1.0f);
+        cu.compColor[0]    = style.CompareR;
+        cu.compColor[1]    = style.CompareG;
+        cu.compColor[2]    = style.CompareB;
+        cu.compColor[3]    = std::clamp(style.CompareOpacity, 0.0f, 1.0f);
+        cu.overlapColor[0] = style.OverlapR;
+        cu.overlapColor[1] = style.OverlapG;
+        cu.overlapColor[2] = style.OverlapB;
+        cu.overlapColor[3] = std::clamp(style.OverlapOpacity, 0.0f, 1.0f);
+        wgpuQueueWriteBuffer(m_queue, m_compareUniformBuf, 0, &cu, sizeof(cu));
+
+        if (!m_compareBindGroup || m_compareMainView != mainView || m_compareOtherView != compView)
+        {
+            if (m_compareBindGroup)
+                m_retired.bindGroups.push_back(m_compareBindGroup);
+            WGPUBindGroupEntry entries[3] = {
+                WGPU_BIND_GROUP_ENTRY_INIT,
+                WGPU_BIND_GROUP_ENTRY_INIT,
+                WGPU_BIND_GROUP_ENTRY_INIT,
+            };
+            entries[0].binding     = 0;
+            entries[0].buffer      = m_compareUniformBuf;
+            entries[0].size        = sizeof(CompareUniforms);
+            entries[1].binding     = 1;
+            entries[1].textureView = mainView;
+            entries[2].binding     = 2;
+            entries[2].textureView = compView;
+
+            WGPUBindGroupDescriptor bd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+            bd.layout     = m_compareLayout;
+            bd.entryCount = 3;
+            bd.entries    = entries;
+            m_compareBindGroup = wgpuDeviceCreateBindGroup(m_device, &bd);
+            m_compareMainView  = mainView;
+            m_compareOtherView = compView;
+        }
+
+        wgpuRenderPassEncoderSetPipeline(m_pass, m_comparePipeline);
+        wgpuRenderPassEncoderSetBindGroup(m_pass, 0, m_compareBindGroup, 0, nullptr);
+        wgpuRenderPassEncoderDraw(m_pass, 3, 1, 0, 0);
+        return true;
     }
 }
