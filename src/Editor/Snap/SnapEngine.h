@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <unordered_set>
 #include <vector>
 
@@ -84,7 +85,8 @@ namespace MiniCAD
         // 端点 / 中点 / 象限点的共同实现：kind 为 FeatureKind
         SnapResult TryFeature      (const Math::Point2&, const Scene&, const Camera&, const std::unordered_set<Object::ObjectID>&, int kind, SnapResult::Type type) const;
 
-        // 遍历捕捉对象：Query 设置了候选集时只遍历候选，否则全场景。不属于当前布局的实体跳过
+        // 遍历捕捉对象：Query 设置了候选集时只遍历候选，否则全场景。不属于当前布局的实体跳过；
+        // 块参照 / 外部参照（InsertEntity）在 Query 入口按光标孔径展开到 m_blockLeaves，一并参与捕捉
         template<typename Fn>
         void ForEachSnapObject(const Scene& scene, Fn&& fn) const
         {
@@ -103,6 +105,9 @@ namespace MiniCAD
             {
                 scene.ForEachObject([&](const Object& o) { if (inLayout(o)) fn(o); });
             }
+            for (const auto& leaf : m_blockLeaves)
+                if (leaf)
+                    fn(*leaf);
         }
 
     private:
@@ -113,8 +118,9 @@ namespace MiniCAD
         double m_gridSize       = 1.0;    // 世界单位
         double m_snapRadiusPx   = 10.0;   // 屏幕像素捕捉孔径(同 AutoCAD APERTURE 默认值)
 
-        // 本次 Query 的候选集（仅在 Query 执行期间有效；nullptr = 全场景遍历）
+        // 本次 Query 的候选集与块内展开叶实体（仅在 Query 执行期间有效）
         mutable const std::vector<Object::ObjectID>* m_queryCandidates = nullptr;
+        mutable std::vector<std::unique_ptr<Entity>> m_blockLeaves;
 
         LayoutFilter m_layoutFilter;   // 布局过滤（Editor::Bind 设置）
     };

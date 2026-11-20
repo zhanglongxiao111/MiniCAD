@@ -13,6 +13,7 @@
 #include "Core/Entity/XLineEntity.hpp"
 #include "Core/Entity/RayEntity.hpp"
 #include "Core/Entity/Solid3DEntity.hpp"
+#include "Core/Entity/InsertEntity.hpp"
 #include "Core/Entity/ICurveEntity.hpp"
 #include "Core/GeomKernel/CurveIntersect.hpp"
 #include "Document/FeaturePoints.h"
@@ -32,7 +33,7 @@
 namespace MiniCAD
 {
     // =========================================================================
-    // 内部工具：屏幕距离比较辅助
+    // 内部工具：屏幕距离比较辅助 + 块参照 / 外部参照孔径展开
     // =========================================================================
     namespace
     {
@@ -49,6 +50,254 @@ namespace MiniCAD
                     return false;
 
             return true;
+        }
+
+        inline bool IsLayerVisibleById(const LayerManager& layers, LayerID id)
+        {
+            const Layer* l = layers.GetLayer(id);
+            return !l || l->IsVisible();
+        }
+
+        // 正交投影下局部包围盒经 m 变换后的屏幕外包框是否与光标孔径相交
+        inline bool BoxHitsAperture(const AABB& lb, const Math::Mat4& m, const Camera& cam, const Math::Point2& sp, double radiusPx)
+        {
+            if (lb.Min.x > lb.Max.x) return false;
+            const Math::Point3 corners[8] = {
+                { lb.Min.x, lb.Min.y, lb.Min.z }, { lb.Max.x, lb.Min.y, lb.Min.z },
+                { lb.Min.x, lb.Max.y, lb.Min.z }, { lb.Max.x, lb.Max.y, lb.Min.z },
+                { lb.Min.x, lb.Min.y, lb.Max.z }, { lb.Max.x, lb.Min.y, lb.Max.z },
+                { lb.Min.x, lb.Max.y, lb.Max.z }, { lb.Max.x, lb.Max.y, lb.Max.z },
+            };
+            double x0 = std::numeric_limits<double>::max(), y0 = x0;
+            double x1 = std::numeric_limits<double>::lowest(), y1 = x1;
+            for (const auto& c : corners)
+            {
+                const Math::Point2 s = cam.WorldToScreen(m * c);
+                x0 = std::min(x0, s.x); x1 = std::max(x1, s.x);
+                y0 = std::min(y0, s.y); y1 = std::max(y1, s.y);
+            }
+            return sp.x >= x0 - radiusPx && sp.x <= x1 + radiusPx
+                && sp.y >= y0 - radiusPx && sp.y <= y1 + radiusPx;
+        }
+
+        // 裁剪边界跨边时收集被截断的线段为世界 LineEntity
+        class ClippedSegmentSink final : public IDrawSink
+        {
+        public:
+            ClippedSegmentSink(const LayerManager& layers, std::vector<std::unique_ptr<Entity>>& out)
+                : m_layers(layers), m_out(out) {}
+
+            bool IsLayerVisible(LayerID id) const override { return IsLayerVisibleById(m_layers, id); }
+            void DrawLine(const Math::Point3& a, const Math::Point3& b, const Math::Color4&, bool) override
+            {
+                if ((b - a).LengthSq() > 1e-24)
+                    m_out.push_back(std::make_unique<LineEntity>(Object::InvalidID, a, b));
+            }
+            void DrawPoint(const Math::Point3& p, const Math::Color4&, bool) override
+            {
+                m_out.push_back(std::make_unique<PointEntity>(Object::InvalidID, p));
+            }
+
+        private:
+            const LayerManager&                   m_layers;
+            std::vector<std::unique_ptr<Entity>>& m_out;
+        };
+
+        void EmitTransformedPrimitive(const Entity& src, const Math::Mat4& m, std::vector<std::unique_ptr<Entity>>& out)
+        {
+            const Math::Vec3 ux = m.TransformVector({ 1.0, 0.0, 0.0 });
+            const Math::Vec3 uy = m.TransformVector({ 0.0, 1.0, 0.0 });
+            const double lx = std::hypot(ux.x, ux.y);
+            const double ly = std::hypot(uy.x, uy.y);
+            const double crossZ = ux.x * uy.y - ux.y * uy.x;
+            const bool uniformXY = lx > 1e-12 && std::abs(lx - ly) <= 1e-5 * std::max(lx, ly);
+
+            if (src.IsKindOf<PointEntity>())
+            {
+                out.push_back(std::make_unique<PointEntity>(Object::InvalidID, m * static_cast<const PointEntity&>(src).GetPoint().Position));
+                return;
+            }
+            if (src.IsKindOf<LineEntity>())
+            {
+                const auto& l = static_cast<const LineEntity&>(src).GetLine();
+                out.push_back(std::make_unique<LineEntity>(Object::InvalidID, m * l.Start, m * l.End));
+                return;
+            }
+            if (src.IsKindOf<RectangleEntity>())
+            {
+                const auto& r = static_cast<const RectangleEntity&>(src).GetRectangle();
+                out.push_back(std::make_unique<PolylineEntity>(Object::InvalidID,
+                    std::vector<Math::Point3>{ m * r.P1, m * r.P2, m * r.P3, m * r.P4, m * r.P1 }));
+                return;
+            }
+            if (src.IsKindOf<PolylineEntity>())
+            {
+                const auto& pl = static_cast<const PolylineEntity&>(src).GetPolyline();
+                if (!pl.IsValid()) return;
+                bool hasArc = false;
+                for (int i = 0; i < pl.SegCount(); ++i)
+                    if (pl.SegIsArc(i)) { hasArc = true; break; }
+                if (!hasArc || uniformXY)
+                {
+                    std::vector<Math::Point3> pts;
+                    pts.reserve(pl.Points.size());
+                    for (const auto& p : pl.Points) pts.push_back(m * p);
+                    std::vector<double> bulges = pl.Bulges;
+                    if (hasArc && crossZ < 0.0)
+                        for (double& b : bulges) b = -b;
+                    out.push_back(std::make_unique<PolylineEntity>(Object::InvalidID, std::move(pts), std::move(bulges)));
+                }
+                else
+                {
+                    auto tess = pl.Tessellate();
+                    for (auto& p : tess) p = m * p;
+                    if (tess.size() >= 2)
+                        out.push_back(std::make_unique<PolylineEntity>(Object::InvalidID, std::move(tess)));
+                }
+                return;
+            }
+            if (src.IsKindOf<CircleEntity>())
+            {
+                const auto& c = static_cast<const CircleEntity&>(src).GetCircle();
+                if (uniformXY)
+                {
+                    out.push_back(std::make_unique<CircleEntity>(Object::InvalidID, m * c.Center, c.Radius * lx));
+                }
+                else if (lx > 1e-12 && ly > 1e-12)
+                {
+                    out.push_back(std::make_unique<PointEntity>(Object::InvalidID, m * c.Center));
+                    std::vector<Math::Point3> pts;
+                    pts.reserve(65);
+                    for (int k = 0; k <= 64; ++k)
+                    {
+                        const double a = Math::TwoPI * k / 64.0;
+                        pts.push_back(m * Math::Point3{ c.Center.x + c.Radius * std::cos(a), c.Center.y + c.Radius * std::sin(a), c.Center.z });
+                    }
+                    out.push_back(std::make_unique<PolylineEntity>(Object::InvalidID, std::move(pts)));
+                }
+                return;
+            }
+            if (src.IsKindOf<ArcEntity>())
+            {
+                const auto& arc = static_cast<const ArcEntity&>(src).GetArc();
+                if (uniformXY)
+                {
+                    if (auto wa = Arc::FromThreePoints(m * arc.StartPoint(), m * arc.MidPoint(), m * arc.EndPoint()))
+                    {
+                        out.push_back(std::make_unique<ArcEntity>(Object::InvalidID, wa->Center, wa->Radius, wa->StartAngle, wa->EndAngle));
+                        return;
+                    }
+                }
+                out.push_back(std::make_unique<PointEntity>(Object::InvalidID, m * arc.Center));
+                const double sweep = arc.SweepAngle();
+                const int segs = std::max(8, static_cast<int>(std::ceil(std::abs(sweep) / (Math::TwoPI / 64.0))));
+                std::vector<Math::Point3> pts;
+                pts.reserve(static_cast<size_t>(segs) + 1);
+                for (int k = 0; k <= segs; ++k)
+                    pts.push_back(m * arc.PointAt(arc.StartAngle + sweep * k / segs));
+                out.push_back(std::make_unique<PolylineEntity>(Object::InvalidID, std::move(pts)));
+                return;
+            }
+            if (src.IsKindOf<MLineEntity>())
+            {
+                for (const auto& el : static_cast<const MLineEntity&>(src).ComputeGeometry().Elements)
+                {
+                    if (el.size() < 2) continue;
+                    std::vector<Math::Point3> pts;
+                    pts.reserve(el.size());
+                    for (const auto& p : el) pts.push_back(m * p);
+                    out.push_back(std::make_unique<PolylineEntity>(Object::InvalidID, std::move(pts)));
+                }
+                return;
+            }
+            if (src.IsKindOf<XLineEntity>())
+            {
+                const auto& xl = static_cast<const XLineEntity&>(src).GetXLine();
+                const Math::Vec3 d = m.TransformVector(xl.Direction);
+                if (d.LengthSq() > 1e-24)
+                    out.push_back(std::make_unique<XLineEntity>(Object::InvalidID, m * xl.Origin, d.Normalized()));
+                return;
+            }
+            if (src.IsKindOf<RayEntity>())
+            {
+                const auto& r = static_cast<const RayEntity&>(src).GetRay();
+                const Math::Vec3 d = m.TransformVector(r.Direction);
+                if (d.LengthSq() > 1e-24)
+                    out.push_back(std::make_unique<RayEntity>(Object::InvalidID, m * r.Origin, d.Normalized()));
+                return;
+            }
+        }
+
+        void CollectInsertLeaves(const InsertEntity& ins,
+                                 const Math::Mat4& parentMat,
+                                 LayerID hostLayerId,
+                                 const Scene& scene,
+                                 const Camera& cam,
+                                 const Math::Point2& sp,
+                                 double radiusPx,
+                                 int depth,
+                                 std::vector<std::unique_ptr<Entity>>& out)
+        {
+            if (depth > 8 || out.size() > 1024) return;
+            const BlockEntity* block = ins.GetBlock();
+            if (!block || block->IsUnresolvedXRef()) return;
+
+            const LayerManager& layers = scene.GetLayerManager();
+            const bool hasClip = ins.HasClipBoundary();
+
+            for (int r = 0; r < ins.GetRowCount(); ++r)
+                for (int c = 0; c < ins.GetColumnCount(); ++c)
+                {
+                    const Math::Mat4 worldMat = ins.CellMatrix(c, r) * parentMat;
+                    if (!ins.IsBoundless() && !BoxHitsAperture(block->GetBoundingBox(), worldMat, cam, sp, radiusPx))
+                        continue;
+
+                    ClippedSegmentSink rawSink(layers, out);
+                    TransformDrawSink  tsink(rawSink, worldMat);
+                    ClipDrawSink       csink(tsink, ins.GetClipBoundary());
+                    const bool useClip = hasClip && csink.Valid();
+
+                    for (const auto& child : block->GetEntities())
+                    {
+                        if (!child || !child->GetAttr().Visible) continue;
+                        const LayerID effLayer = child->GetAttr().LayerId == Layer::DefaultLayerID
+                            ? hostLayerId
+                            : child->GetAttr().LayerId;
+                        if (!IsLayerVisibleById(layers, effLayer)) continue;
+                        if (const auto* def = dynamic_cast<const AttDefEntity*>(child.get()))
+                            if (!def->ShowsInBlockReference()) continue;
+
+                        const AABB cb = child->GetBoundingBox();
+                        if (!child->IsBoundless() && !BoxHitsAperture(cb, worldMat, cam, sp, radiusPx))
+                            continue;
+
+                        ClipDrawSink::Region clipRegion = ClipDrawSink::Region::Inside;
+                        if (useClip && !child->IsBoundless())
+                        {
+                            const Math::Point3 q[4] = {
+                                { cb.Min.x, cb.Min.y, 0.0 }, { cb.Max.x, cb.Min.y, 0.0 },
+                                { cb.Max.x, cb.Max.y, 0.0 }, { cb.Min.x, cb.Max.y, 0.0 },
+                            };
+                            clipRegion = csink.Classify(q);
+                            if (clipRegion == ClipDrawSink::Region::Outside)
+                                continue;
+                        }
+
+                        if (child->IsKindOf<InsertEntity>())
+                        {
+                            if (useClip && clipRegion == ClipDrawSink::Region::Crossing)
+                                child->Draw(csink, false, false);
+                            else
+                                CollectInsertLeaves(static_cast<const InsertEntity&>(*child), worldMat, effLayer, scene, cam, sp, radiusPx, depth + 1, out);
+                            continue;
+                        }
+
+                        if (useClip && clipRegion == ClipDrawSink::Region::Crossing)
+                            child->Draw(csink, false, false);
+                        else
+                            EmitTransformedPrimitive(*child, worldMat, out);
+                    }
+                }
         }
 
         // 候选点与光标的屏幕距离，满足阈值则更新 best
@@ -81,6 +330,28 @@ namespace MiniCAD
     {
         // 候选集仅在本次 Query 执行期间生效（各 Try* 经 ForEachSnapObject 消费）
         m_queryCandidates = candidates;
+        m_blockLeaves.clear();
+
+        // 展开候选中的块参照 / 外部参照（仅保留落在光标孔径内的可见叶图元）
+        const double cullRadius = m_snapRadiusPx + 2.0;
+        auto expandIfInsert = [&](const Object& obj)
+        {
+            if (exclude.contains(obj.GetID()) || !IsSnapVisible(scene, obj)) return;
+            if (!obj.IsKindOf<InsertEntity>()) return;
+            const auto& ins = static_cast<const InsertEntity&>(obj);
+            if (m_layoutFilter && !m_layoutFilter(ins.GetAttr())) return;
+            CollectInsertLeaves(ins, Math::Mat4::Identity(), ins.GetAttr().LayerId, scene, cam, sp, cullRadius, 0, m_blockLeaves);
+        };
+        if (candidates)
+        {
+            for (auto id : *candidates)
+                if (const Object* o = scene.GetEntity(id))
+                    expandIfInsert(*o);
+        }
+        else
+        {
+            scene.ForEachObject(expandIfInsert);
+        }
 
         // ── 点类捕捉（端点/中点/交点/象限/垂足）：同一孔径内按「捕捉点到
         //    光标的屏幕距离」取最近者，距离相同时按上述顺序优先 ──
@@ -105,7 +376,8 @@ namespace MiniCAD
         if (!best.IsValid() && IsModeEnabled(SnapMode::Nearest))
             best = TryNearest(sp, scene, cam, exclude);
 
-        m_queryCandidates = nullptr;   // 候选集指针仅本次查询有效
+        m_queryCandidates = nullptr;   // 候选集指针与块内叶图元仅本次查询有效
+        m_blockLeaves.clear();
 
         if (best.IsValid()) return best;
         if (IsModeEnabled(SnapMode::Grid)) return TryGrid(sp, cam);

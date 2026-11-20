@@ -14,10 +14,18 @@ namespace MiniCAD
     {
     public:
         // prompt：N_ 标记的原文，显示时翻译
-        PickPointTool(std::string prompt, std::function<void(const Math::Point3&)> onPicked)
+        PickPointTool(std::string prompt,
+                      std::function<void(const Math::Point3&)> onPicked,
+                      std::function<void()> onCancelled = nullptr)
             : m_prompt(std::move(prompt))
             , m_onPicked(std::move(onPicked))
+            , m_onCancelled(std::move(onCancelled))
         {
+        }
+
+        ~PickPointTool() override
+        {
+            NotifyCancelled();
         }
 
         bool OnInput(const EditorContext& ctx) override
@@ -30,8 +38,9 @@ namespace MiniCAD
                     ? e.SnapWorld
                     : ctx.viewport.GetCamera().ScreenToWorld(e.MouseX, e.MouseY);
 
+                m_done = true;
                 if (m_onPicked) m_onPicked(p);
-                Cancel();
+                if (OnFinished) OnFinished();
                 return true;
             }
 
@@ -44,12 +53,25 @@ namespace MiniCAD
             return false;
         }
 
-        void Cancel() override { if (OnFinished) OnFinished(); }
+        void Cancel() override
+        {
+            NotifyCancelled();
+            if (OnFinished) OnFinished();
+        }
 
         std::string GetPrompt() const override { return Tr(m_prompt); }
 
     private:
+        void NotifyCancelled()
+        {
+            if (m_done) return;
+            m_done = true;
+            if (m_onCancelled) m_onCancelled();
+        }
+
         std::string                               m_prompt;
+        bool                                      m_done = false;
         std::function<void(const Math::Point3&)> m_onPicked;
+        std::function<void()>                    m_onCancelled;
     };
 }
