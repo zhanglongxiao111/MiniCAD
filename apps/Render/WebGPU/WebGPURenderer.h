@@ -36,6 +36,7 @@ namespace MiniCAD
         void Submit(std::span<const Vertex_P3_C4> verts, const Math::Mat4& viewProj, PrimitiveType type, bool depth = true, bool blend = false) override;
         void SubmitTextured(std::span<const Vertex_P3_C4_UV> verts, const Math::Mat4& viewProj, void* nativeSRV, bool depth = false, bool blend = true) override;
         void SubmitImage(const ImageData& image, std::span<const Vertex_P3_C4_UV> quad, const Math::Mat4& viewProj) override;
+        void SubmitImageForSlot(const ImageData& image, std::span<const Vertex_P3_C4_UV> quad, const Math::Mat4& viewProj, uint32_t slotOffset) override;
 
         void SubmitCached(uint32_t slot, uint64_t version,
                           std::span<const Vertex_P3_C4> verts,
@@ -55,12 +56,17 @@ namespace MiniCAD
         std::unique_ptr<IRenderTarget> CreateLayerTarget() override;
         void  DrawLayer(IRenderTarget& layer) override;
         void  SetLightBackground(bool light) override { m_lightBackground = light; }
+        void  SetPaintStyle(const PaintStyle& style) override { m_paintStyle = style; }
+        void  SetScissorRect(const ScissorRect& rect) override;
+        void  SetClearColor(float r, float g, float b, float a) override { m_clearColor = WGPUColor{ r, g, b, a }; }
         void  ReleaseCachedResources() override;
+        void  ReleaseSlotRange(uint32_t firstSlot, uint32_t lastSlot) override;
         void* GetNativeDevice() override { return m_device; }
 
     private:
         enum class Program   { Color, Text, Image, Glyph, Count };
         enum class DepthMode { Off, Test, TestWrite };      // 与 GL / D3D11 相同：不测试 / 混合的只测试不写入 / 不混合的测试并写入
+        enum class BlendSlot { Off = 0, Alpha = 1, Screen = 2, Count = 3 };
 
         // 持久缓存的顶点缓冲（或字形实例缓冲）
         struct GpuBuffer
@@ -80,19 +86,31 @@ namespace MiniCAD
             uint64_t   used     = 0;
         };
 
+        struct GlyphSlot
+        {
+            GpuBuffer                   instances;
+            std::vector<GlyphBatch>     batches;
+            std::vector<GlyphMeshRange> meshes;
+            WGPUBuffer                  fill = nullptr;
+            WGPUBuffer                  line = nullptr;
+            uint64_t                    meshVersion = 0;
+            bool                        meshValid   = false;
+        };
+
         void CreateLayouts();
-        WGPURenderPipeline GetPipeline(Program p, PrimitiveType type, DepthMode depth, bool blend);
+        WGPURenderPipeline GetPipeline(Program p, PrimitiveType type, DepthMode depth, BlendSlot blend);
         void BeginPass(bool clear);
         void EndPass();
         // 写入本次提交的矩阵与换色参数，绑定管线和 group 0；未在帧内时返回 false
         bool Bind(Program p, PrimitiveType type, const Math::Mat4& viewProj, bool depth, bool blend);
+        void ApplyScissor();
         // 写进帧内流缓冲，返回偏移（容量不足时换一块更大的，旧的提交后销毁）
         uint64_t Stream(const void* data, uint64_t bytes);
         void Upload(GpuBuffer& gb, const void* data, uint64_t bytes, WGPUBufferUsage usage);
         WGPUBindGroup TextureBindGroup(WGPUTextureView view);
         void Retire(WGPUBuffer& buffer);
         void ReleaseGlyphResources();
-        void EnsureGlyphMeshes(const GlyphMeshView& meshes);
+        void EnsureGlyphMeshes(GlyphSlot& gs, const GlyphMeshView& meshes);
 
     private:
         WGPUDevice m_device = nullptr;
@@ -104,7 +122,7 @@ namespace MiniCAD
         WGPUPipelineLayout  m_colorPipeLayout = nullptr;
         WGPUPipelineLayout  m_texPipeLayout   = nullptr;
         WGPUSampler         m_sampler         = nullptr;
-        std::array<WGPURenderPipeline, 4 * 3 * 3 * 2> m_pipelines{};
+        std::array<WGPURenderPipeline, 4 * 3 * 3 * 3> m_pipelines{};
 
         FrameBuffer   m_uniforms;
         WGPUBindGroup m_uniformGroup = nullptr;
@@ -113,24 +131,14 @@ namespace MiniCAD
         std::unordered_map<uint32_t, GpuBuffer> m_cached;
         std::unordered_map<uint32_t, GpuBuffer> m_cachedText;
 
-        // 字形实例（GlyphInstancing.hpp）：网格库两个缓冲 + 各槽的实例缓冲与分批副本
-        struct GlyphSlot
-        {
-            GpuBuffer               instances;
-            std::vector<GlyphBatch> batches;
-        };
         std::unordered_map<uint32_t, GlyphSlot> m_glyphSlots;
-        std::vector<GlyphMeshRange>             m_glyphMeshes;
-        WGPUBuffer m_glyphFill = nullptr;
-        WGPUBuffer m_glyphLine = nullptr;
-        uint64_t   m_glyphMeshVersion = 0;
-        bool       m_glyphMeshValid   = false;
 
         struct ImageTexture
         {
             WGPUTexture     texture   = nullptr;     // 全为空 = 创建失败，不再重试
             WGPUTextureView view      = nullptr;
             WGPUBindGroup   bindGroup = nullptr;
+            uint32_t        ownerBits = 0;           // 按 ImageSlotOwnerMask 记录使用方槽位组
         };
         std::unordered_map<uint64_t, ImageTexture>          m_imageTextures;   // ImageData::Key
         std::unordered_map<WGPUTextureView, WGPUBindGroup>  m_textGroups;      // 文字纹理（nativeSRV）
@@ -143,5 +151,9 @@ namespace MiniCAD
         ViewportDesc           m_viewport;
         WebGPUCommon::RetireList m_retired;
         bool m_lightBackground = false;
+        PaintStyle  m_paintStyle{};
+        ScissorRect m_scissor{};
+        bool        m_scissorEmpty = false;
+        WGPUColor   m_clearColor{ 0.0, 0.0, 0.0, 0.0 };
     };
 }

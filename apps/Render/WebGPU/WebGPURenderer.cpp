@@ -16,8 +16,11 @@ namespace MiniCAD
         const char* kShader = R"(
             struct Uniforms
             {
-                viewProj : mat4x4<f32>,
-                light    : f32,          // 1 浅色背景，0 深色背景，-1 不换色（光栅图像）
+                viewProj  : mat4x4<f32>,
+                light     : f32,         // 1 浅色背景，0 深色背景，-1 不换色（光栅图像）
+                paintMode : f32,         // bit0: Monochrome 染色, bit1: Screen 预乘
+                _pad0     : vec2<f32>,
+                tintColor : vec4<f32>,   // rgb = 染色色值, a = 透明度
             };
             @group(0) @binding(0) var<uniform> u : Uniforms;
             @group(1) @binding(0) var tex  : texture_2d<f32>;
@@ -76,20 +79,38 @@ namespace MiniCAD
                 return o;
             }
 
+            fn ApplyPaint(c : vec4<f32>, isImage : bool) -> vec4<f32>
+            {
+                let a = clamp(c.a * u.tintColor.a, 0.0, 1.0);
+                var rgb = c.rgb;
+                if (u.paintMode == 1.0 || u.paintMode == 3.0)
+                {
+                    let maxC = max(rgb.r, max(rgb.g, rgb.b));
+                    let rawLum = clamp(max(dot(rgb, vec3<f32>(0.299, 0.587, 0.114)), maxC), 0.0, 1.0);
+                    let lum = select(0.80 + 0.20 * rawLum, clamp(dot(rgb, vec3<f32>(0.299, 0.587, 0.114)), 0.0, 1.0), isImage);
+                    rgb = u.tintColor.rgb * lum;
+                }
+                if (u.paintMode >= 1.5)
+                {
+                    return vec4<f32>(rgb * a, a);
+                }
+                return vec4<f32>(rgb, a);
+            }
+
             @fragment fn fsColor(i : VOut) -> @location(0) vec4<f32>
             {
-                return i.color;
+                return ApplyPaint(i.color, false);
             }
 
             // 文字：字形图集只用 alpha
             @fragment fn fsText(i : VOut) -> @location(0) vec4<f32>
             {
-                return vec4<f32>(i.color.rgb, i.color.a * textureSample(tex, samp, i.uv).a);
+                return ApplyPaint(vec4<f32>(i.color.rgb, i.color.a * textureSample(tex, samp, i.uv).a), false);
             }
 
             @fragment fn fsImage(i : VOut) -> @location(0) vec4<f32>
             {
-                return textureSample(tex, samp, i.uv) * i.color;
+                return ApplyPaint(textureSample(tex, samp, i.uv) * i.color, true);
             }
         )";
 
@@ -97,9 +118,11 @@ namespace MiniCAD
         {
             float viewProj[16];
             float light;
-            float pad[3];
+            float paintMode;
+            float pad0[2];
+            float tintColor[4];
         };
-        static_assert(sizeof(Uniforms) == 80);
+        static_assert(sizeof(Uniforms) == 96);
 
         constexpr uint64_t kUniformStride   = 256;          // minUniformBufferOffsetAlignment 的上限，所有设备都满足
         constexpr uint64_t kInitialUniforms = 256 * kUniformStride;
@@ -161,7 +184,7 @@ namespace MiniCAD
     {
         WGPUBindGroupLayoutEntry ue = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
         ue.binding    = 0;
-        ue.visibility = WGPUShaderStage_Vertex;
+        ue.visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
         ue.buffer.type             = WGPUBufferBindingType_Uniform;
         ue.buffer.hasDynamicOffset = true;
         ue.buffer.minBindingSize   = sizeof(Uniforms);
@@ -192,9 +215,9 @@ namespace MiniCAD
         m_texPipeLayout = wgpuDeviceCreatePipelineLayout(m_device, &pd);
     }
 
-    WGPURenderPipeline WebGPURenderer::GetPipeline(Program p, PrimitiveType type, DepthMode depth, bool blend)
+    WGPURenderPipeline WebGPURenderer::GetPipeline(Program p, PrimitiveType type, DepthMode depth, BlendSlot blend)
     {
-        const size_t index = ((static_cast<size_t>(p) * 3 + static_cast<size_t>(type)) * 3 + static_cast<size_t>(depth)) * 2 + (blend ? 1 : 0);
+        const size_t index = ((static_cast<size_t>(p) * 3 + static_cast<size_t>(type)) * 3 + static_cast<size_t>(depth)) * 3 + static_cast<size_t>(blend);
         WGPURenderPipeline& pipeline = m_pipelines[index];
         if (pipeline)
             return pipeline;
@@ -259,11 +282,19 @@ namespace MiniCAD
 
         // ── 混合：与 D3D11Renderer 相同，颜色按 alpha 混合，alpha 直接写入 ──
         WGPUBlendState blendState = WGPU_BLEND_STATE_INIT;
-        blendState.color = { WGPUBlendOperation_Add, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha };
-        blendState.alpha = { WGPUBlendOperation_Add, WGPUBlendFactor_One,      WGPUBlendFactor_Zero };
+        if (blend == BlendSlot::Screen)
+        {
+            blendState.color = { WGPUBlendOperation_Add, WGPUBlendFactor_One, WGPUBlendFactor_OneMinusSrc };
+            blendState.alpha = { WGPUBlendOperation_Add, WGPUBlendFactor_One, WGPUBlendFactor_OneMinusSrcAlpha };
+        }
+        else
+        {
+            blendState.color = { WGPUBlendOperation_Add, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha };
+            blendState.alpha = { WGPUBlendOperation_Add, WGPUBlendFactor_One,      WGPUBlendFactor_OneMinusSrcAlpha };
+        }
         WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
         target.format    = WebGPURenderTarget::kColorFormat;
-        target.blend     = blend ? &blendState : nullptr;
+        target.blend     = blend != BlendSlot::Off ? &blendState : nullptr;
         target.writeMask = WGPUColorWriteMask_All;
 
         WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
@@ -299,10 +330,55 @@ namespace MiniCAD
     {
         if (m_encoder)
             EndFrame();
-        m_target   = static_cast<WebGPURenderTarget*>(&target);
-        m_viewport = vp;
-        m_encoder  = wgpuDeviceCreateCommandEncoder(m_device, nullptr);
+        m_target       = static_cast<WebGPURenderTarget*>(&target);
+        m_viewport     = vp;
+        m_paintStyle   = {};
+        m_scissor      = {};
+        m_scissorEmpty = false;
+        m_encoder      = wgpuDeviceCreateCommandEncoder(m_device, nullptr);
         BeginPass(true);
+    }
+
+    void WebGPURenderer::SetScissorRect(const ScissorRect& rect)
+    {
+        m_scissor = rect;
+        ApplyScissor();
+    }
+
+    void WebGPURenderer::ApplyScissor()
+    {
+        if (!m_target)
+        {
+            m_scissorEmpty = false;
+            return;
+        }
+        const int tw = m_target->GetWidth();
+        const int th = m_target->GetHeight();
+        if (tw <= 0 || th <= 0)
+        {
+            m_scissorEmpty = true;
+            return;
+        }
+        if (!m_scissor.Enabled)
+        {
+            m_scissorEmpty = false;
+            if (m_pass)
+                wgpuRenderPassEncoderSetScissorRect(m_pass, 0, 0, static_cast<uint32_t>(tw), static_cast<uint32_t>(th));
+            return;
+        }
+        const int x0 = std::clamp(m_scissor.X, 0, tw);
+        const int y0 = std::clamp(m_scissor.Y, 0, th);
+        const int x1 = std::clamp(m_scissor.X + m_scissor.Width, 0, tw);
+        const int y1 = std::clamp(m_scissor.Y + m_scissor.Height, 0, th);
+        if (x1 <= x0 || y1 <= y0)
+        {
+            m_scissorEmpty = true;
+            return;
+        }
+        m_scissorEmpty = false;
+        if (m_pass)
+            wgpuRenderPassEncoderSetScissorRect(m_pass, static_cast<uint32_t>(x0), static_cast<uint32_t>(y0),
+                                                static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0));
     }
 
     void WebGPURenderer::BeginPass(bool clear)
@@ -311,7 +387,7 @@ namespace MiniCAD
         color.view       = m_target->GetColorView();
         color.loadOp     = clear ? WGPULoadOp_Clear : WGPULoadOp_Load;
         color.storeOp    = WGPUStoreOp_Store;
-        color.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 0.0 };
+        color.clearValue = m_clearColor;
 
         WGPURenderPassDepthStencilAttachment depth = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
         depth.view            = m_target->GetDepthView();
@@ -333,6 +409,7 @@ namespace MiniCAD
         const float w  = std::clamp(m_viewport.width,  0.0f, tw - x);
         const float h  = std::clamp(m_viewport.height, 0.0f, th - y);
         wgpuRenderPassEncoderSetViewport(m_pass, x, y, w, h, 0.0f, 1.0f);
+        ApplyScissor();
     }
 
     void WebGPURenderer::EndPass()
@@ -377,7 +454,7 @@ namespace MiniCAD
     // =========================================================
     bool WebGPURenderer::Bind(Program p, PrimitiveType type, const Math::Mat4& viewProj, bool depth, bool blend)
     {
-        if (!m_pass)
+        if (!m_pass || m_scissorEmpty)
             return false;
 
         if (m_uniforms.used + kUniformStride > m_uniforms.capacity)
@@ -405,13 +482,22 @@ namespace MiniCAD
         Uniforms u{};
         for (int i = 0; i < 16; ++i)
             u.viewProj[i] = static_cast<float>(viewProj.m[i]);
-        u.light = p == Program::Image ? -1.0f : (m_lightBackground ? 1.0f : 0.0f);
+        u.light        = p == Program::Image ? -1.0f : (m_lightBackground ? 1.0f : 0.0f);
+        u.paintMode    = (m_paintStyle.TintMode == PaintTintMode::Monochrome ? 1.0f : 0.0f)
+                       + (m_paintStyle.BlendMode == PaintBlendMode::Screen ? 2.0f : 0.0f);
+        u.tintColor[0] = m_paintStyle.TintR;
+        u.tintColor[1] = m_paintStyle.TintG;
+        u.tintColor[2] = m_paintStyle.TintB;
+        u.tintColor[3] = m_paintStyle.Opacity;
         const uint64_t offset = m_uniforms.used;
         wgpuQueueWriteBuffer(m_queue, m_uniforms.buffer, offset, &u, sizeof(u));
         m_uniforms.used += kUniformStride;
 
-        const DepthMode mode = !depth ? DepthMode::Off : (blend ? DepthMode::Test : DepthMode::TestWrite);
-        wgpuRenderPassEncoderSetPipeline(m_pass, GetPipeline(p, type, mode, blend));
+        const BlendSlot blendSlot = (m_paintStyle.BlendMode == PaintBlendMode::Screen)
+            ? BlendSlot::Screen
+            : ((blend || m_paintStyle.Opacity < 0.999f) ? BlendSlot::Alpha : BlendSlot::Off);
+        const DepthMode mode = !depth ? DepthMode::Off : (blendSlot != BlendSlot::Off ? DepthMode::Test : DepthMode::TestWrite);
+        wgpuRenderPassEncoderSetPipeline(m_pass, GetPipeline(p, type, mode, blendSlot));
         const uint32_t dynamicOffset = static_cast<uint32_t>(offset);
         wgpuRenderPassEncoderSetBindGroup(m_pass, 0, m_uniformGroup, 1, &dynamicOffset);
         return true;
@@ -480,6 +566,60 @@ namespace MiniCAD
         m_textGroups.clear();
     }
 
+    void WebGPURenderer::ReleaseSlotRange(uint32_t firstSlot, uint32_t lastSlot)
+    {
+        auto eraseBuffers = [&](std::unordered_map<uint32_t, GpuBuffer>& cache)
+        {
+            for (auto it = cache.begin(); it != cache.end();)
+            {
+                if (it->first >= firstSlot && it->first <= lastSlot)
+                {
+                    Retire(it->second.buffer);
+                    it = cache.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        };
+        eraseBuffers(m_cached);
+        eraseBuffers(m_cachedText);
+        for (auto it = m_glyphSlots.begin(); it != m_glyphSlots.end();)
+        {
+            if (it->first >= firstSlot && it->first <= lastSlot)
+            {
+                Retire(it->second.instances.buffer);
+                Retire(it->second.fill);
+                Retire(it->second.line);
+                it = m_glyphSlots.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        const uint32_t clearBits = IRenderer::ImageSlotOwnerMask(firstSlot, lastSlot);
+        if (clearBits)
+        {
+            for (auto it = m_imageTextures.begin(); it != m_imageTextures.end();)
+            {
+                it->second.ownerBits &= ~clearBits;
+                if (it->second.ownerBits == 0)
+                {
+                    if (it->second.bindGroup) wgpuBindGroupRelease(it->second.bindGroup);
+                    if (it->second.view)      wgpuTextureViewRelease(it->second.view);
+                    DestroyTexture(it->second.texture);
+                    it = m_imageTextures.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        }
+    }
+
     // =========================================================
     // 提交
     // =========================================================
@@ -508,9 +648,15 @@ namespace MiniCAD
 
     void WebGPURenderer::SubmitImage(const ImageData& image, std::span<const Vertex_P3_C4_UV> quad, const Math::Mat4& viewProj)
     {
+        SubmitImageForSlot(image, quad, viewProj, 0);
+    }
+
+    void WebGPURenderer::SubmitImageForSlot(const ImageData& image, std::span<const Vertex_P3_C4_UV> quad, const Math::Mat4& viewProj, uint32_t slotOffset)
+    {
         if (quad.empty() || image.Width == 0 || image.Height == 0 || image.Rgba.empty() || !m_pass)
             return;
 
+        const uint32_t ownerBit = IRenderer::ImageSlotOwnerMask(slotOffset, slotOffset);
         auto it = m_imageTextures.find(image.Key);
         if (it == m_imageTextures.end())
         {
@@ -538,7 +684,12 @@ namespace MiniCAD
             {
                 LOG_WARN_TR("WebGPURenderer: 光栅图像 {0}x{1} 超过纹理尺寸上限 {2}，不显示", static_cast<unsigned>(image.Width), static_cast<unsigned>(image.Height), m_maxTextureSize);
             }
+            im.ownerBits = ownerBit;
             it = m_imageTextures.emplace(image.Key, im).first;
+        }
+        else
+        {
+            it->second.ownerBits |= ownerBit;
         }
         if (!it->second.bindGroup || !Bind(Program::Image, PrimitiveType::Triangle, viewProj, false, true))
             return;
@@ -602,18 +753,18 @@ namespace MiniCAD
     void WebGPURenderer::ReleaseGlyphResources()
     {
         for (auto& [slot, gs] : m_glyphSlots)
+        {
             Retire(gs.instances.buffer);
+            Retire(gs.fill);
+            Retire(gs.line);
+        }
         m_glyphSlots.clear();
-        Retire(m_glyphFill);
-        Retire(m_glyphLine);
-        m_glyphMeshes.clear();
-        m_glyphMeshValid = false;
     }
 
-    // 字形网格库：版本变化时整体重新上传（几 MB，只在新增字形时变化）
-    void WebGPURenderer::EnsureGlyphMeshes(const GlyphMeshView& meshes)
+    // 字形网格库：版本变化时整体重新上传（按槽位独立持有，主图/对比图互不覆盖）
+    void WebGPURenderer::EnsureGlyphMeshes(GlyphSlot& gs, const GlyphMeshView& meshes)
     {
-        if (m_glyphMeshValid && m_glyphMeshVersion == meshes.Version)
+        if (gs.meshValid && gs.meshVersion == meshes.Version)
             return;
         auto upload = [this](WGPUBuffer& buffer, std::span<const Math::Float2> verts)
         {
@@ -622,11 +773,11 @@ namespace MiniCAD
             if (!verts.empty())
                 wgpuQueueWriteBuffer(m_queue, buffer, 0, verts.data(), verts.size_bytes());
         };
-        upload(m_glyphFill, meshes.FillVerts);
-        upload(m_glyphLine, meshes.LineVerts);
-        m_glyphMeshes.assign(meshes.Meshes.begin(), meshes.Meshes.end());
-        m_glyphMeshVersion = meshes.Version;
-        m_glyphMeshValid   = true;
+        upload(gs.fill, meshes.FillVerts);
+        upload(gs.line, meshes.LineVerts);
+        gs.meshes.assign(meshes.Meshes.begin(), meshes.Meshes.end());
+        gs.meshVersion = meshes.Version;
+        gs.meshValid   = true;
     }
 
     void WebGPURenderer::SubmitGlyphsCached(uint32_t slot, uint64_t version, const GlyphMeshView& meshes,
@@ -642,20 +793,20 @@ namespace MiniCAD
             gs.instances.valid   = true;
             gs.batches.assign(batches.begin(), batches.end());
         }
-        EnsureGlyphMeshes(meshes);
+        EnsureGlyphMeshes(gs, meshes);
         if (gs.instances.count == 0)
             return;
 
         const bool fill = type == PrimitiveType::Triangle;
-        WGPUBuffer meshBuffer = fill ? m_glyphFill : m_glyphLine;
+        WGPUBuffer meshBuffer = fill ? gs.fill : gs.line;
         if (!Bind(Program::Glyph, fill ? PrimitiveType::Triangle : PrimitiveType::Line, viewProj, depth, blend))
             return;
         wgpuRenderPassEncoderSetVertexBuffer(m_pass, 0, meshBuffer, 0, wgpuBufferGetSize(meshBuffer));
         wgpuRenderPassEncoderSetVertexBuffer(m_pass, 1, gs.instances.buffer, 0, static_cast<uint64_t>(gs.instances.count) * sizeof(GlyphInstance));
         for (const GlyphBatch& b : gs.batches)
         {
-            if (b.mesh >= m_glyphMeshes.size()) continue;
-            const GlyphMeshRange& m = m_glyphMeshes[b.mesh];
+            if (b.mesh >= gs.meshes.size()) continue;
+            const GlyphMeshRange& m = gs.meshes[b.mesh];
             const uint32_t n     = fill ? m.fillCount : m.lineCount;
             const uint32_t start = fill ? m.fillStart : m.lineStart;
             if (n == 0) continue;
@@ -668,7 +819,7 @@ namespace MiniCAD
     {
         auto it = m_glyphSlots.find(slot);
         return it != m_glyphSlots.end() && it->second.instances.valid && it->second.instances.version == version
-            && m_glyphMeshValid && m_glyphMeshVersion == meshVersion;
+            && it->second.meshValid && it->second.meshVersion == meshVersion;
     }
 
     // =========================================================

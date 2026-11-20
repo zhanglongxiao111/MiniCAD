@@ -1,6 +1,7 @@
 #include "GLES3/GLES3Renderer.h"
 #include "GLES3/GLRenderTarget.h"
 #include "Core/Log.h"
+#include <algorithm>
 #include <cstddef>
 #include <string>
 
@@ -99,28 +100,40 @@ namespace MiniCAD
                 gl_Position = uViewProj * vec4(w, aT.z, 1.0);
             })";
 
-        const char* kFragmentColor = R"(#version 300 es
-            precision mediump float;
-            in vec4 vColor;
-            out vec4 outColor;
-            void main() { outColor = vColor; })";
+        #define MINICAD_GL_APPLY_PAINT \
+            "uniform float uPaintMode;\n" \
+            "uniform vec4 uTintColor;\n" \
+            "vec4 ApplyPaint(vec4 c, bool isImage) {\n" \
+            "    float a = clamp(c.a * uTintColor.a, 0.0, 1.0);\n" \
+            "    vec3 rgb = c.rgb;\n" \
+            "    if (uPaintMode == 1.0 || uPaintMode == 3.0) {\n" \
+            "        float maxC = max(rgb.r, max(rgb.g, rgb.b));\n" \
+            "        float rawLum = clamp(max(dot(rgb, vec3(0.299, 0.587, 0.114)), maxC), 0.0, 1.0);\n" \
+            "        float lum = isImage ? clamp(dot(rgb, vec3(0.299, 0.587, 0.114)), 0.0, 1.0) : (0.80 + 0.20 * rawLum);\n" \
+            "        rgb = uTintColor.rgb * lum;\n" \
+            "    }\n" \
+            "    if (uPaintMode >= 1.5) return vec4(rgb * a, a);\n" \
+            "    return vec4(rgb, a);\n" \
+            "}\n"
+
+        const char* kFragmentColor =
+            "#version 300 es\nprecision mediump float;\n"
+            MINICAD_GL_APPLY_PAINT
+            "in vec4 vColor;\nout vec4 outColor;\n"
+            "void main() { outColor = ApplyPaint(vColor, false); }";
 
         // 文字：字形图集只用 alpha
-        const char* kFragmentText = R"(#version 300 es
-            precision mediump float;
-            uniform sampler2D uTex;
-            in vec4 vColor;
-            in vec2 vUV;
-            out vec4 outColor;
-            void main() { outColor = vec4(vColor.rgb, vColor.a * texture(uTex, vUV).a); })";
+        const char* kFragmentText =
+            "#version 300 es\nprecision mediump float;\nuniform sampler2D uTex;\n"
+            MINICAD_GL_APPLY_PAINT
+            "in vec4 vColor;\nin vec2 vUV;\nout vec4 outColor;\n"
+            "void main() { outColor = ApplyPaint(vec4(vColor.rgb, vColor.a * texture(uTex, vUV).a), false); }";
 
-        const char* kFragmentImage = R"(#version 300 es
-            precision mediump float;
-            uniform sampler2D uTex;
-            in vec4 vColor;
-            in vec2 vUV;
-            out vec4 outColor;
-            void main() { outColor = texture(uTex, vUV) * vColor; })";
+        const char* kFragmentImage =
+            "#version 300 es\nprecision mediump float;\nuniform sampler2D uTex;\n"
+            MINICAD_GL_APPLY_PAINT
+            "in vec4 vColor;\nin vec2 vUV;\nout vec4 outColor;\n"
+            "void main() { outColor = ApplyPaint(texture(uTex, vUV) * vColor, true); }";
 
         GLuint Compile(GLenum type, const char* source)
         {
@@ -171,9 +184,11 @@ namespace MiniCAD
         for (int i = 0; i < 3; ++i)
         {
             ProgramInfo& info = m_programs[i];
-            info.program  = Link(i == 0 ? kVertexColor : kVertexTextured, fragments[i]);
-            info.viewProj = glGetUniformLocation(info.program, "uViewProj");
-            info.light    = glGetUniformLocation(info.program, "uLight");
+            info.program   = Link(i == 0 ? kVertexColor : kVertexTextured, fragments[i]);
+            info.viewProj  = glGetUniformLocation(info.program, "uViewProj");
+            info.light     = glGetUniformLocation(info.program, "uLight");
+            info.paintMode = glGetUniformLocation(info.program, "uPaintMode");
+            info.tintColor = glGetUniformLocation(info.program, "uTintColor");
             if (i != 0)
             {
                 glUseProgram(info.program);
@@ -182,9 +197,11 @@ namespace MiniCAD
         }
         {
             ProgramInfo& info = m_programs[static_cast<int>(Program::Glyph)];
-            info.program  = Link(kVertexGlyph, kFragmentColor);
-            info.viewProj = glGetUniformLocation(info.program, "uViewProj");
-            info.light    = glGetUniformLocation(info.program, "uLight");
+            info.program   = Link(kVertexGlyph, kFragmentColor);
+            info.viewProj  = glGetUniformLocation(info.program, "uViewProj");
+            info.light     = glGetUniformLocation(info.program, "uLight");
+            info.paintMode = glGetUniformLocation(info.program, "uPaintMode");
+            info.tintColor = glGetUniformLocation(info.program, "uTintColor");
         }
         InitVertexBuffer(m_stream, false);
         InitVertexBuffer(m_textStream, true);
@@ -204,9 +221,9 @@ namespace MiniCAD
         for (auto& [slot, vb] : m_cachedText) destroy(vb);
         ReleaseGlyphResources();
         glDeleteVertexArrays(1, &m_glyphVao);
-        for (auto& [key, tex] : m_imageTextures)
-            if (tex)
-                glDeleteTextures(1, &tex);
+        for (auto& [key, im] : m_imageTextures)
+            if (im.tex)
+                glDeleteTextures(1, &im.tex);
         for (ProgramInfo& p : m_programs)
             glDeleteProgram(p.program);
     }
@@ -223,10 +240,64 @@ namespace MiniCAD
         m_cached.clear();
         m_cachedText.clear();
         ReleaseGlyphResources();
-        for (auto& [key, tex] : m_imageTextures)
-            if (tex)
-                glDeleteTextures(1, &tex);
+        for (auto& [key, im] : m_imageTextures)
+            if (im.tex)
+                glDeleteTextures(1, &im.tex);
         m_imageTextures.clear();
+    }
+
+    void GLES3Renderer::ReleaseSlotRange(uint32_t firstSlot, uint32_t lastSlot)
+    {
+        auto eraseBuffers = [&](std::unordered_map<uint32_t, VertexBuffer>& cache)
+        {
+            for (auto it = cache.begin(); it != cache.end();)
+            {
+                if (it->first >= firstSlot && it->first <= lastSlot)
+                {
+                    glDeleteBuffers(1, &it->second.vbo);
+                    glDeleteVertexArrays(1, &it->second.vao);
+                    it = cache.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        };
+        eraseBuffers(m_cached);
+        eraseBuffers(m_cachedText);
+        for (auto it = m_glyphSlots.begin(); it != m_glyphSlots.end();)
+        {
+            if (it->first >= firstSlot && it->first <= lastSlot)
+            {
+                glDeleteBuffers(1, &it->second.instances.vbo);
+                glDeleteBuffers(1, &it->second.fillVbo);
+                glDeleteBuffers(1, &it->second.lineVbo);
+                it = m_glyphSlots.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        const uint32_t clearBits = IRenderer::ImageSlotOwnerMask(firstSlot, lastSlot);
+        if (clearBits)
+        {
+            for (auto it = m_imageTextures.begin(); it != m_imageTextures.end();)
+            {
+                it->second.ownerBits &= ~clearBits;
+                if (it->second.ownerBits == 0)
+                {
+                    if (it->second.tex)
+                        glDeleteTextures(1, &it->second.tex);
+                    it = m_imageTextures.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        }
     }
 
     void GLES3Renderer::InitVertexBuffer(VertexBuffer& vb, bool textured)
@@ -296,9 +367,15 @@ namespace MiniCAD
         float m[16];
         for (int i = 0; i < 16; ++i)
             m[i] = static_cast<float>(viewProj.m[i]);
+        const float pm = (m_paintStyle.TintMode == PaintTintMode::Monochrome ? 1.0f : 0.0f)
+                       + (m_paintStyle.BlendMode == PaintBlendMode::Screen ? 2.0f : 0.0f);
+        const bool effectiveBlend = blend || (m_paintStyle.BlendMode == PaintBlendMode::Screen) || (m_paintStyle.Opacity < 0.999f);
+
         glUseProgram(info.program);
         glUniformMatrix4fv(info.viewProj, 1, GL_FALSE, m);
         glUniform1f(info.light, p == Program::Image ? -1.0f : (m_lightBackground ? 1.0f : 0.0f));
+        glUniform1f(info.paintMode, pm);
+        glUniform4f(info.tintColor, m_paintStyle.TintR, m_paintStyle.TintG, m_paintStyle.TintB, m_paintStyle.Opacity);
 
         // 深度：与 D3D11Renderer 相同——不测试 / 混合的只测试不写入 / 不混合的测试并写入（三维视图的着色面）
         if (!depth)
@@ -307,15 +384,17 @@ namespace MiniCAD
         {
             glEnable(GL_DEPTH_TEST);
             glDepthFunc(GL_LESS);
-            glDepthMask(blend ? GL_FALSE : GL_TRUE);
+            glDepthMask(effectiveBlend ? GL_FALSE : GL_TRUE);
         }
 
-        if (blend)
+        if (effectiveBlend)
         {
-            // 与 D3D11Renderer 相同：颜色按 alpha 混合，alpha 直接写入
             glEnable(GL_BLEND);
             glBlendEquation(GL_FUNC_ADD);
-            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);
+            if (m_paintStyle.BlendMode == PaintBlendMode::Screen)
+                glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_COLOR, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            else
+                glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         }
         else
         {
@@ -336,19 +415,56 @@ namespace MiniCAD
         const int height = target.GetHeight();
         glViewport(static_cast<GLint>(vp.x), static_cast<GLint>(height - (vp.y + vp.height)),
                    static_cast<GLsizei>(vp.width), static_cast<GLsizei>(vp.height));
+        m_paintStyle   = {};
+        m_scissor      = {};
+        m_scissorEmpty = false;
         glDisable(GL_SCISSOR_TEST);
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_CULL_FACE);
-        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClearColor(m_clearColor[0], m_clearColor[1], m_clearColor[2], m_clearColor[3]);
         glDepthMask(GL_TRUE);
         glClearDepthf(1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     }
 
+    void GLES3Renderer::SetScissorRect(const ScissorRect& rect)
+    {
+        m_scissor = rect;
+        if (!m_currentTarget || !m_scissor.Enabled)
+        {
+            m_scissorEmpty = false;
+            glDisable(GL_SCISSOR_TEST);
+            return;
+        }
+        const int tw = m_currentTarget->GetWidth();
+        const int th = m_currentTarget->GetHeight();
+        if (tw <= 0 || th <= 0)
+        {
+            m_scissorEmpty = true;
+            glDisable(GL_SCISSOR_TEST);
+            return;
+        }
+        const int x0 = std::clamp(m_scissor.X, 0, tw);
+        const int y0 = std::clamp(m_scissor.Y, 0, th);
+        const int x1 = std::clamp(m_scissor.X + m_scissor.Width, 0, tw);
+        const int y1 = std::clamp(m_scissor.Y + m_scissor.Height, 0, th);
+        if (x1 <= x0 || y1 <= y0)
+        {
+            m_scissorEmpty = true;
+            glDisable(GL_SCISSOR_TEST);
+            return;
+        }
+        m_scissorEmpty = false;
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(x0, th - y1, x1 - x0, y1 - y0);
+    }
+
     void GLES3Renderer::EndFrame()
     {
         m_currentTarget = nullptr;
+        m_scissorEmpty  = false;
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDisable(GL_SCISSOR_TEST);
         glDisable(GL_BLEND);
         glDisable(GL_DEPTH_TEST);   // 与界面层共用上下文：恢复默认深度状态
         glDepthMask(GL_TRUE);
@@ -359,7 +475,7 @@ namespace MiniCAD
     // =========================================================
     void GLES3Renderer::Submit(std::span<const Vertex_P3_C4> verts, const Math::Mat4& viewProj, PrimitiveType type, bool depth, bool blend)
     {
-        if (verts.empty())
+        if (verts.empty() || m_scissorEmpty)
             return;
         UseProgram(Program::Color, viewProj, depth, blend);
         Upload(m_stream, verts.data(), verts.size_bytes(), GL_STREAM_DRAW);
@@ -368,7 +484,7 @@ namespace MiniCAD
 
     void GLES3Renderer::SubmitTextured(std::span<const Vertex_P3_C4_UV> verts, const Math::Mat4& viewProj, void* nativeSRV, bool depth, bool blend)
     {
-        if (verts.empty() || !nativeSRV)
+        if (verts.empty() || !nativeSRV || m_scissorEmpty)
             return;
         UseProgram(Program::Text, viewProj, depth, blend);
         glActiveTexture(GL_TEXTURE0);
@@ -379,9 +495,15 @@ namespace MiniCAD
 
     void GLES3Renderer::SubmitImage(const ImageData& image, std::span<const Vertex_P3_C4_UV> quad, const Math::Mat4& viewProj)
     {
-        if (quad.empty() || image.Width == 0 || image.Height == 0 || image.Rgba.empty())
+        SubmitImageForSlot(image, quad, viewProj, 0);
+    }
+
+    void GLES3Renderer::SubmitImageForSlot(const ImageData& image, std::span<const Vertex_P3_C4_UV> quad, const Math::Mat4& viewProj, uint32_t slotOffset)
+    {
+        if (quad.empty() || image.Width == 0 || image.Height == 0 || image.Rgba.empty() || m_scissorEmpty)
             return;
 
+        const uint32_t ownerBit = IRenderer::ImageSlotOwnerMask(slotOffset, slotOffset);
         auto it = m_imageTextures.find(image.Key);
         if (it == m_imageTextures.end())
         {
@@ -396,14 +518,18 @@ namespace MiniCAD
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(image.Width), static_cast<GLsizei>(image.Height),
                          0, GL_RGBA, GL_UNSIGNED_BYTE, image.Rgba.data());
             glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-            it = m_imageTextures.emplace(image.Key, tex).first;
+            it = m_imageTextures.emplace(image.Key, ImageTexture{ tex, ownerBit }).first;
         }
-        if (!it->second)
+        else
+        {
+            it->second.ownerBits |= ownerBit;
+        }
+        if (!it->second.tex)
             return;
 
         UseProgram(Program::Image, viewProj, false, true);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, it->second);
+        glBindTexture(GL_TEXTURE_2D, it->second.tex);
         Upload(m_textStream, quad.data(), quad.size_bytes(), GL_STREAM_DRAW);
         Draw(m_textStream, GL_TRIANGLES, static_cast<GLsizei>(quad.size()));
     }
@@ -418,19 +544,18 @@ namespace MiniCAD
     void GLES3Renderer::ReleaseGlyphResources()
     {
         for (auto& [slot, gs] : m_glyphSlots)
+        {
             glDeleteBuffers(1, &gs.instances.vbo);
+            glDeleteBuffers(1, &gs.fillVbo);
+            glDeleteBuffers(1, &gs.lineVbo);
+        }
         m_glyphSlots.clear();
-        glDeleteBuffers(1, &m_glyphFillVbo);
-        glDeleteBuffers(1, &m_glyphLineVbo);
-        m_glyphFillVbo = m_glyphLineVbo = 0;
-        m_glyphMeshes.clear();
-        m_glyphMeshValid = false;
     }
 
-    // 字形网格库：版本变化时整体重新上传（几 MB，只在新增字形时变化）
-    void GLES3Renderer::EnsureGlyphMeshes(const GlyphMeshView& meshes)
+    // 字形网格库：版本变化时整体重新上传（按槽位独立持有）
+    void GLES3Renderer::EnsureGlyphMeshes(GlyphSlot& gs, const GlyphMeshView& meshes)
     {
-        if (m_glyphMeshValid && m_glyphMeshVersion == meshes.Version)
+        if (gs.meshValid && gs.meshVersion == meshes.Version)
             return;
         auto upload = [](GLuint& vbo, std::span<const Math::Float2> verts)
         {
@@ -438,11 +563,11 @@ namespace MiniCAD
             glBindBuffer(GL_ARRAY_BUFFER, vbo);
             glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(verts.size_bytes()), verts.data(), GL_STATIC_DRAW);
         };
-        upload(m_glyphFillVbo, meshes.FillVerts);
-        upload(m_glyphLineVbo, meshes.LineVerts);
-        m_glyphMeshes.assign(meshes.Meshes.begin(), meshes.Meshes.end());
-        m_glyphMeshVersion = meshes.Version;
-        m_glyphMeshValid   = true;
+        upload(gs.fillVbo, meshes.FillVerts);
+        upload(gs.lineVbo, meshes.LineVerts);
+        gs.meshes.assign(meshes.Meshes.begin(), meshes.Meshes.end());
+        gs.meshVersion = meshes.Version;
+        gs.meshValid   = true;
     }
 
     void GLES3Renderer::SubmitGlyphsCached(uint32_t slot, uint64_t version, const GlyphMeshView& meshes,
@@ -459,10 +584,10 @@ namespace MiniCAD
             gs.instances.valid   = true;
             gs.batches.assign(batches.begin(), batches.end());
         }
-        EnsureGlyphMeshes(meshes);
-        if (gs.instances.count == 0)
+        EnsureGlyphMeshes(gs, meshes);
+        if (gs.instances.count == 0 || m_scissorEmpty)
             return;
-        const GLuint meshVbo = type == PrimitiveType::Triangle ? m_glyphFillVbo : m_glyphLineVbo;
+        const GLuint meshVbo = type == PrimitiveType::Triangle ? gs.fillVbo : gs.lineVbo;
 
         UseProgram(Program::Glyph, viewProj, depth, blend);
         glBindVertexArray(m_glyphVao);
@@ -479,8 +604,8 @@ namespace MiniCAD
         constexpr GLsizei stride = sizeof(GlyphInstance);
         for (const GlyphBatch& b : gs.batches)
         {
-            if (b.mesh >= m_glyphMeshes.size()) continue;
-            const GlyphMeshRange& m = m_glyphMeshes[b.mesh];
+            if (b.mesh >= gs.meshes.size()) continue;
+            const GlyphMeshRange& m = gs.meshes[b.mesh];
             const GLsizei n     = static_cast<GLsizei>(type == PrimitiveType::Triangle ? m.fillCount : m.lineCount);
             const GLint   start = static_cast<GLint>(type == PrimitiveType::Triangle ? m.fillStart : m.lineStart);
             if (n == 0) continue;
@@ -498,7 +623,7 @@ namespace MiniCAD
     {
         auto it = m_glyphSlots.find(slot);
         return it != m_glyphSlots.end() && it->second.instances.valid && it->second.instances.version == version
-            && m_glyphMeshValid && m_glyphMeshVersion == meshVersion;
+            && it->second.meshValid && it->second.meshVersion == meshVersion;
     }
 
     void GLES3Renderer::SubmitCached(uint32_t slot, uint64_t version, std::span<const Vertex_P3_C4> verts,
@@ -512,7 +637,7 @@ namespace MiniCAD
             vb.version = version;
             vb.valid   = true;
         }
-        if (vb.count == 0)
+        if (vb.count == 0 || m_scissorEmpty)
             return;
         UseProgram(Program::Color, viewProj, depth, blend);
         Draw(vb, PrimitiveMode(type), vb.count);
@@ -531,7 +656,7 @@ namespace MiniCAD
             vb.version = version;
             vb.valid   = true;
         }
-        if (vb.count == 0)
+        if (vb.count == 0 || m_scissorEmpty)
             return;
         UseProgram(Program::Text, viewProj, depth, blend);
         glActiveTexture(GL_TEXTURE0);

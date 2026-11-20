@@ -28,6 +28,7 @@ namespace MiniCAD
         void Submit(std::span<const Vertex_P3_C4> verts, const Math::Mat4& viewProj, PrimitiveType type, bool depth = true, bool blend = false) override;
         void SubmitTextured(std::span<const Vertex_P3_C4_UV> verts, const Math::Mat4& viewProj, void* nativeSRV, bool depth = false, bool blend = true) override;
         void SubmitImage(const ImageData& image, std::span<const Vertex_P3_C4_UV> quad, const Math::Mat4& viewProj) override;
+        void SubmitImageForSlot(const ImageData& image, std::span<const Vertex_P3_C4_UV> quad, const Math::Mat4& viewProj, uint32_t slotOffset) override;
 
         void SubmitCached(uint32_t slot, uint64_t version,
                           std::span<const Vertex_P3_C4> verts,
@@ -47,7 +48,11 @@ namespace MiniCAD
         std::unique_ptr<IRenderTarget> CreateLayerTarget() override;
         void  DrawLayer(IRenderTarget& layer) override;
         void  SetLightBackground(bool light) override { m_lightBackground = light; }
+        void  SetPaintStyle(const PaintStyle& style) override { m_paintStyle = style; }
+        void  SetScissorRect(const ScissorRect& rect) override;
+        void  SetClearColor(float r, float g, float b, float a) override { m_clearColor[0] = r; m_clearColor[1] = g; m_clearColor[2] = b; m_clearColor[3] = a; }
         void  ReleaseCachedResources() override;
+        void  ReleaseSlotRange(uint32_t firstSlot, uint32_t lastSlot) override;
         void* GetNativeDevice() override { return nullptr; }
 
     private:
@@ -55,9 +60,11 @@ namespace MiniCAD
 
         struct ProgramInfo
         {
-            GLuint program = 0;
-            GLint  viewProj = -1;
-            GLint  light    = -1;
+            GLuint program   = 0;
+            GLint  viewProj  = -1;
+            GLint  light     = -1;
+            GLint  paintMode = -1;
+            GLint  tintColor = -1;
         };
 
         // 一个顶点数组对象 + 顶点缓冲（持久缓存或每帧流式上传）
@@ -84,23 +91,32 @@ namespace MiniCAD
         std::unordered_map<uint32_t, VertexBuffer> m_cached;
         std::unordered_map<uint32_t, VertexBuffer> m_cachedText;
 
-        // 字形实例（GlyphInstancing.hpp）：网格库两个缓冲 + 各槽的实例缓冲与分批副本
+        // 字形实例（GlyphInstancing.hpp）：每个槽位独立持有实例 VBO 与网格库
         struct GlyphSlot
         {
-            VertexBuffer            instances;   // 只用 vbo / capacity / version / count / valid
-            std::vector<GlyphBatch> batches;
+            VertexBuffer                instances;   // 只用 vbo / capacity / version / count / valid
+            std::vector<GlyphBatch>     batches;
+            std::vector<GlyphMeshRange> meshes;
+            GLuint                      fillVbo     = 0;
+            GLuint                      lineVbo     = 0;
+            uint64_t                    meshVersion = 0;
+            bool                        meshValid   = false;
         };
         void ReleaseGlyphResources();
-        void EnsureGlyphMeshes(const GlyphMeshView& meshes);
+        void EnsureGlyphMeshes(GlyphSlot& gs, const GlyphMeshView& meshes);
         std::unordered_map<uint32_t, GlyphSlot> m_glyphSlots;
-        std::vector<GlyphMeshRange>             m_glyphMeshes;
         GLuint   m_glyphVao     = 0;
-        GLuint   m_glyphFillVbo = 0;
-        GLuint   m_glyphLineVbo = 0;
-        uint64_t m_glyphMeshVersion = 0;
-        bool     m_glyphMeshValid   = false;
-        std::unordered_map<uint64_t, GLuint>       m_imageTextures;   // ImageData::Key → 纹理（0 = 创建失败，不再重试）
-        IRenderTarget* m_currentTarget = nullptr;
+        struct ImageTexture
+        {
+            GLuint   tex       = 0;   // 0 = 创建失败，不再重试
+            uint32_t ownerBits = 0;   // 按 ImageSlotOwnerMask 记录使用方槽位组
+        };
+        std::unordered_map<uint64_t, ImageTexture> m_imageTextures;   // ImageData::Key → 纹理
+        IRenderTarget* m_currentTarget   = nullptr;
         bool           m_lightBackground = false;
+        PaintStyle     m_paintStyle{};
+        ScissorRect    m_scissor{};
+        bool           m_scissorEmpty    = false;
+        float          m_clearColor[4]   = { 0.0f, 0.0f, 0.0f, 0.0f };
     };
 }

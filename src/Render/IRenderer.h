@@ -27,6 +27,28 @@ namespace MiniCAD
         float maxDepth = 1.0f;
     };
 
+    enum class PaintTintMode : uint8_t { None = 0, Monochrome = 1 };
+    enum class PaintBlendMode : uint8_t { Alpha = 0, Screen = 1 };
+
+    struct PaintStyle
+    {
+        PaintTintMode  TintMode  = PaintTintMode::None;
+        PaintBlendMode BlendMode = PaintBlendMode::Alpha;
+        float TintR   = 1.0f;
+        float TintG   = 1.0f;
+        float TintB   = 1.0f;
+        float Opacity = 1.0f;
+    };
+
+    struct ScissorRect
+    {
+        bool Enabled = false;
+        int  X       = 0;
+        int  Y       = 0;
+        int  Width   = 0;
+        int  Height  = 0;
+    };
+
     class IRenderer
     {
     public:
@@ -43,6 +65,29 @@ namespace MiniCAD
         virtual void SubmitImage(const ImageData& image, std::span<const Vertex_P3_C4_UV> quad, const Math::Mat4& viewProj)
         {
             (void)image; (void)quad; (void)viewProj;
+        }
+
+        // 带槽位偏移提交光栅图像（用于主图 0..31 / 对比图 32..63 按归属独立释放 GPU 纹理）
+        virtual void SubmitImageForSlot(const ImageData& image, std::span<const Vertex_P3_C4_UV> quad, const Math::Mat4& viewProj, uint32_t slotOffset)
+        {
+            (void)slotOffset;
+            SubmitImage(image, quad, viewProj);
+        }
+
+        // 按 slot/32 分桶的图像纹理归属位掩码（最多覆盖 32 组，前 0..31 主图 / 32..63 对比图）
+        static constexpr uint32_t ImageSlotOwnerMask(uint32_t firstSlot, uint32_t lastSlot)
+        {
+            if (firstSlot > lastSlot)
+                return 0u;
+            const uint32_t startBucket = firstSlot / 32u;
+            if (startBucket >= 32u)
+                return 0u;
+            const uint32_t rawEnd    = lastSlot / 32u;
+            const uint32_t endBucket = rawEnd < 31u ? rawEnd : 31u;
+            uint32_t mask = 0u;
+            for (uint32_t b = startBucket; b <= endBucket; ++b)
+                mask |= (1u << b);
+            return mask;
         }
 
         // ── 缓存提交 ─────────────────────────────────────────────────────
@@ -130,8 +175,15 @@ namespace MiniCAD
         // 白色的实体、图层颜色、十字光标在两种背景下都看得见。只影响线 / 三角形 / 文字，不影响光栅图像
         virtual void SetLightBackground(bool light) { (void)light; }
 
+        // 叠图对比染色/透明/混合与裁剪矩形（只影响随后的提交，BeginFrame 复位）
+        virtual void SetPaintStyle(const PaintStyle& style) { (void)style; }
+        virtual void SetScissorRect(const ScissorRect& rect) { (void)rect; }
+        virtual void SetClearColor(float r, float g, float b, float a) { (void)r; (void)g; (void)b; (void)a; }
+
         // 释放缓存提交的顶点缓冲与图像纹理（关闭文档后调用）：之后的提交按需重新创建、上传
         virtual void ReleaseCachedResources() {}
+        // 只释放 [firstSlot, lastSlot] 槽位范围的缓存（如主图 0..31、对比图 32..63 各自独立释放）
+        virtual void ReleaseSlotRange(uint32_t firstSlot, uint32_t lastSlot) { (void)firstSlot; (void)lastSlot; }
 
         virtual void* GetNativeDevice() = 0;
     };
