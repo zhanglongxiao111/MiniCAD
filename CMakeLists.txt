@@ -86,3 +86,10 @@ if(MINICAD_BUILD_TESTS AND NOT EMSCRIPTEN AND NOT ANDROID)
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+# 无界面读图纸文字工具（Node WASM，只读导出 TSV，不进 MiniCADWeb）
+if(EMSCRIPTEN)
+    add_executable(SaDwgText "${CMAKE_SOURCE_DIR}/apps/SaDwgText/main.cpp")
+    target_link_libraries(SaDwgText PRIVATE MiniCAD MiniDWG)
+    target_link_options(SaDwgText PRIVATE -sNODERAWFS=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=8388608 -sENVIRONMENT=node -sEXIT_RUNTIME=1)
+endif()
