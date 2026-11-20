@@ -32,6 +32,9 @@ namespace MiniCAD
         };
     }
 
+    namespace { CommandStack::VetoHook& VetoHookRef() { static CommandStack::VetoHook hook; return hook; } }
+    void CommandStack::SetVetoHook(VetoHook fn) { VetoHookRef() = std::move(fn); }
+
     void CommandStack::PushNew(std::unique_ptr<ICommand> cmd)
     {
         if (m_postCommand)
@@ -53,6 +56,12 @@ namespace MiniCAD
 
         if (!cmd->Execute(scene))
             return false;
+        if (cmd->AffectsDocument() && VetoHookRef() && VetoHookRef()(*cmd))
+        {
+            cmd->Undo(scene);
+            scene.MarkDisplayDirty();
+            return false;
+        }
 
         const bool mutates = cmd->AffectsDocument();
         PushNew(std::move(cmd));
@@ -67,6 +76,12 @@ namespace MiniCAD
         // 空命令不入栈,否则 Undo 时解引用空指针
         if (!cmd)
             return;
+        if (cmd->AffectsDocument() && m_scene && VetoHookRef() && VetoHookRef()(*cmd))
+        {
+            cmd->Undo(*m_scene);
+            m_scene->MarkDisplayDirty();
+            return;
+        }
 
         const bool mutates = cmd->AffectsDocument();
         PushNew(std::move(cmd));

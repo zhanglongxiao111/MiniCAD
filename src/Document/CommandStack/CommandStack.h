@@ -17,6 +17,10 @@ namespace MiniCAD
         // 与原命令合为一步撤销 / 重做;无附属改动返回空。Undo/Redo 时不调用(附属改动随命令重放)。
         using PostCommandHook = std::function<std::unique_ptr<ICommand>()>;
         void SetPostCommandHook(PostCommandHook fn) { m_postCommand = std::move(fn); }
+        // 嵌入模式：全局否决钩子。命令生效后、入栈前调用，返回 true 则立即撤销该命令、不入栈（嵌入页只浏览 / 只批注时防误改）
+        using VetoHook = std::function<bool(const ICommand&)>;
+        static void SetVetoHook(VetoHook fn);
+        void SetScene(Scene* scene) { m_scene = scene; }   // Push（已经发生的改动）被否决时用来撤销
 
         // Execute = 执行 + 入栈；Execute 返回 false 时不入栈
         bool Execute(std::unique_ptr<ICommand> cmd, Scene& scene);
@@ -38,5 +42,6 @@ namespace MiniCAD
         std::stack<std::unique_ptr<ICommand>> m_redoStack;
         std::function<void()>                 m_onMutate;
         PostCommandHook                       m_postCommand;
+        Scene*                                m_scene = nullptr;
     };
 }

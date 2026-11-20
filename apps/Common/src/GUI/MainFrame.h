@@ -10,6 +10,8 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include "Viewport/Viewport.h"
+#include <memory>
 #include <vector>
 #include "GUI/AppPlatform.h"
 #include "Render/IRenderer.h"
@@ -114,6 +116,48 @@ namespace MiniCAD
         // manual（帮助 > 检查更新）时结果都弹对话框。平台不支持时（网页版）什么都不做。宿主启动时调用一次，自测不调用
         void CheckForUpdates(bool manual = false);
         bool HasUnsavedDocuments() const;       // 网页版：关闭页面前据此提示
+        // ── 嵌入模式（看图与批注）────────────────────────────
+        // 嵌入模式：0 = 浏览（看图、图层开关、特性只读、查询、捕捉；不改图纸），1 = 批注（另可标注 / 引线 / 文字 / 矩形 / 多段线 / 圆，
+        // 新对象一律落在图层 SA-问题批注，其余图层锁定，不能改动原图对象）。固定用嵌入布局（layouts.saembed），不随窗口尺寸切换
+        void EmbedSetMode(int mode);
+        int  EmbedGetMode() const { return m_embedMode; }
+        // 用户在功能区点「浏览 / 批注」选项卡也切换模式（选项卡即模式）；切换后回调宿主（网页版转发给宿主页）
+        void EmbedSetModeListener(std::function<void(int)> listener) { m_embedModeListener = std::move(listener); }
+        void EmbedSyncRibbonTab();     // 功能区选中与当前模式一致的选项卡，并挂上选项卡切换回调
+        // 当前图纸全部文字（TEXT / MTEXT / ATTRIB）的 TSV（格式见 Document/SaTextExport.h）；没有文档返回空
+        std::string EmbedExportTextTsv() const;
+        // 窗口逻辑坐标（画布 CSS 像素）→ 当前文档主视口的世界坐标；没有文档或点不在主视口内返回 false
+        bool EmbedWindowToWorld(float x, float y, double& worldX, double& worldY);
+        void EmbedZoomAll();
+        // 把主视口对准世界坐标范围（不留边）；没有文档返回 false
+        bool EmbedZoomToWorld(double minX, double minY, double maxX, double maxY);
+        // 主视口当前可见的世界范围：minX, minY, maxX, maxY
+        bool EmbedGetViewWorld(double out[4]);
+        // 世界坐标 → 窗口逻辑坐标（画布 CSS 像素）
+        bool EmbedWorldToWindow(double worldX, double worldY, float& x, float& y);
+        // 在当前图纸上加云线批注（图层 SA-问题批注，红色），按原版本导出 DWG 字节，再撤掉批注；失败返回空并写 error
+        std::vector<std::uint8_t> EmbedExportMarkupDwg(const std::vector<std::array<double, 4>>& rects, const std::vector<std::string>& labels, std::string& error);
+        // 当前图纸没读进来的外部参照（嵌入模式只喂字节、不给路径，所以全部外部参照都在这里）：块名、图内保存的路径
+        std::vector<std::pair<std::string, std::string>> EmbedListXrefs() const;
+        // 在 searchRoot（虚拟文件系统目录）里按文件名查找并读入外部参照，返回读入个数
+        int EmbedReloadXrefs(const std::string& searchRoot);
+        // 单引擎叠图与内存收口接口
+        void EmbedOpenMainDrawing(const std::string& fsPath);
+        bool EmbedCloseOtherDocuments(const std::string& keepPath);
+        void EmbedCloseAllDocuments();
+        bool EmbedHasCompareDocument() const { return m_compareDoc != nullptr; }
+        const std::string& EmbedGetMainOpenError() const { return m_mainOpenError; }
+        const std::string& EmbedGetCompareOpenError() const { return m_compareOpenError; }
+        void EmbedOpenCompareDrawing(const std::string& fsPath);
+        bool EmbedIsOpeningCompare() const;
+        void EmbedCloseCompareDrawing();
+        std::vector<std::pair<std::string, std::string>> EmbedListCompareXrefs() const;
+        int  EmbedReloadCompareXrefs(const std::string& searchRoot);
+        void EmbedSetCompareState(int mode, double scale, double dx, double dy, float opacity, float splitRatio, bool soloCompare);
+        void EmbedZoomCompareAll();
+        // 叠图对基点：target 0 = 主图，1 = 底图
+        bool EmbedStartPickPoint(int seq, int target, std::function<void(int, double, double)> onPicked, std::function<void(int)> onCancelled);
+        void EmbedCancelPickPoint();
         const std::string&  GetUiPath() const { return m_uiPath; }
         MiniGUI::UIContext& GetUI() const { return *m_ui; }
         MiniGUI::TitleBar*  GetTitleBar() const;
@@ -488,6 +532,12 @@ namespace MiniCAD
         bool                                   m_updateChecking = false;
         bool                                   m_commandLineVisible = true; // 命令行的显示开关（各窗口共用，保存在用户布局文件里）
         bool                                   m_viewCubeVisible = true; // 视图方块的显示开关（同上）
+        int                                    m_embedMode = -1;         // 嵌入模式：-1 不是嵌入；0 浏览；1 批注
+        std::function<void(int)>               m_embedModeListener;
+        std::unordered_map<const Document*, std::vector<std::pair<LayerID, bool>>> m_embedSavedLocks;   // 批注模式锁图层前的原锁定状态
+        LayerID EmbedEnsureMarkupLayer(Document& doc);
+        void    EmbedApplyMarkupLocks(Document& doc);
+        void    EmbedRestoreLocks(Document& doc);
         bool                                   m_compact = false;        // 用的是紧凑布局：只浏览
         bool                                   m_flushLayout = false;    // "设置 > 布局"选了紧凑（贴边）；与只浏览的 m_compact 无关
         static constexpr const char*           kLayoutSettingKey = "layout";   // 用户设置里的值："floating" / "compact"
@@ -574,6 +624,27 @@ namespace MiniCAD
         MiniGUI::ProgressBar*                  m_saveProgress = nullptr;
         uint32_t                               m_saveHideTimer = 0;      // 保存完成后隐藏进度的定时器
         bool                                   m_saveStatusShown = false;   // 本次保存前已显示"正在保存"（据此区分失败与取消另存为）
+
+        void SyncCompareCamera();
+        void RouteComparePointer(const MiniGUI::ViewportPointerEvent& original);
+
+        void EmbedCloseDocumentsExcept(Document* keep);
+
+        std::string                m_mainOpenError;
+        std::string                m_compareOpenError;
+        std::unique_ptr<Document>  m_compareDoc;
+        std::unique_ptr<Viewport>  m_compareViewport;
+        std::unique_ptr<Editor>    m_compareEditor;
+        std::shared_ptr<OpenJob>   m_compareOpenJob;
+        ViewInput                  m_compareInput;
+        CompareDisplayMode         m_compareDisplayMode = CompareDisplayMode::Off;
+        double                     m_compareScale       = 1.0;
+        double                     m_compareDx          = 0.0;
+        double                     m_compareDy          = 0.0;
+        float                      m_compareOpacity     = 0.85f;
+        float                      m_compareSplitRatio  = 0.5f;
+        bool                       m_compareSolo        = false;
+        int                        m_pickPointTarget    = -1;   // -1 = 未拾取，0 = 主图，1 = 底图
 
         // ── 视口指针状态（物理像素，视口内坐标）──────────────────
         ViewInput m_mainInput;      // 主视口的鼠标状态（光标是否在视口里：m_main.hovered）

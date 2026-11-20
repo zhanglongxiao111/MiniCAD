@@ -30,20 +30,47 @@ namespace MiniCAD
         std::vector<Vertex_P3_C4> fill;
         std::vector<Vertex_P3_C4> border;
     };
+    enum class CompareDisplayMode : uint8_t
+    {
+        Off           = 0,
+        Blend         = 1,   // 主图青色 + 对比图橙红色 Screen 混色（重合处发白）
+        Split         = 2,   // 卷帘分屏：SplitX 左侧主图原色，右侧对比图原色
+        CurrentOnly   = 3,   // 只看主图原色
+        CompareOnly   = 4,   // 只看对比图原色
+        AlignPickBase = 5,   // 抓对比图基点：主图 22% 淡化原色 + 对比图原色置顶（或 SoloCompare 时仅显示对比图）
+        AlignPickMain = 6    // 抓主图目标点：主图原色 + 对比图橙红半透明实时跟随
+    };
+
+    struct CompareRenderPass
+    {
+        const ViewState*   State          = nullptr;
+        CompareDisplayMode Mode           = CompareDisplayMode::Off;
+        double             Dx             = 0.0;   // p_base = p_main * Scale + (Dx, Dy)
+        double             Dy             = 0.0;
+        double             Scale          = 1.0;
+        float              CompareOpacity = 0.8f;
+        int                SplitX         = 0;     // 物理像素分割线
+        bool               SoloCompare    = false;
+        bool               PickCompare    = false; // true 时动态捕捉标记使用对比图的 Snap
+    };
+
     class Viewport
     {
     public:
+        static constexpr uint32_t kCompareSlotOffset = 32;
+
         // 库内不创建 RenderTarget，应用层负责创建并在 Render() 时传入
         Viewport(float width, float height);
 
-        // 应用层每帧调用：传入自己的 renderer + renderTarget，Viewport 负责提交所有几何
-        void Render(IRenderer& renderer, IRenderTarget& target, const ViewState& viewState);
+        // 应用层每帧调用：传入自己的 renderer + renderTarget，Viewport 负责提交所有几何（可选单引擎同相机对比通道）
+        void Render(IRenderer& renderer, IRenderTarget& target, const ViewState& viewState,
+                    const CompareRenderPass* compare = nullptr);
         // 场景静态流（填充、线、文字）的当前版本是否都已由渲染后端持有：是则调用方可以释放 CPU 端的拼接流
-        static bool SceneUploaded(const IRenderer& renderer, const ViewState& viewState);
+        static bool SceneUploaded(const IRenderer& renderer, const ViewState& viewState, uint32_t slotOffset = 0);
         // 同上，按版本号查询（Editor 在渲染前核对自己的场景缓冲还在不在后端里：多个视口轮流渲染时会被别的文档顶掉）。
         // textured：场景里有纹理文字（要查文字槽位）；glyphs：有矢量字形实例（要查字形槽位，网格版本为 meshVersion）
         static bool SceneUploaded(const IRenderer& renderer, uint64_t sceneVersion, uint64_t glyphVersion,
-                                  bool textured, bool glyphs, uint64_t meshVersion);
+                                  bool textured, bool glyphs, uint64_t meshVersion, uint32_t slotOffset = 0);
 
         void Resize(float width, float height);
 

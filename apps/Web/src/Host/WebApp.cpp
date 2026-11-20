@@ -1,4 +1,6 @@
 // ── MiniCAD 网页版宿主：图形设备、浏览器文件选择与下载、从网址打开、页面关闭提示 ─────────
+#include <array>
+#include <cstdio>
 #include "Host/WebApp.h"
 #include "Core/Log.h"
 #include "MiniI18n/I18n.h"
@@ -416,7 +418,242 @@ namespace MiniCAD
 
         EMSCRIPTEN_KEEPALIVE int MiniCADWeb_HasUnsaved()
         {
-            return g_app && g_app->HasUnsavedDocuments() ? 1 : 0;
+            // 嵌入模式：图纸不会被嵌入页保存（批注只经导出），换图 / 关页不提示
+            return g_app && g_app->GetFrame().EmbedGetMode() < 0 && g_app->HasUnsavedDocuments() ? 1 : 0;
+        }
+
+        // ── 嵌入宿主接口（单引擎叠图 + 内存主动释放） ──
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_IsReady()
+        {
+            return g_app && g_app->IsUiReady() ? 1 : 0;
+        }
+
+        // 0 = 浏览，1 = 批注（见 MainFrame::EmbedSetMode）
+        EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_SetMode(int mode)
+        {
+            if (!g_app)
+                return;
+            g_app->GetFrame().EmbedSetModeListener([](int next) {
+                EM_ASM({ if (Module.onSaEmbedModeChanged) Module.onSaEmbedModeChanged($0); }, next);
+            });
+            g_app->GetFrame().EmbedSetMode(mode);
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_ExportText(const char* outPath)
+        {
+            if (!g_app || !outPath)
+                return 0;
+            const std::string tsv = g_app->GetFrame().EmbedExportTextTsv();
+            if (tsv.empty())
+                return 0;
+            FILE* f = std::fopen(outPath, "wb");
+            if (!f)
+                return 0;
+            std::fwrite(tsv.data(), 1, tsv.size(), f);
+            std::fclose(f);
+            return 1;
+        }
+
+        EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_OpenDrawing(const char* fsPath)
+        {
+            if (g_app && fsPath && *fsPath)
+                g_app->GetFrame().EmbedOpenMainDrawing(fsPath);
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_IsOpening()
+        {
+            return g_app && g_app->GetFrame().IsOpeningDrawings() ? 1 : 0;
+        }
+
+        EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_OpenCompareDrawing(const char* fsPath)
+        {
+            if (g_app && fsPath && *fsPath)
+                g_app->GetFrame().EmbedOpenCompareDrawing(fsPath);
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_IsOpeningCompare()
+        {
+            return g_app && g_app->GetFrame().EmbedIsOpeningCompare() ? 1 : 0;
+        }
+
+        EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_CloseCompareDrawing()
+        {
+            if (g_app)
+                g_app->GetFrame().EmbedCloseCompareDrawing();
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_CloseOtherDocuments(const char* keepPath)
+        {
+            return g_app && keepPath && *keepPath && g_app->GetFrame().EmbedCloseOtherDocuments(keepPath) ? 1 : 0;
+        }
+
+        EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_CloseAllDocuments()
+        {
+            if (g_app)
+                g_app->GetFrame().EmbedCloseAllDocuments();
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_HasCompareDocument()
+        {
+            return g_app && g_app->GetFrame().EmbedHasCompareDocument() ? 1 : 0;
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_GetMainError(const char* outPath)
+        {
+            if (!g_app || !outPath) return 0;
+            const std::string& err = g_app->GetFrame().EmbedGetMainOpenError();
+            if (err.empty()) return 0;
+            FILE* f = std::fopen(outPath, "wb");
+            if (!f) return 0;
+            std::fwrite(err.data(), 1, err.size(), f);
+            std::fclose(f);
+            return 1;
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_GetCompareError(const char* outPath)
+        {
+            if (!g_app || !outPath) return 0;
+            const std::string& err = g_app->GetFrame().EmbedGetCompareOpenError();
+            if (err.empty()) return 0;
+            FILE* f = std::fopen(outPath, "wb");
+            if (!f) return 0;
+            std::fwrite(err.data(), 1, err.size(), f);
+            std::fclose(f);
+            return 1;
+        }
+
+        EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_ZoomAll()
+        {
+            if (g_app)
+                g_app->GetFrame().EmbedZoomAll();
+        }
+
+        EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_ZoomCompareAll()
+        {
+            if (g_app)
+                g_app->GetFrame().EmbedZoomCompareAll();
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_WindowToWorld(float x, float y, double* out)
+        {
+            double wx = 0.0, wy = 0.0;
+            if (!g_app || !out || !g_app->GetFrame().EmbedWindowToWorld(x, y, wx, wy)) return 0;
+            out[0] = wx; out[1] = wy;
+            return 1;
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_ZoomToWorld(double minX, double minY, double maxX, double maxY)
+        {
+            return g_app && g_app->GetFrame().EmbedZoomToWorld(minX, minY, maxX, maxY) ? 1 : 0;
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_GetViewWorld(double* out)
+        {
+            return g_app && out && g_app->GetFrame().EmbedGetViewWorld(out) ? 1 : 0;
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_WorldToWindow(double wx, double wy, double* out)
+        {
+            float x = 0.f, y = 0.f;
+            if (!g_app || !out || !g_app->GetFrame().EmbedWorldToWindow(wx, wy, x, y)) return 0;
+            out[0] = x; out[1] = y;
+            return 1;
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_ExportMarkupDwg(const double* rects, int count, const char* labels, const char* outPath, const char* errPath)
+        {
+            std::string error;
+            std::vector<std::array<double, 4>> list;
+            for (int i = 0; i < count; ++i)
+                list.push_back({ rects[i * 4], rects[i * 4 + 1], rects[i * 4 + 2], rects[i * 4 + 3] });
+            std::vector<std::string> labelList;
+            {
+                std::string all = labels ? labels : "";
+                std::size_t start = 0;
+                while (labelList.size() < static_cast<std::size_t>(count))
+                {
+                    const std::size_t end = all.find('\n', start);
+                    labelList.push_back(all.substr(start, end == std::string::npos ? std::string::npos : end - start));
+                    if (end == std::string::npos) break;
+                    start = end + 1;
+                }
+            }
+            std::vector<std::uint8_t> bytes;
+            if (g_app) bytes = g_app->GetFrame().EmbedExportMarkupDwg(list, labelList, error);
+            else error = "MiniCAD 尚未就绪";
+            if (bytes.empty())
+            {
+                if (FILE* f = std::fopen(errPath, "wb")) { std::fwrite(error.data(), 1, error.size(), f); std::fclose(f); }
+                return 0;
+            }
+            FILE* f = std::fopen(outPath, "wb");
+            if (!f) return 0;
+            std::fwrite(bytes.data(), 1, bytes.size(), f);
+            std::fclose(f);
+            return 1;
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_ListXrefs(const char* outPath)
+        {
+            if (!g_app || !outPath) return 0;
+            const auto list = g_app->GetFrame().EmbedListXrefs();
+            std::string text;
+            for (const auto& [name, path] : list) text += name + "\t" + path + "\n";
+            FILE* f = std::fopen(outPath, "wb");
+            if (!f) return 0;
+            std::fwrite(text.data(), 1, text.size(), f);
+            std::fclose(f);
+            return static_cast<int>(list.size());
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_ReloadXrefs(const char* searchRoot)
+        {
+            return g_app && searchRoot ? g_app->GetFrame().EmbedReloadXrefs(searchRoot) : 0;
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_ListCompareXrefs(const char* outPath)
+        {
+            if (!g_app || !outPath) return 0;
+            const auto list = g_app->GetFrame().EmbedListCompareXrefs();
+            std::string text;
+            for (const auto& [name, path] : list) text += name + "\t" + path + "\n";
+            FILE* f = std::fopen(outPath, "wb");
+            if (!f) return 0;
+            std::fwrite(text.data(), 1, text.size(), f);
+            std::fclose(f);
+            return static_cast<int>(list.size());
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_ReloadCompareXrefs(const char* searchRoot)
+        {
+            return g_app && searchRoot ? g_app->GetFrame().EmbedReloadCompareXrefs(searchRoot) : 0;
+        }
+
+        EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_SetCompareState(int mode, double scale, double dx, double dy, float opacity, float splitRatio, int soloCompare)
+        {
+            if (g_app)
+                g_app->GetFrame().EmbedSetCompareState(mode, scale, dx, dy, opacity, splitRatio, soloCompare != 0);
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_StartPickPoint(int seq, int target)
+        {
+            if (!g_app)
+                return 0;
+            return g_app->GetFrame().EmbedStartPickPoint(
+                seq,
+                target,
+                [](int s, double x, double y) {
+                    EM_ASM({ if (Module.onSaEmbedPointPicked) Module.onSaEmbedPointPicked($0, $1, $2); }, s, x, y);
+                },
+                [](int s) {
+                    EM_ASM({ if (Module.onSaEmbedPickCancelled) Module.onSaEmbedPickCancelled($0); }, s);
+                }) ? 1 : 0;
+        }
+
+        EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_CancelPickPoint()
+        {
+            if (g_app)
+                g_app->GetFrame().EmbedCancelPickPoint();
         }
     }
 

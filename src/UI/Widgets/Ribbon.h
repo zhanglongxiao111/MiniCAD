@@ -42,6 +42,8 @@ namespace MiniGUI
         void FocusSearch();
         TextBox* GetSearchBox() const { return m_search; }
         void SetOnSearchDone(std::function<void()> cb) { m_onSearchDone = std::move(cb); }
+        // 用户点选项卡切换后回调（参数为新选项卡序号；SelectTab 代码调用不回调）。嵌入模式据此把选项卡与浏览 / 批注模式绑定
+        void SetOnTabSelected(std::function<void(int)> cb) { m_onTabSelected = std::move(cb); }
         // 搜索结果（命令编号，按匹配程度排序；不可用的命令排在后面）。测试和宿主也可直接调用
         std::vector<std::string> SearchCommands(const std::string& query, size_t limit = 40) const;
 
@@ -131,6 +133,7 @@ namespace MiniGUI
         Popup*                      m_menu       = nullptr;   // 打开着的组下拉（只用来比较，弹层可能已被别处关闭）
         const Panel*                m_menuPanel  = nullptr;
         std::function<void()>       m_onSearchDone;
+        std::function<void(int)>    m_onTabSelected;
         bool                        m_collapsed  = false;
         bool                        m_card       = true;
         bool                        m_expandedByClick = false;   // 上一次单击把收起的功能区展开了（随后的双击不再收起）

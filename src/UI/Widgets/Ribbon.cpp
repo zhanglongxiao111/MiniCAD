@@ -950,7 +950,10 @@ namespace MiniGUI
                 {
                     m_expandedByClick = m_collapsed;
                     SetCollapsed(false);
+                    const bool changed = tab != m_selected;
                     SelectTab(tab);
+                    if (changed && m_onTabSelected)
+                        m_onTabSelected(tab);
                 }
                 e.handled = true;
             }

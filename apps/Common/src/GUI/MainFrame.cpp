@@ -1,5 +1,6 @@
 // ── MiniCAD 主窗口（MiniGUI 版）：初始化、文档、视口输入与渲染（平台相关部分见 AppPlatform）─────────
 #include "GUI/MainFrame.h"
+#include "Widgets/Ribbon.h"
 #include "GUI/FloatingPanelHost.h"
 #include "GUI/Language.h"
 #include "MiniI18n/I18n.h"
@@ -14,7 +15,11 @@
 #include "Core/Entity/DimensionEntity.hpp"
 #include "Core/Entity/RectangleEntity.hpp"
 #include "Core/Entity/RegionEntity.hpp"
+#include "Core/Entity/PolylineEntity.hpp"
+#include "Core/Entity/TextEntity.hpp"
 #include "Document/Command/AddEntityCommand.h"
+#include "Document/SaTextExport.h"
+#include "Document/CommandStack/CommandStack.h"
 #include "Document/Command/LayoutCommands.h"
 #include "Import/CadExchange.h"
 #include "Core/Log.h"
@@ -43,6 +48,7 @@
 #include <filesystem>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <unordered_set>
 #include <thread>
 #include <utility>
@@ -153,17 +159,26 @@ namespace MiniCAD
     {
         WaitNodeEvaluation();   // 节点图的后台求值在用内核与文档的节点图
         // 后台还在读图纸：没开始的不再开始；正在读的让它中止并等它退出（它引用了 m_docManager）
-        if (m_openJob)
+        auto abandonJob = [](std::shared_ptr<OpenJob>& job)
         {
+            if (!job)
+                return;
             int pending = OpenJob::Pending;
-            if (!m_openJob->state.compare_exchange_strong(pending, OpenJob::Abandoned))
+            if (!job->state.compare_exchange_strong(pending, OpenJob::Abandoned))
             {
-                m_openJob->cancel = true;
-                while (m_openJob->state.load() == OpenJob::Running)
+                job->cancel = true;
+                while (job->state.load() == OpenJob::Running)
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
-            m_openJob->state = OpenJob::Abandoned;
-        }
+            job->state = OpenJob::Abandoned;
+        };
+        abandonJob(m_openJob);
+        abandonJob(m_compareOpenJob);
+        if (m_compareEditor)
+            m_compareEditor->Unbind();
+        m_compareEditor.reset();
+        m_compareDoc.reset();
+        m_compareViewport.reset();
 
         // 界面先于平台对象释放（纹理属于平台的界面后端）；绑定引用特性面板里的控件，先清掉
         ForEachChrome([](ViewChrome& c)
@@ -369,8 +384,699 @@ namespace MiniCAD
         m_commands.NotifyStateChanged();    // 最大化按钮切换"还原"图标
     }
 
+    // ── 嵌入模式：浏览 / 批注两种模式 ──────────────────────────────
+    static constexpr const char* kSaMarkupLayer = "SA-问题批注";
+
+    // 命令白名单（功能区、快捷键、命令搜索都经 CommandRegistry 总闸）
+    static bool SaEmbedCommandAllowed(int mode, std::string_view id)
+    {
+        auto starts = [&](std::string_view p) { return id.substr(0, p.size()) == p; };
+        if (id == "view.start" || id == "view.panel.nodes" || id == "view.fullScreen")
+            return false;
+        if (starts("view.") || starts("aux.") || starts("doc.") || starts("inquiry.") || starts("window."))
+            return true;
+        if (id == "edit.selectAll" || id == "ui.theme" || id == "ui.cursor" || id == "ui.search")
+            return true;
+        if (mode != 1)
+            return false;
+        static const char* const markup[] = {
+            "dim.linear", "dim.angular", "dim.radius", "dim.diameter", "dim.arc", "dim.ordinate",
+            "dim.leader", "dim.mleader", "draw.text", "draw.mtext", "draw.rect", "draw.pline", "draw.circle",
+            "edit.undo", "edit.redo", "edit.delete",
+        };
+        for (const char* m : markup)
+            if (id == m)
+                return true;
+        return false;
+    }
+
+    // 工具白名单（键入命令 / 别名也经 Editor::ActivateToolById）
+    static bool SaEmbedToolAllowed(int mode, const std::string& tool)
+    {
+        static const char* const browse[] = { "Previous", "Zoom", "ZoomAll", "Pan", "Area",
+            "ViewTop", "ViewBottom", "ViewFront", "ViewBack", "ViewLeft", "ViewRight", "ViewSWIso", "ViewSEIso", "ViewNEIso", "ViewNWIso" };
+        for (const char* t : browse)
+            if (tool == t)
+                return true;
+        if (mode != 1)
+            return false;
+        static const char* const markup[] = { "Dimension", "DimAngular", "DimRadius", "DimDiameter", "DimArc", "DimOrdinate",
+            "Leader", "MLeader", "Text", "MText", "Rectangle", "Polyline", "Circle" };
+        for (const char* t : markup)
+            if (tool == t)
+                return true;
+        return false;
+    }
+
+    // 改动否决：浏览模式只放行图层开关；批注模式不许动图层定义（锁定 / 解锁 / 改名 / 颜色 …）与布局
+    static bool SaEmbedVeto(int mode, const ICommand& cmd)
+    {
+        const std::string name = cmd.GetName();
+        if (name == "打开图层" || name == "关闭图层")
+            return false;
+        if (mode == 0)
+            return true;
+        static const char* const denied[] = { "新建图层", "删除图层", "图层改名", "修改图层颜色", "锁定图层", "解锁图层",
+            "修改图层线型", "修改图层线宽", "修改图层特性", "修改图层", "新建布局", "删除布局" };
+        for (const char* d : denied)
+            if (name == d)
+                return true;
+        return false;
+    }
+
+    LayerID MainFrame::EmbedEnsureMarkupLayer(Document& doc)
+    {
+        LayerManager& layers = doc.GetScene().GetLayerManager();
+        for (LayerID id : layers.GetAllLayerIDs())
+            if (const Layer* l = layers.GetLayer(id); l && l->GetName() == kSaMarkupLayer)
+                return id;
+        const LayerID id = layers.AddLayer(kSaMarkupLayer);
+        if (Layer* layer = layers.GetLayer(id))
+            layer->SetColor(AciToColor4(1));
+        return id;
+    }
+
+    void MainFrame::EmbedApplyMarkupLocks(Document& doc)
+    {
+        const LayerID markup = EmbedEnsureMarkupLayer(doc);
+        LayerManager& layers = doc.GetScene().GetLayerManager();
+        auto& saved = m_embedSavedLocks[&doc];
+        const bool first = saved.empty();
+        for (LayerID id : layers.GetAllLayerIDs())
+        {
+            Layer* l = layers.GetLayer(id);
+            if (!l)
+                continue;
+            if (first)
+                saved.emplace_back(id, l->IsLocked());
+            l->SetLocked(id != markup);
+        }
+        if (Layer* l = layers.GetLayer(markup))
+        {
+            l->SetVisible(true);
+            l->SetLocked(false);
+        }
+        layers.SetActiveLayerID(markup);
+        doc.GetScene().MarkDisplayDirty();
+    }
+
+    void MainFrame::EmbedRestoreLocks(Document& doc)
+    {
+        auto it = m_embedSavedLocks.find(&doc);
+        if (it == m_embedSavedLocks.end())
+            return;
+        LayerManager& layers = doc.GetScene().GetLayerManager();
+        for (const auto& [id, locked] : it->second)
+            if (Layer* l = layers.GetLayer(id))
+                l->SetLocked(locked);
+        m_embedSavedLocks.erase(it);
+        doc.GetScene().MarkDisplayDirty();
+    }
+
+    void MainFrame::EmbedSetMode(int mode)
+    {
+        mode = mode == 1 ? 1 : 0;
+        const bool first = m_embedMode < 0;
+        m_embedMode = mode;
+        if (first)
+        {
+            m_docManager.GetEditor().SetSnapEnabled(true);
+            m_commands.SetGate([this](std::string_view id) { return m_embedMode < 0 || SaEmbedCommandAllowed(m_embedMode, id); });
+            Editor::SetToolGate([this](const std::string& tool) {
+                if (m_embedMode < 0)
+                    return true;
+                if (!SaEmbedToolAllowed(m_embedMode, tool))
+                    return false;
+                if (m_embedMode == 1)
+                    if (Document* doc = m_docManager.GetActive())
+                        EmbedApplyMarkupLocks(*doc);      // 每次起画都把当前层拉回 SA-问题批注（防止用户在图层栏改了当前层）
+                return true;
+            });
+            CommandStack::SetVetoHook([this](const ICommand& cmd) { return m_embedMode >= 0 && SaEmbedVeto(m_embedMode, cmd); });
+            m_compact = false;
+            if (m_layout)
+            {
+                m_layout->SetLayoutName("saembed", true);
+                ForEachChrome([this](ViewChrome& c) { ApplyCompactChrome(c); });
+                ReloadUi();
+                UpdateChromeVisibility();
+            }
+        }
+        if (Document* doc = m_docManager.GetActive())
+        {
+            // 结束进行中的命令（等同按 Esc）
+            Editor& editor = m_docManager.GetEditor();
+            InputEvent esc = {};
+            esc.Type = InputEventType::KeyDown;
+            esc.Key  = KeyCode::Escape;
+            editor.OnInput(esc);
+            esc.Type = InputEventType::KeyUp;
+            editor.OnInput(esc);
+            editor.SetSelection({});
+            if (mode == 1)
+                EmbedApplyMarkupLocks(*doc);
+            else
+                EmbedRestoreLocks(*doc);
+        }
+        EmbedSyncRibbonTab();
+        m_commands.NotifyStateChanged();
+        RequestRenderAll();
+    }
+
+    void MainFrame::EmbedSyncRibbonTab()
+    {
+        if (m_embedMode < 0 || !m_layout)
+            return;
+        MiniGUI::Ribbon* ribbon = m_layout->GetRibbon();
+        if (!ribbon)
+            return;
+        const int browseTab = ribbon->FindTab("浏览");
+        const int markupTab = ribbon->FindTab("批注");
+        const int want      = m_embedMode == 1 ? markupTab : browseTab;
+        if (want >= 0)
+            ribbon->SelectTab(want);
+        ribbon->SetOnTabSelected([this, browseTab, markupTab](int tab)
+        {
+            const int next = tab == markupTab ? 1 : tab == browseTab ? 0 : -1;
+            if (next < 0 || next == m_embedMode)
+                return;
+            EmbedSetMode(next);
+            if (m_embedModeListener)
+                m_embedModeListener(next);
+        });
+    }
+
+    std::string MainFrame::EmbedExportTextTsv() const
+    {
+        const Document* doc = m_docManager.GetActive();
+        return doc ? SaTextExport::ExportTsv(doc->GetScene()) : std::string();
+    }
+
+    bool MainFrame::EmbedWindowToWorld(float x, float y, double& worldX, double& worldY)
+    {
+        if (!m_viewport || !m_docManager.GetActive())
+            return false;
+        const MiniGUI::Rect r = m_viewport->GetScreenBounds();
+        if (x < r.min.x || y < r.min.y || x > r.max.x || y > r.max.y)
+            return false;
+        const double px = (x - r.min.x) * m_dpiScale;
+        const double py = (y - r.min.y) * m_dpiScale;
+        const auto wp = m_docManager.GetViewport().GetCamera().ScreenToWorld(px, py);
+        worldX = wp.x;
+        worldY = wp.y;
+        return true;
+    }
+
+    void MainFrame::EmbedZoomAll()
+    {
+        if (m_docManager.GetActive())
+            m_docManager.ZoomAll(false);
+        RequestRenderAll();
+    }
+
+
+    bool MainFrame::EmbedZoomToWorld(double minX, double minY, double maxX, double maxY)
+    {
+        if (!m_docManager.GetActive() || !(maxX > minX) || !(maxY > minY))
+            return false;
+        m_docManager.GetViewport().GetCamera().ZoomToBounds(minX, minY, maxX, maxY, 1.0);
+        RequestRenderAll();
+        return true;
+    }
+
+    bool MainFrame::EmbedGetViewWorld(double out[4])
+    {
+        if (!m_docManager.GetActive())
+            return false;
+        const Camera& cam = m_docManager.GetViewport().GetCamera();
+        const auto a = cam.ScreenToWorld(0.0, cam.GetHeight());
+        const auto b = cam.ScreenToWorld(cam.GetWidth(), 0.0);
+        out[0] = std::min(a.x, b.x); out[1] = std::min(a.y, b.y);
+        out[2] = std::max(a.x, b.x); out[3] = std::max(a.y, b.y);
+        return true;
+    }
+
+    bool MainFrame::EmbedWorldToWindow(double worldX, double worldY, float& x, float& y)
+    {
+        if (!m_viewport || !m_docManager.GetActive())
+            return false;
+        const MiniGUI::Rect r = m_viewport->GetScreenBounds();
+        const auto sp = m_docManager.GetViewport().GetCamera().WorldToScreen({ worldX, worldY, 0.0 });
+        x = static_cast<float>(sp.x / m_dpiScale + r.min.x);
+        y = static_cast<float>(sp.y / m_dpiScale + r.min.y);
+        return true;
+    }
+
+    // 云线：沿矩形四边按弧长均分，每段向外鼓的半圆小弧（凸度 ±1 视走向而定，逆时针走向取 -0.5 向外）
+    static Polyline BuildRevisionCloud(double minX, double minY, double maxX, double maxY)
+    {
+        const double w = maxX - minX, h = maxY - minY;
+        const double arc = std::max(std::min(w, h) / 6.0, 1e-6);
+        std::vector<Math::Point3> pts;
+        auto edge = [&](double x0, double y0, double x1, double y1) {
+            const double len = std::hypot(x1 - x0, y1 - y0);
+            const int n = std::max(1, static_cast<int>(std::round(len / arc)));
+            for (int i = 0; i < n; ++i)
+                pts.push_back({ x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n, 0.0 });
+        };
+        edge(minX, minY, maxX, minY);
+        edge(maxX, minY, maxX, maxY);
+        edge(maxX, maxY, minX, maxY);
+        edge(minX, maxY, minX, minY);
+        pts.push_back({ minX, minY, 0.0 });
+        // 逆时针走向：弧向行进方向左侧（外侧）鼓出 ⇒ 凸度取负
+        std::vector<double> bulges(pts.size() - 1, -0.5);
+        return Polyline(std::move(pts), std::move(bulges));
+    }
+
+    std::vector<std::uint8_t> MainFrame::EmbedExportMarkupDwg(const std::vector<std::array<double, 4>>& rects, const std::vector<std::string>& labels, std::string& error)
+    {
+        Document* doc = m_docManager.GetActive();
+        if (!doc)
+        {
+            error = "没有打开的图纸";
+            return {};
+        }
+        Scene& scene = doc->GetScene();
+        LayerManager& layers = scene.GetLayerManager();
+        // 批注层已有（批注模式下画的标注 / 文字）就沿用并保留；导出时把锁定状态还原成原图的样子
+        bool layerExisted = false;
+        for (LayerID id : layers.GetAllLayerIDs())
+            if (const Layer* l = layers.GetLayer(id); l && l->GetName() == kSaMarkupLayer)
+                layerExisted = true;
+        const bool relock = m_embedSavedLocks.count(doc) > 0;
+        EmbedRestoreLocks(*doc);
+        const LayerID layerId = EmbedEnsureMarkupLayer(*doc);
+        std::vector<Object::ObjectID> added;
+        for (std::size_t index = 0; index < rects.size(); ++index)
+        {
+            const auto& r = rects[index];
+            const auto id = scene.NextObjectID();
+            auto entity = std::make_unique<PolylineEntity>(id, BuildRevisionCloud(r[0], r[1], r[2], r[3]));
+            entity->SetLayerId(layerId);
+            entity->GetAttr().Color = EntityColor::FromAci(1);
+            scene.AddEntity(std::move(entity));
+            added.push_back(id);
+            if (index < labels.size() && !labels[index].empty())
+            {
+                // 引注文字放在云线左上角外侧，字高取框高的 1/8（至少框短边的 1/20）
+                const double h = std::max((r[3] - r[1]) / 8.0, std::min(r[2] - r[0], r[3] - r[1]) / 20.0);
+                const auto textId = scene.NextObjectID();
+                auto text = std::make_unique<TextEntity>(textId, Math::Point3{ r[0], r[3] + h * 0.5, 0.0 }, labels[index], static_cast<float>(h));
+                text->SetLayerId(layerId);
+                text->GetAttr().Color = EntityColor::FromAci(1);
+                scene.AddEntity(std::move(text));
+                added.push_back(textId);
+            }
+        }
+        CadSaveVersion version = doc->GetCadSaveVersion();
+        if (!CadSaveVersionSupported(CadFileKind::Dwg, version))
+            version = CadSaveVersion::R2010;
+        std::vector<std::uint8_t> bytes = ExportCad(scene, CadFileKind::Dwg, version, &error, doc->GetCadSource());
+        for (auto id : added)
+            scene.RemoveEntity(id);
+        if (!layerExisted)
+            layers.RemoveLayer(layerId);
+        if (relock)
+            EmbedApplyMarkupLocks(*doc);
+        RequestRenderAll();
+        if (bytes.empty() && error.empty())
+            error = "导出 DWG 失败";
+        return bytes;
+    }
+
+    std::vector<std::pair<std::string, std::string>> MainFrame::EmbedListXrefs() const
+    {
+        std::vector<std::pair<std::string, std::string>> out;
+        const Document* doc = m_docManager.GetActive();
+        if (!doc)
+            return out;
+        for (const auto& x : FindUnresolvedXrefs(doc->GetScene()))
+            out.emplace_back(x.Name, x.Path);
+        return out;
+    }
+
+    int MainFrame::EmbedReloadXrefs(const std::string& searchRoot)
+    {
+        Document* doc = m_docManager.GetActive();
+        if (!doc)
+            return 0;
+        const int n = ReloadUnresolvedXrefs(doc->GetScene(), {}, { searchRoot });
+        RequestRenderAll();
+        return n;
+    }
+
+    void MainFrame::SyncCompareCamera()
+    {
+        if (!m_compareViewport)
+            return;
+        Viewport& mainVp = m_docManager.GetMainViewport();
+        if (m_compareViewport->GetWidth() != mainVp.GetWidth() || m_compareViewport->GetHeight() != mainVp.GetHeight())
+            m_compareViewport->Resize(static_cast<float>(mainVp.GetWidth()), static_cast<float>(mainVp.GetHeight()));
+        Camera& mainCam = mainVp.GetCamera();
+        const double* fi = mainCam.GetFitInsets();
+        Camera& compCam = m_compareViewport->GetCamera();
+        compCam.SetFitInsets(fi[0], fi[1], fi[2], fi[3]);
+
+        CameraState cs = mainCam.GetState();
+        const double s = (std::isfinite(m_compareScale) && m_compareScale > 1e-9) ? m_compareScale : 1.0;
+        cs.Target.x = cs.Target.x * s + m_compareDx;
+        cs.Target.y = cs.Target.y * s + m_compareDy;
+        cs.Zoom     = cs.Zoom * s;
+        compCam.SetState(cs);
+    }
+
+    void MainFrame::EmbedOpenMainDrawing(const std::string& fsPath)
+    {
+        if (fsPath.empty())
+            return;
+        EmbedCancelPickPoint();
+        m_mainOpenError.clear();
+        m_openFailures.clear();
+        if (m_openJob)
+        {
+            m_openJob->cancel = true;
+            m_openJob->state  = OpenJob::Abandoned;
+            m_openJob.reset();
+        }
+        m_openDone.reset();
+        m_openAddPosted = false;
+        m_openQueue.clear();
+        m_buildDoc = nullptr;
+        OpenDrawings({ fsPath });
+    }
+
+    bool MainFrame::EmbedCloseOtherDocuments(const std::string& keepPath)
+    {
+        Document* keep = m_docManager.FindOpen(keepPath);
+        if (!keep)
+            return false;
+        EmbedCloseDocumentsExcept(keep);
+        return true;
+    }
+
+    void MainFrame::EmbedCloseAllDocuments()
+    {
+        EmbedCloseDocumentsExcept(nullptr);
+    }
+
+    void MainFrame::EmbedCloseDocumentsExcept(Document* keep)
+    {
+        std::vector<Document*> others;
+        for (const auto& d : m_docManager.GetAll())
+            if (d.get() != keep)
+                others.push_back(d.get());
+        if (others.empty())
+        {
+            if (keep)
+                m_docManager.SetActive(keep);
+            return;
+        }
+        if (keep)
+            m_docManager.SetActive(keep);
+        for (Document* doc : others)
+        {
+            if (m_buildDoc == doc)
+                m_buildDoc = nullptr;
+            m_embedSavedLocks.erase(doc);
+            m_nodeHistory.erase(doc);
+            m_xrefMissingDocs.erase(std::remove(m_xrefMissingDocs.begin(), m_xrefMissingDocs.end(), doc), m_xrefMissingDocs.end());
+            m_docManager.Close(doc);
+        }
+        m_docManager.GetEditor().ClearImageCache();
+        if (m_platform)
+        {
+            if (m_compareDoc)
+                m_platform->GetRenderer().ReleaseSlotRange(0, Viewport::kCompareSlotOffset - 1);
+            else
+                m_platform->GetRenderer().ReleaseCachedResources();
+            m_docManager.GetEditor().RequestSceneRestitch();
+            m_platform->ReleaseFreeMemory();
+        }
+        RequestRenderAll();
+        StateChanged();
+    }
+
+    void MainFrame::EmbedCloseCompareDrawing()
+    {
+        m_compareOpenError.clear();
+        if (m_pickPointTarget == 1)
+            EmbedCancelPickPoint();
+        if (m_compareOpenJob)
+        {
+            m_compareOpenJob->cancel = true;
+            m_compareOpenJob->state  = OpenJob::Abandoned;
+            m_compareOpenJob.reset();
+        }
+        if (m_compareEditor)
+        {
+            m_compareEditor->ClearImageCache();
+            m_compareEditor->Unbind();
+            m_compareEditor.reset();
+        }
+        m_compareDoc.reset();
+        m_compareViewport.reset();
+        m_compareDisplayMode = CompareDisplayMode::Off;
+        m_compareInput       = {};
+        if (m_platform)
+        {
+            m_platform->GetRenderer().ReleaseSlotRange(Viewport::kCompareSlotOffset, Viewport::kCompareSlotOffset * 2 - 1);
+            m_platform->ReleaseFreeMemory();
+        }
+        RequestRenderAll();
+    }
+
+    void MainFrame::EmbedOpenCompareDrawing(const std::string& fsPath)
+    {
+        if (fsPath.empty())
+            return;
+        const CompareDisplayMode keepMode = m_compareDisplayMode;
+        const double keepScale = m_compareScale;
+        const double keepDx    = m_compareDx;
+        const double keepDy    = m_compareDy;
+        const float  keepOp    = m_compareOpacity;
+        const float  keepSplit = m_compareSplitRatio;
+        const bool   keepSolo  = m_compareSolo;
+        EmbedCloseCompareDrawing();
+        m_compareDisplayMode = keepMode;
+        m_compareScale       = keepScale;
+        m_compareDx          = keepDx;
+        m_compareDy          = keepDy;
+        m_compareOpacity     = keepOp;
+        m_compareSplitRatio  = keepSplit;
+        m_compareSolo        = keepSolo;
+
+        auto job  = std::make_shared<OpenJob>();
+        job->path = fsPath;
+        m_compareOpenJob = job;
+
+        const DocumentManager* dm = &m_docManager;
+        AppPlatform* platform = m_platform;
+        platform->RunInBackground(
+            [job, dm, platform]
+            {
+                int pending = OpenJob::Pending;
+                if (!job->state.compare_exchange_strong(pending, OpenJob::Running))
+                    return;
+                job->doc = dm->Load(job->path, &job->error, [job, platform](float f)
+                {
+                    if (job->cancel) throw OpenCancelled();
+                    job->progress = f;
+                    platform->RequestRedraw();
+                });
+                job->state = OpenJob::Finished;
+            },
+            [this, job]
+            {
+                if (job->state.load() == OpenJob::Abandoned || m_compareOpenJob != job)
+                    return;
+                m_compareOpenJob.reset();
+                if (!job->doc)
+                {
+                    m_compareOpenError = job->error.empty() ? "MiniCAD 没能打开这张对比图纸" : job->error;
+                    RequestRenderAll();
+                    return;
+                }
+                m_compareDoc      = std::move(job->doc);
+                m_compareViewport = std::make_unique<Viewport>(static_cast<float>(m_docManager.GetMainViewport().GetWidth()), static_cast<float>(m_docManager.GetMainViewport().GetHeight()));
+                SyncCompareCamera();
+                m_compareEditor   = std::make_unique<Editor>();
+                m_compareEditor->CopySettingsFrom(m_docManager.GetMainEditor());
+                m_compareEditor->Bind(*m_compareDoc, *m_compareViewport);
+                m_compareEditor->BeginProgressiveBuild();
+                RequestRenderAll();
+            });
+    }
+
+    bool MainFrame::EmbedIsOpeningCompare() const
+    {
+        return m_compareOpenJob != nullptr || (m_compareEditor && m_compareEditor->IsBuildingDisplay());
+    }
+
+    std::vector<std::pair<std::string, std::string>> MainFrame::EmbedListCompareXrefs() const
+    {
+        std::vector<std::pair<std::string, std::string>> out;
+        if (!m_compareDoc)
+            return out;
+        for (const auto& x : FindUnresolvedXrefs(m_compareDoc->GetScene()))
+            out.emplace_back(x.Name, x.Path);
+        return out;
+    }
+
+    int MainFrame::EmbedReloadCompareXrefs(const std::string& searchRoot)
+    {
+        if (!m_compareDoc)
+            return 0;
+        const int n = ReloadUnresolvedXrefs(m_compareDoc->GetScene(), {}, { searchRoot });
+        if (n > 0)
+        {
+            m_compareDoc->GetScene().MarkDirty();
+            if (m_compareEditor)
+                m_compareEditor->BeginProgressiveBuild();
+        }
+        RequestRenderAll();
+        return n;
+    }
+
+    void MainFrame::EmbedSetCompareState(int mode, double scale, double dx, double dy, float opacity, float splitRatio, bool soloCompare)
+    {
+        const int clamped = std::clamp(mode, 0, static_cast<int>(CompareDisplayMode::AlignPickMain));
+        m_compareDisplayMode = static_cast<CompareDisplayMode>(clamped);
+        m_compareScale       = (std::isfinite(scale) && scale > 1e-9) ? scale : 1.0;
+        m_compareDx          = std::isfinite(dx) ? dx : 0.0;
+        m_compareDy          = std::isfinite(dy) ? dy : 0.0;
+        m_compareOpacity     = std::clamp(opacity, 0.0f, 1.0f);
+        m_compareSplitRatio  = std::clamp(splitRatio, 0.0f, 1.0f);
+        m_compareSolo        = soloCompare;
+        SyncCompareCamera();
+        RequestRenderAll();
+    }
+
+    void MainFrame::EmbedZoomCompareAll()
+    {
+        if (!m_compareDoc)
+            return;
+        AABB box = AABB::Empty();
+        if (!m_compareDoc->GetScene().GetExtents(box))
+            return;
+        const double invS = (std::isfinite(m_compareScale) && m_compareScale > 1e-9) ? (1.0 / m_compareScale) : 1.0;
+        const double minX = (box.Min.x - m_compareDx) * invS;
+        const double minY = (box.Min.y - m_compareDy) * invS;
+        const double maxX = (box.Max.x - m_compareDx) * invS;
+        const double maxY = (box.Max.y - m_compareDy) * invS;
+        m_docManager.GetMainViewport().GetCamera().ZoomToBounds(
+            std::min(minX, maxX), std::min(minY, maxY),
+            std::max(minX, maxX), std::max(minY, maxY));
+        SyncCompareCamera();
+        RequestRenderAll();
+    }
+
+    bool MainFrame::EmbedStartPickPoint(int seq, int target, std::function<void(int, double, double)> onPicked, std::function<void(int)> onCancelled)
+    {
+        EmbedCancelPickPoint();
+        if (target == 1)
+        {
+            if (!m_compareDoc || !m_compareEditor)
+                return false;
+            Document* compDoc = m_compareDoc.get();
+            Editor& editor = *m_compareEditor;
+            const bool restoreSnapOff = !editor.IsSnapEnabled();
+            if (restoreSnapOff)
+                editor.SetSnapEnabled(true);
+            m_pickPointTarget = 1;
+            editor.StartPickPointTool(
+                N_("指定底图对齐基点:"),
+                [this, compDoc, seq, restoreSnapOff, onPicked = std::move(onPicked)](const Math::Point3& p)
+                {
+                    if (m_pickPointTarget == 1)
+                        m_pickPointTarget = -1;
+                    if (restoreSnapOff && m_compareDoc.get() == compDoc && m_compareEditor)
+                        m_compareEditor->SetSnapEnabled(false);
+                    RequestRenderAll();
+                    if (onPicked)
+                        onPicked(seq, p.x, p.y);
+                },
+                [this, compDoc, seq, restoreSnapOff, onCancelled = std::move(onCancelled)]()
+                {
+                    if (m_pickPointTarget == 1)
+                        m_pickPointTarget = -1;
+                    if (restoreSnapOff && m_compareDoc.get() == compDoc && m_compareEditor)
+                        m_compareEditor->SetSnapEnabled(false);
+                    RequestRenderAll();
+                    if (onCancelled)
+                        onCancelled(seq);
+                });
+            RequestRenderAll();
+            return true;
+        }
+
+        Document* doc = m_docManager.GetActive();
+        if (!doc)
+            return false;
+        Editor& editor = m_docManager.GetEditor();
+        const bool restoreSnapOff = !editor.IsSnapEnabled();
+        if (restoreSnapOff)
+            editor.SetSnapEnabled(true);
+        m_pickPointTarget = 0;
+        editor.StartPickPointTool(
+            N_("指定对齐基点:"),
+            [this, doc, seq, restoreSnapOff, onPicked = std::move(onPicked)](const Math::Point3& p)
+            {
+                if (m_pickPointTarget == 0)
+                    m_pickPointTarget = -1;
+                if (restoreSnapOff && m_docManager.GetActive() == doc)
+                    m_docManager.GetEditor().SetSnapEnabled(false);
+                RequestRenderAll();
+                if (onPicked)
+                    onPicked(seq, p.x, p.y);
+            },
+            [this, doc, seq, restoreSnapOff, onCancelled = std::move(onCancelled)]()
+            {
+                if (m_pickPointTarget == 0)
+                    m_pickPointTarget = -1;
+                if (restoreSnapOff && m_docManager.GetActive() == doc)
+                    m_docManager.GetEditor().SetSnapEnabled(false);
+                RequestRenderAll();
+                if (onCancelled)
+                    onCancelled(seq);
+            });
+        RequestRenderAll();
+        return true;
+    }
+
+    void MainFrame::EmbedCancelPickPoint()
+    {
+        if (m_pickPointTarget == 1 && m_compareEditor && m_compareEditor->IsActiveTool())
+        {
+            InputEvent esc = {};
+            esc.Type = InputEventType::KeyDown;
+            esc.Key  = KeyCode::Escape;
+            m_compareEditor->OnInput(esc);
+            esc.Type = InputEventType::KeyUp;
+            m_compareEditor->OnInput(esc);
+            m_pickPointTarget = -1;
+            RequestRenderAll();
+            return;
+        }
+        m_pickPointTarget = -1;
+        if (!m_docManager.GetActive())
+            return;
+        Editor& editor = m_docManager.GetEditor();
+        if (!editor.IsActiveTool())
+            return;
+        InputEvent esc = {};
+        esc.Type = InputEventType::KeyDown;
+        esc.Key  = KeyCode::Escape;
+        editor.OnInput(esc);
+        esc.Type = InputEventType::KeyUp;
+        editor.OnInput(esc);
+        RequestRenderAll();
+    }
+
     bool MainFrame::WantsCompactLayout(float width, float height) const
     {
+        if (m_embedMode >= 0)
+            return false;
         if (!m_platform || !m_platform->SupportsCompactLayout())
             return false;
         // 进出的阈值不同：在临界尺寸上旋转、调整时不来回切换
@@ -625,8 +1331,13 @@ namespace MiniCAD
             if (m_viewport) m_viewport->Focus();
         }
         m_openedAny = false;
-        if (!m_openFailures.empty() && m_ui)
-            MiniGUI::ShowMessageBox(*m_ui, Tr("打开图纸失败"), m_openFailures, { Tr("确定") }, [](int) {});
+        if (!m_openFailures.empty())
+        {
+            if (m_embedMode >= 0)
+                m_mainOpenError = m_openFailures;
+            else if (m_ui)
+                MiniGUI::ShowMessageBox(*m_ui, Tr("打开图纸失败"), m_openFailures, { Tr("确定") }, [](int) {});
+        }
         m_openFailures.clear();
         PromptMissingXrefs();
     }
@@ -1391,8 +2102,102 @@ namespace MiniCAD
             m_viewport->Invalidate();       // 更新状态栏坐标
             return;
         }
-        if (Document* doc = m_docManager.GetMainDocument())
-            RouteViewportPointer(e, doc, m_mainInput, *m_viewport);
+        Document* mainDoc = m_docManager.GetMainDocument();
+        if (!mainDoc)
+            return;
+        if (m_pickPointTarget == 1 && m_compareDoc && m_compareEditor)
+        {
+            const bool isMiddle =
+                ((e.type == T::Down || e.type == T::Up) && e.button == MiniGUI::MouseButton::Middle)
+                || (e.type == T::Move && ((e.buttons & static_cast<uint8_t>(MiniGUI::MouseButtonMask::Middle)) != 0
+                                       || (m_mainInput.buttons & static_cast<uint8_t>(MouseButtonState::Middle)) != 0));
+            if (e.type == T::Wheel || isMiddle || e.type == T::Cancel)
+            {
+                RouteViewportPointer(e, mainDoc, m_mainInput, *m_viewport);
+                SyncCompareCamera();
+                if (e.type == T::Wheel)
+                {
+                    MiniGUI::ViewportPointerEvent hover = e;
+                    hover.type = T::Move;
+                    m_compareInput.mouseX = std::numeric_limits<int>::min();
+                    RouteComparePointer(hover);
+                }
+                return;
+            }
+            RouteComparePointer(e);
+            return;
+        }
+        RouteViewportPointer(e, mainDoc, m_mainInput, *m_viewport);
+    }
+
+    void MainFrame::RouteComparePointer(const MiniGUI::ViewportPointerEvent& original)
+    {
+        using T = MiniGUI::PointerEventType;
+        if (!m_compareEditor || !m_viewport)
+            return;
+        MiniGUI::ViewportPointerEvent e = original;
+        const int x = static_cast<int>(std::floor(e.pixel.x));
+        const int y = static_cast<int>(std::floor(e.pixel.y));
+
+        InputEvent ie   = {};
+        ie.Modifiers    = e.modifiers;
+        ie.MouseButtons = ToButtonState(e.buttons);
+        ie.ClickCount   = e.clickCount;
+        ie.MouseX       = x;
+        ie.MouseY       = y;
+        ie.LastMouseX   = m_compareInput.mouseX;
+        ie.LastMouseY   = m_compareInput.mouseY;
+
+        switch (e.type)
+        {
+        case T::Down:
+            m_compareInput.pressX = x;
+            m_compareInput.pressY = y;
+            ie.Type   = InputEventType::MouseButtonDown;
+            ie.Button = ToMouseButton(e.button);
+            break;
+        case T::Up:
+            ie.Type   = InputEventType::MouseButtonUp;
+            ie.Button = ToMouseButton(e.button);
+            break;
+        case T::Move:
+            if (x == m_compareInput.mouseX && y == m_compareInput.mouseY)
+                return;
+            ie.Type = InputEventType::MouseMove;
+            break;
+        case T::Cancel:
+        {
+            const std::pair<MouseButton, MouseButtonState> held[] =
+            {
+                { MouseButton::Left,   MouseButtonState::Left   },
+                { MouseButton::Middle, MouseButtonState::Middle },
+                { MouseButton::Right,  MouseButtonState::Right  },
+            };
+            for (const auto& [button, state] : held)
+            {
+                if (!(m_compareInput.buttons & static_cast<uint8_t>(state)))
+                    continue;
+                InputEvent up   = ie;
+                up.Type         = InputEventType::MouseButtonUp;
+                up.Button       = button;
+                up.MouseButtons = 0;
+                m_compareEditor->OnInput(up);
+            }
+            m_compareInput.buttons = 0;
+            NoteInput(*m_viewport);
+            return;
+        }
+        default:
+            return;
+        }
+
+        ie.PressMouseX = m_compareInput.pressX;
+        ie.PressMouseY = m_compareInput.pressY;
+        m_compareInput.mouseX  = x;
+        m_compareInput.mouseY  = y;
+        m_compareInput.buttons = ie.MouseButtons;
+        m_compareEditor->OnInput(ie);
+        NoteInput(*m_viewport);
     }
 
     // 一个视口（主窗口的，或某个文档窗口的）里的指针事件交给那个文档的编辑器；按下 / 滚轮即成为当前文档
@@ -1485,7 +2290,24 @@ namespace MiniCAD
 
     bool MainFrame::OnViewportKey(const MiniGUI::KeyEvent& e)
     {
-const KeyCode code = ToKeyCode(e.key);
+        const KeyCode code = ToKeyCode(e.key);
+        if (m_pickPointTarget == 1 && m_compareEditor && code == KeyCode::Escape)
+        {
+            InputEvent ie = {};
+            ie.Type         = e.type == MiniGUI::KeyEventType::Down ? InputEventType::KeyDown : InputEventType::KeyUp;
+            ie.Key          = code;
+            ie.Modifiers    = e.modifiers;
+            ie.MouseButtons = m_compareInput.buttons;
+            ie.MouseX       = m_compareInput.mouseX;
+            ie.MouseY       = m_compareInput.mouseY;
+            ie.LastMouseX   = m_compareInput.mouseX;
+            ie.LastMouseY   = m_compareInput.mouseY;
+            ie.PressMouseX  = m_compareInput.pressX;
+            ie.PressMouseY  = m_compareInput.pressY;
+            const bool handled = m_compareEditor->OnInput(ie);
+            NoteInput();
+            return handled || ie.Type == InputEventType::KeyDown;
+        }
         if (code == KeyCode::Unknown || !m_docManager.GetActive() || m_compact)
             return false;       // 只浏览：键盘不进命令行、不执行快捷键
         // Tab 只交给进行中的工具（如圆角边切换重叠的边），工具不处理时仍留给界面切换焦点
@@ -1535,16 +2357,57 @@ const KeyCode code = ToKeyCode(e.key);
         {
             Editor&    editor   = m_docManager.GetMainEditor();
             IRenderer& renderer = m_platform->GetRenderer();
-            editor.EnsureSceneCached(renderer);     // 场景缓冲被文档窗口顶掉了就重新拼接
-            editor.SetCursorHidden(m_compact);
+            const bool useCompare = m_compareDoc && m_compareEditor && m_compareDisplayMode != CompareDisplayMode::Off;
+            const int splitX = static_cast<int>(std::lround(std::clamp(m_compareSplitRatio, 0.0f, 1.0f) * static_cast<float>(pixelWidth)));
+            const bool mainDrawn = !useCompare || (m_compareDisplayMode != CompareDisplayMode::CompareOnly
+                && !(m_compareDisplayMode == CompareDisplayMode::AlignPickBase && m_compareSolo)
+                && !(m_compareDisplayMode == CompareDisplayMode::Split && splitX <= 0));
+            const bool compDrawn = useCompare && m_compareDisplayMode != CompareDisplayMode::CurrentOnly
+                && !(m_compareDisplayMode == CompareDisplayMode::Split && splitX >= pixelWidth)
+                && !(m_compareDisplayMode == CompareDisplayMode::Blend && m_compareOpacity <= 0.001f);
+
+            editor.EnsureSceneCached(renderer, 0);
+            editor.SetCursorHidden(m_compact || (useCompare && m_pickPointTarget == 1));
             editor.Render();
             const ViewState vs = editor.BuildViewState();
-            vp.Render(renderer, target, vs);
-// 场景顶点已在 GPU 缓冲里：CPU 端的拼接流不再需要（几百万顶点的图纸约 200 MB）。
-            // 追加段没接上后端的缓冲（这一帧画的是旧内容）：下一帧从逐实体缓存全量重新拼接
-            if (Viewport::SceneUploaded(renderer, vs))
+
+            if (useCompare)
+            {
+                SyncCompareCamera();
+                m_compareEditor->SetThinLines(editor.IsThinLines());
+                m_compareEditor->SetCursorHidden(m_compact || m_pickPointTarget != 1);
+                m_compareEditor->EnsureSceneCached(renderer, Viewport::kCompareSlotOffset);
+                m_compareEditor->Render();
+                const ViewState compVs = m_compareEditor->BuildViewState();
+
+                CompareRenderPass cp;
+                cp.Mode           = m_compareDisplayMode;
+                cp.Scale          = m_compareScale;
+                cp.Dx             = m_compareDx;
+                cp.Dy             = m_compareDy;
+                cp.CompareOpacity = m_compareOpacity;
+                cp.SplitX         = splitX;
+                cp.SoloCompare    = m_compareSolo;
+                cp.PickCompare    = (m_pickPointTarget == 1);
+                cp.State          = &compVs;
+                vp.Render(renderer, target, vs, &cp);
+
+                if (Viewport::SceneUploaded(renderer, compVs, Viewport::kCompareSlotOffset))
+                    m_compareEditor->ReleaseUploadedSceneStreams();
+                else if (compVs.SceneAppendActive && compDrawn)
+                {
+                    m_compareEditor->RequestSceneRestitch();
+                    m_viewport->RequestRender();
+                }
+            }
+            else
+            {
+                vp.Render(renderer, target, vs);
+            }
+
+            if (Viewport::SceneUploaded(renderer, vs, 0))
                 editor.ReleaseUploadedSceneStreams();
-            else if (vs.SceneAppendActive)
+            else if (vs.SceneAppendActive && mainDrawn)
             {
                 editor.RequestSceneRestitch();
                 m_viewport->RequestRender();
@@ -1749,7 +2612,8 @@ renderer.BeginFrame(target, ViewportDesc{ .width = static_cast<float>(pixelWidth
         // 4.5 视图切换的过渡动画、分帧生成显示：帧结束后再请求下一帧。不能在渲染中途请求——本帧结束时（UIContext::Render、
         //     WM_PAINT 的 ValidateRect）会把请求清掉，动画要等鼠标动了才继续。生成完显示后再画一帧，收起状态栏的进度
         if (Document* main = m_docManager.GetMainDocument();
-            main && (main == m_buildDoc || m_docManager.GetMainEditor().IsViewTransitioning() || m_docManager.GetMainEditor().IsBuildingDisplay()))
+            main && (main == m_buildDoc || m_docManager.GetMainEditor().IsViewTransitioning() || m_docManager.GetMainEditor().IsBuildingDisplay()
+                     || (m_compareEditor && (m_compareEditor->IsViewTransitioning() || m_compareEditor->IsBuildingDisplay()))))
             m_platform->Post([this] { m_viewport->RequestRender(); });
 
         // 5. 读完的图纸在"正在生成显示"画出来之后才加入（加入后分帧生成显示）。

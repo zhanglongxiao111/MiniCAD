@@ -366,12 +366,12 @@ namespace MiniCAD
         // 新视口的缩放与原来的不同：Render 比较 worldPerPixel 时会重建动态流与随视图变化的选中流
     }
 
-    void Editor::EnsureSceneCached(const IRenderer& renderer)
+    void Editor::EnsureSceneCached(const IRenderer& renderer, uint32_t slotOffset)
     {
         if (!m_sceneStreamsReleased || m_sceneRestitch)
             return;
         if (!Viewport::SceneUploaded(renderer, m_sceneVersion, m_sceneGlyphVersion, m_fontTexture != nullptr,
-                                     !m_glyphSorted.empty(), m_glyphLibrary.View().Version))
+                                     !m_glyphSorted.empty(), m_glyphLibrary.View().Version, slotOffset))
             m_sceneRestitch = true;
     }
 
@@ -988,8 +988,16 @@ namespace MiniCAD
         return '\0';
     }
 
+    static std::function<bool(const std::string&)>& ToolGateRef() { static std::function<bool(const std::string&)> gate; return gate; }
+    void Editor::SetToolGate(std::function<bool(const std::string&)> gate) { ToolGateRef() = std::move(gate); }
+
     void Editor::ActivateToolById(const std::string& toolId)
     {
+        if (ToolGateRef() && !ToolGateRef()(toolId))
+        {
+            m_commandLine.Echo(TrF("当前模式不能使用此命令: {0}", toolId));
+            return;
+        }
         if (toolId == "Previous")
         {
             m_picking.RestoreLastSelection();
@@ -1356,12 +1364,12 @@ namespace MiniCAD
         ActivateTool(std::make_unique<PasteTool>(clipboard, std::move(onCommitted), basePoint));
     }
 
-    void Editor::StartPickPointTool(std::string prompt, std::function<void(const Math::Point3&)> onPicked)
+    void Editor::StartPickPointTool(std::string prompt, std::function<void(const Math::Point3&)> onPicked, std::function<void()> onCancelled)
     {
         if (!IsBound())
             return;
 
-        ActivateTool(std::make_unique<PickPointTool>(std::move(prompt), std::move(onPicked)));
+        ActivateTool(std::make_unique<PickPointTool>(std::move(prompt), std::move(onPicked), std::move(onCancelled)));
     }
 
     std::string Editor::GenerateBlockName() const

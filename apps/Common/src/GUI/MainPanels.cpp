@@ -904,6 +904,8 @@ namespace MiniCAD
             bar->SetWindowActive(m_platform->IsWindowActive());
         }
 
+        // 嵌入模式：功能区重新生成后重新对齐「浏览 / 批注」选项卡并挂回调
+        EmbedSyncRibbonTab();
         // 功能区也是重新生成的：命令搜索框执行或关闭后把焦点还给绘图区
         if (Ribbon* ribbon = m_layout->GetRibbon())
             ribbon->SetOnSearchDone([this]
@@ -974,6 +976,8 @@ namespace MiniCAD
         m_fontSystem.GetFontEngine().RescanFallbacks();
         for (auto& doc : m_docManager.GetAll())
             doc->GetScene().MarkDirty();        // 已经画成方块的字重新细分
+        if (m_compareDoc)
+            m_compareDoc->GetScene().MarkDirty();
         m_ui->Update();
         RequestRenderAll();
     }

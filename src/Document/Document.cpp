@@ -46,6 +46,7 @@ namespace MiniCAD
     {
         // 所有编辑都经由 CommandStack,在此统一标记未保存
         m_cmdStack.SetOnMutate([this] { MarkDirty(); });
+        m_cmdStack.SetScene(&m_scene);   // 嵌入模式：否决钩子撤销 Push 进来的改动
         // 每条命令生效后让关联标注跟上几何,跟随的改动与该命令一起撤销
         m_cmdStack.SetPostCommandHook([this] { return DimAssoc::Sync(m_scene); });
     }

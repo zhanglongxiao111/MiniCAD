@@ -129,6 +129,8 @@ namespace MiniCAD
         void RegisterTool(const std::string& toolId, std::function<std::unique_ptr<ITool>()> factory);
         void RegisterAlias(const std::string& alias, const std::string& toolId);
         void ActivateToolById(const std::string& toolId);
+        // 嵌入模式：全局工具闸（键入命令、别名、功能区按钮都经 ActivateToolById）；返回 false 的工具不启动
+        static void SetToolGate(std::function<bool(const std::string&)> gate);
         void ActivateRegisteredTool(const std::string& toolId);     // 跳过特例命令,直接按注册表启动工具
 
         // ── 命令行 ───────────────────────────────────────────
@@ -171,7 +173,7 @@ namespace MiniCAD
                             const Math::Point3* basePoint = nullptr);
 
         // 单点拾取:左键拾取一个点后回调并结束,右键/ESC 取消(带基点复制等轻交互)
-        void StartPickPointTool(std::string prompt, std::function<void(const Math::Point3&)> onPicked);   // prompt：N_ 标记的原文
+        void StartPickPointTool(std::string prompt, std::function<void(const Math::Point3&)> onPicked, std::function<void()> onCancelled = nullptr);   // prompt：N_ 标记的原文
 
         // 定义块(AutoCAD BLOCK):把指定实体收进新块并原位替换为块引用;
         // name 为空时自动生成唯一块名(Block1..N)
@@ -423,7 +425,7 @@ namespace MiniCAD
         void RequestSceneRestitch() { m_sceneRestitch = m_sceneStreamsReleased; }
         // 每帧 Render 之前调用：拼接流已释放而后端里已经没有本编辑器的场景缓冲（渲染器按槽位只留一份，几个视口轮流渲染
         // 不同的文档时会被顶掉）就重新拼接，否则这一帧会按空流上传、图纸消失
-        void EnsureSceneCached(const IRenderer& renderer);
+        void EnsureSceneCached(const IRenderer& renderer, uint32_t slotOffset = 0);
         // 渲染后端能把新增实体的顶点接到已上传的场景缓冲末尾（IRenderer::SupportsCachedAppend）：拼接流释放后
         // 新画一个图形只细分它、把顶点放进追加段（ViewState::SceneAppendActive），不再从逐实体缓存重新拼接、
         // 整体重新上传。进程内全局，宿主在渲染器就绪后设置

@@ -195,7 +195,7 @@ namespace MiniGUI
     bool CommandRegistry::IsEnabled(std::string_view id) const
     {
         const Command* c = Find(id);
-        return c && c->execute && (!c->canExecute || c->canExecute());
+        return c && c->execute && (!m_gate || m_gate(id)) && (!c->canExecute || c->canExecute());
     }
 
     bool CommandRegistry::IsChecked(std::string_view id) const

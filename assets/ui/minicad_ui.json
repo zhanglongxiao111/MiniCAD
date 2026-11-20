@@ -125,6 +125,32 @@
 
   // 功能区：选项卡 → 组 → 命令（或 { "panel": 宿主面板名 }）；点组名列出全组命令，宽度不够时整组折叠
   "ribbons": {
+    // 嵌入模式（看图与批注）：只有看图与批注两页；命令是否可用另由宿主按模式白名单把关（MainFrame::EmbedSetMode）
+    "saembed": {
+      "search": false,
+      "tabs": [
+        {
+          "title": "浏览",
+          "panels": [
+            { "title": "导航", "items": [ "view.zoomExtents", "view.zoomWindow", "view.pan", "view.zoomIn", "view.zoomOut" ] },
+            { "title": "查询", "items": [ "inquiry.area" ] },
+            { "title": "显示", "items": [ "view.thinLines", "view.grid" ] },
+            { "title": "辅助", "items": [ "aux.snap", "aux.ortho", "aux.polar" ] },
+            { "title": "面板", "items": [ "view.panel.layers", "view.panel.properties", "view.panel.commandline" ] }
+          ]
+        },
+        {
+          "title": "批注",
+          "panels": [
+            { "title": "标注", "items": [ "dim.linear", "dim.angular", "dim.radius", "dim.diameter", "dim.arc", "dim.ordinate" ] },
+            { "title": "引线", "items": [ "dim.leader", "dim.mleader" ] },
+            { "title": "文字", "items": [ "draw.text", "draw.mtext" ] },
+            { "title": "圈注", "items": [ "draw.rect", "draw.pline", "draw.circle" ] },
+            { "title": "编辑", "items": [ "edit.undo", "edit.redo", "edit.delete" ] }
+          ]
+        }
+      ]
+    },
     "main": {
       "search": "搜索命令  Ctrl+K",
       "tabs": [
@@ -204,7 +230,8 @@
   "toolbars": {
     "quick": [ "file.save", "edit.undo", "edit.redo" ],
     "home": [ "view.start" ],
-    "compact": [ "view.start", "file.open" ]
+    "compact": [ "view.start", "file.open" ],
+    "saembed": [ "view.zoomExtents", "edit.undo", "edit.redo" ]
   },
 
   // 照 SolidCraft：标题栏下面整个是绘图区（canvas），功能区、停靠面板、状态栏都是浮在它上面的圆角卡片
@@ -285,6 +312,64 @@
 
   // 文档窗口：标题栏（“文件”菜单、快速访问、文档标签、窗口按钮）、功能区、绘图区与停靠面板、状态栏
   "layouts": {
+    // 嵌入模式：没有文件菜单 / 起始页按钮；功能区（浏览 / 批注）、右侧特性与图层、底部命令行与状态栏（捕捉、布局标签）
+    "saembed": {
+      "type": "column",
+      "children": [
+        {
+          "type": "titlebar",
+          "icon": "app.png",
+          "shrink": 0,
+          "children": [
+            { "type": "toolbar", "id": "saembed", "iconSize": 18, "padding": [ 2, 3, 2, 3 ], "shrink": 0 },
+            { "type": "separator", "height": 16 },
+            { "type": "panel", "name": "doctabs", "grow": 1 }
+          ]
+        },
+        { "type": "panel", "name": "start", "grow": 1, "visible": false },
+        {
+          "type": "column",
+          "grow": 1,
+          "children": [
+            { "type": "panel", "name": "canvas", "position": "absolute", "left": 0, "top": 0, "right": 0, "bottom": 0 },
+            {
+              "type": "column",
+              "position": "absolute", "left": 0, "top": 0, "right": 0, "bottom": 0,
+              "padding": 6,
+              "gap": 6,
+              "passThrough": true,
+              "variants": { "flush": { "padding": 0, "gap": 0 } },
+              "children": [
+                { "type": "row", "shrink": 0, "passThrough": true, "children": [ { "type": "ribbon", "id": "saembed", "grow": 1, "variants": { "flush": { "card": false } } } ] },
+                {
+                  "type": "dock",
+                  "id": "main",
+                  "grow": 1,
+                  "gap": 6,
+                  "floating": true,
+                  "variants": { "flush": { "gap": 0 } },
+                  "root": {
+                    "split": "row",
+                    "children": [
+                      { "tabs": [ { "panel": "documents", "header": false, "closable": false } ] },
+                      {
+                        "split": "column",
+                        "size": 300,
+                        "children": [
+                          { "tabs": [ "layers" ] },
+                          { "tabs": [ "properties" ], "size": 300 }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                { "type": "panel", "name": "statusbar", "shrink": 0, "card": true, "variants": { "flush": { "card": false } } }
+              ]
+            }
+          ]
+        }
+      ]
+    },
     // 小屏幕只浏览：标题栏（首页、打开、缩放全图、文档标签）、铺满的绘图区（视图方块、导航条）、状态栏（布局标签）
     "compact": {
       "type": "column",

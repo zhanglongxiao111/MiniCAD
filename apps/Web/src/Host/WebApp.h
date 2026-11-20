@@ -50,6 +50,7 @@ namespace MiniCAD
         void OnRemoteCompleted(int requestId);
         void OnXrefsFetched(int requestId, const char* dir, const char* error);
         bool HasUnsavedDocuments() const;
+        bool IsUiReady() const { return m_uiReady; }   // 嵌入模式：图形设备与界面都就绪后才接受打开图纸
 
         // ── AppPlatform ─────────────────────────────────────────
         MiniGUI::IRenderBackend& GetUiBackend() override;
@@ -59,6 +60,7 @@ namespace MiniCAD
         bool LoadUiFonts(MiniGUI::TextSystem& text) override;
         std::vector<std::shared_ptr<MiniGUI::Font>> LoadLanguageUiFonts(const std::string& language) override;
         void RequestRedraw() override { m_host.RequestFrame(); }
+        void ReleaseFreeMemory() override { if (m_graphics) m_graphics->ReleaseFreeMemory(); }
         void BeginUiPass() override;
         void EndUiPass() override;
         const char* GetGraphicsName() const override { return m_graphics ? m_graphics->GetName() : ""; }

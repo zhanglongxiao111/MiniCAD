@@ -64,6 +64,8 @@ namespace MiniGUI
         const std::vector<std::string>& GetIds() const { return m_order; }   // 注册顺序
 
         bool Execute(std::string_view id);                  // 不存在或不可用返回 false
+        // 宿主的总闸（嵌入模式：按模式白名单放行命令）；返回 false 的命令一律不可用（灰显、快捷键无效）
+        void SetGate(std::function<bool(std::string_view)> gate) { m_gate = std::move(gate); NotifyStateChanged(); }
         bool IsEnabled(std::string_view id) const;          // 不存在返回 false
         bool IsChecked(std::string_view id) const;
         bool IsToggle(std::string_view id) const;
@@ -109,6 +111,7 @@ namespace MiniGUI
         std::vector<std::string>                 m_order;
 
         std::vector<BoundTable>         m_tables;
+        std::function<bool(std::string_view)> m_gate;
 
         struct Listener { ListenerId id; std::function<void()> fn; };
         std::vector<Listener> m_listeners;

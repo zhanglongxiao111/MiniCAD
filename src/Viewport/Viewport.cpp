@@ -92,21 +92,22 @@ namespace MiniCAD
         m_viewportDesc.maxDepth = 1.0f;
     }
 
-    bool Viewport::SceneUploaded(const IRenderer& renderer, const ViewState& viewState)
+    bool Viewport::SceneUploaded(const IRenderer& renderer, const ViewState& viewState, uint32_t slotOffset)
     {
         // 没有字体纹理时文字流不提交，也就不需要保留
         return SceneUploaded(renderer, viewState.SceneVersion, viewState.SceneGlyphVersion,
-                             viewState.FontTexture != nullptr, !viewState.Glyphs.empty(), viewState.GlyphMeshes.Version);
+                             viewState.FontTexture != nullptr, !viewState.Glyphs.empty(),
+                             viewState.GlyphMeshes.Version, slotOffset);
     }
 
     bool Viewport::SceneUploaded(const IRenderer& renderer, uint64_t sceneVersion, uint64_t glyphVersion,
-                                 bool textured, bool glyphs, uint64_t meshVersion)
+                                 bool textured, bool glyphs, uint64_t meshVersion, uint32_t slotOffset)
     {
-        return renderer.IsCached(kSlotSceneFill, sceneVersion, false)
-            && renderer.IsCached(kSlotScene, sceneVersion, false)
-            && renderer.IsCached(kSlotScenePoint, sceneVersion, false)
-            && (!textured || renderer.IsCached(kSlotSceneText, glyphVersion, true))
-            && (!glyphs || renderer.IsGlyphCached(kSlotGlyph, glyphVersion, meshVersion));
+        return renderer.IsCached(kSlotSceneFill + slotOffset, sceneVersion, false)
+            && renderer.IsCached(kSlotScene + slotOffset, sceneVersion, false)
+            && renderer.IsCached(kSlotScenePoint + slotOffset, sceneVersion, false)
+            && (!textured || renderer.IsCached(kSlotSceneText + slotOffset, glyphVersion, true))
+            && (!glyphs || renderer.IsGlyphCached(kSlotGlyph + slotOffset, glyphVersion, meshVersion));
     }
 
     uint64_t Viewport::NextViewVersion()
@@ -123,7 +124,8 @@ namespace MiniCAD
     //   动态层 —— 每帧：先把缓存层整块复制过来，再画选中、叠加层（橡皮筋 / 悬停高亮）、
     //            夹点、框选框、捕捉标记、十字光标。鼠标移动只改这些，GPU 开销与场景规模无关。
     // 后端不支持缓存层（CreateLayerTarget 返回空）时，两层都画在目标上，结果相同。
-    void Viewport::Render(IRenderer& renderer, IRenderTarget& target, const ViewState& viewState)
+    void Viewport::Render(IRenderer& renderer, IRenderTarget& target, const ViewState& viewState,
+                          const CompareRenderPass* compare)
     {
         auto screenVP = Math::Mat4::OrthoOffCenterLH(0.0f, m_width, m_height, 0.0f, 0.0f, 1.0f);
         Math::Mat4 vp = m_camera.GetViewProj();
@@ -150,10 +152,10 @@ namespace MiniCAD
             vpSilhouettes.m[14] -= 6.0 * m_camera.GetWorldPerPixel() / span;
         }
 
-        // 顶点相对渲染原点（ViewState::RenderOrigin）：原点的平移在双精度里合进矩阵，交给 GPU 的矩阵平移量只剩
-        // 视图中心与原点之差（测绘坐标下世界坐标的矩阵里是几百万，转成 float 后与顶点相减，误差有好几个像素）。
-        // 三维视图的网格与坐标轴按世界坐标生成，用合进原点之前的矩阵
-        const Math::Mat4 vpWorldLines = vpLines;
+        // 未叠渲染原点前的主世界矩阵：对比图也以它为基准，在双精度里同时合成“对比图原点 + 仿射对齐逆变换”
+        const Math::Mat4 vpWorld            = vp;
+        const Math::Mat4 vpWorldLines       = vpLines;
+        const Math::Mat4 vpWorldSilhouettes = vpSilhouettes;
         if (const Math::Point3& o = viewState.RenderOrigin; o.x != 0.0 || o.y != 0.0 || o.z != 0.0)
         {
             const Math::Mat4 shift = Math::Mat4::Translation(Math::Vec3{ o.x, o.y, o.z });
@@ -164,37 +166,99 @@ namespace MiniCAD
 
         // 网格/坐标轴/Gizmo 只依赖相机+尺寸+开关：版本未变时 CPU 不重建、GPU 缓冲直接复用
         RefreshViewGeometry(viewState);
-        renderer.SetLightBackground(m_lightBackground);
 
-        // 追加段：拼接流释放后新增实体的静态顶点，接到后端缓冲的末尾（后端据 (slot, 基础版本) 找缓冲）。
-        // 接不上（后端没有那个版本、显存不够）这一帧按基础版本画旧内容；SceneUploaded 随之为假，
-        // 应用层请编辑器下一帧全量重新拼接
-        uint64_t sceneVersion = viewState.SceneVersion;
-        if (viewState.SceneAppendActive && !renderer.IsCached(kSlotScene, viewState.SceneVersion, false))
+        auto resolveSceneVersion = [&](const ViewState& vs, uint32_t slotOffset) -> uint64_t
         {
-            // 先原地改写（修改 / 删除的实体那一段），再追加、升级版本
-            bool ok = true;
-            for (const ViewState::ScenePatch& p : viewState.ScenePatches)
+            uint64_t ver = vs.SceneVersion;
+            if (vs.SceneAppendActive && !renderer.IsCached(kSlotScene + slotOffset, vs.SceneVersion, false))
             {
-                const uint32_t slot = p.Stream == 0 ? kSlotScene : p.Stream == 1 ? kSlotSceneFill : kSlotScenePoint;
-                const auto&    src  = p.Stream == 0 ? viewState.ScenePatchLines : p.Stream == 1 ? viewState.ScenePatchFills : viewState.ScenePatchPoints;
-                if (p.First + p.Count > src.size() ||
-                    !renderer.WriteCached(slot, viewState.SceneAppendBase, p.Offset, src.subspan(p.First, p.Count)))
+                bool ok = true;
+                for (const ViewState::ScenePatch& p : vs.ScenePatches)
                 {
-                    ok = false;
-                    break;
+                    const uint32_t slot = (p.Stream == 0 ? kSlotScene : p.Stream == 1 ? kSlotSceneFill : kSlotScenePoint) + slotOffset;
+                    const auto&    src  = p.Stream == 0 ? vs.ScenePatchLines : p.Stream == 1 ? vs.ScenePatchFills : vs.ScenePatchPoints;
+                    if (p.First + p.Count > src.size() ||
+                        !renderer.WriteCached(slot, vs.SceneAppendBase, p.Offset, src.subspan(p.First, p.Count)))
+                    {
+                        ok = false;
+                        break;
+                    }
                 }
+                const bool appended = ok &&
+                    renderer.AppendCached(kSlotScene + slotOffset,      vs.SceneAppendBase, vs.SceneVersion, vs.SceneAppend) &&
+                    renderer.AppendCached(kSlotSceneFill + slotOffset,  vs.SceneAppendBase, vs.SceneVersion, vs.SceneAppendFill) &&
+                    renderer.AppendCached(kSlotScenePoint + slotOffset, vs.SceneAppendBase, vs.SceneVersion, vs.SceneAppendPoints);
+                if (!appended)
+                    ver = vs.SceneAppendBase;
             }
-            const bool appended = ok &&
-                renderer.AppendCached(kSlotScene,      viewState.SceneAppendBase, viewState.SceneVersion, viewState.SceneAppend) &&
-                renderer.AppendCached(kSlotSceneFill,  viewState.SceneAppendBase, viewState.SceneVersion, viewState.SceneAppendFill) &&
-                renderer.AppendCached(kSlotScenePoint, viewState.SceneAppendBase, viewState.SceneVersion, viewState.SceneAppendPoints);
-            if (!appended)
-                sceneVersion = viewState.SceneAppendBase;
+            return ver;
+        };
+
+        const uint64_t sceneVersion = resolveSceneVersion(viewState, 0);
+        const bool hasCompare = compare && compare->State && compare->Mode != CompareDisplayMode::Off;
+        const bool forceDarkCompare = hasCompare && (compare->Mode == CompareDisplayMode::Blend || compare->Mode == CompareDisplayMode::AlignPickMain);
+        const bool effectiveLight = forceDarkCompare ? false : m_lightBackground;
+        renderer.SetLightBackground(effectiveLight);
+        if (hasCompare)
+        {
+            if (effectiveLight)
+                renderer.SetClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+            else
+                renderer.SetClearColor(30.0f / 255.0f, 31.0f / 255.0f, 34.0f / 255.0f, 1.0f);
+        }
+        else
+        {
+            renderer.SetClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        uint64_t compSceneVersion = 0;
+        Math::Mat4 compVp = vpWorld, compVpLines = vpWorldLines, compVpSilhouettes = vpWorldSilhouettes;
+        if (hasCompare)
+        {
+            compSceneVersion = resolveSceneVersion(*compare->State, kCompareSlotOffset);
+            const double s = (std::isfinite(compare->Scale) && compare->Scale > 1e-9) ? compare->Scale : 1.0;
+            const double invS = 1.0 / s;
+            const Math::Point3& co = compare->State->RenderOrigin;
+            const Math::Mat4 compShift =
+                Math::Mat4::Scale(Math::Vec3{ invS, invS, 1.0 }) *
+                Math::Mat4::Translation(Math::Vec3{ (co.x - compare->Dx) * invS, (co.y - compare->Dy) * invS, co.z });
+            compVp            = compShift * vpWorld;
+            compVpLines       = compShift * vpWorldLines;
+            compVpSilhouettes = compShift * vpWorldSilhouettes;
         }
 
+        auto drawScenePass = [&](const ViewState& vs, uint64_t ver, uint32_t slotOff,
+                                 const Math::Mat4& passVp, const Math::Mat4& passVpLines, const Math::Mat4& passVpSil,
+                                 bool withWorldGrid)
+        {
+            for (const ImageDraw& im : vs.Images)
+                if (im.Image) renderer.SubmitImageForSlot(*im.Image, im.Verts, passVp, slotOff);
+
+            renderer.SubmitCached(kSlotShaded + slotOff, vs.ShadedVersion, vs.Shaded, passVp, PrimitiveType::Triangle, !plan, plan);
+            if (withWorldGrid && !plan)
+            {
+                renderer.SubmitCached(kSlotGrid, m_viewVersion, m_gridVerts, vpWorldLines, PrimitiveType::Line, true, true);
+                renderer.SubmitCached(kSlotAxis, m_viewVersion, m_axisVerts, vpWorldLines, PrimitiveType::Line, true, true);
+            }
+
+            renderer.SubmitCached(kSlotScenePoint + slotOff, ver, vs.ScenePoints, passVp, PrimitiveType::Point, true, true);
+            renderer.SubmitCached(kSlotSceneFill + slotOff,  ver, vs.SceneFill,   passVp, PrimitiveType::Triangle, true, true);
+            renderer.SubmitCached(kSlotDynFill + slotOff,    vs.SceneDynVersion, vs.SceneDynFill, passVp, PrimitiveType::Triangle, true, true);
+            renderer.SubmitGlyphsCached(kSlotGlyph + slotOff, vs.SceneGlyphVersion, vs.GlyphMeshes, vs.Glyphs, vs.GlyphBatches,
+                                        passVp, PrimitiveType::Triangle, true, true);
+            renderer.SubmitCached(kSlotScene + slotOff,      ver, vs.Scene,        passVpLines, PrimitiveType::Line, true, true);
+            renderer.SubmitCached(kSlotDyn + slotOff,        vs.SceneDynVersion, vs.SceneDyn,     passVpLines, PrimitiveType::Line, true, true);
+            renderer.SubmitCached(kSlotSilhouette + slotOff, vs.ShadedVersion,   vs.Silhouettes,  passVpSil,   PrimitiveType::Line, true, true);
+            renderer.SubmitGlyphsCached(kSlotGlyph + slotOff, vs.SceneGlyphVersion, vs.GlyphMeshes, vs.Glyphs, vs.GlyphBatches,
+                                        passVpLines, PrimitiveType::Line, true, true);
+            if (vs.FontTexture)
+                renderer.SubmitTexturedCached(kSlotSceneText + slotOff, vs.SceneGlyphVersion, vs.TextScene, passVp, vs.FontTexture, false, true);
+        };
+
+        const int pw = static_cast<int>(m_width), ph = static_cast<int>(m_height);
         auto drawStatic = [&]
         {
+            renderer.SetScissorRect({});
+            renderer.SetPaintStyle({});
             if (plan)
             {
                 renderer.SubmitCached(kSlotGrid, m_viewVersion, m_gridVerts, screenVP, PrimitiveType::Line, true, true);
@@ -202,44 +266,84 @@ namespace MiniCAD
             }
             renderer.SubmitCached(kSlotGizmo, m_viewVersion, m_gizmoVerts, screenVP, PrimitiveType::Line, true, true);
 
-            // 光栅图像在最底层（填充、线、文字都盖在它上面）
-            for (const ImageDraw& im : viewState.Images)
-                if (im.Image) renderer.SubmitImage(*im.Image, im.Verts, vp);
-
-            // 三维实体的着色面：俯视时只按绘制顺序（在填充、线之下），三维视图写深度
-            renderer.SubmitCached(kSlotShaded, viewState.ShadedVersion, viewState.Shaded, vp, PrimitiveType::Triangle, !plan, plan);
-            if (!plan)
+            if (!hasCompare)
             {
-                // 三维视图的网格与坐标轴（世界坐标，z = 0 平面）：画在着色面之后，被实体挡住的部分不显示
-                renderer.SubmitCached(kSlotGrid, m_viewVersion, m_gridVerts, vpWorldLines, PrimitiveType::Line, true, true);
-                renderer.SubmitCached(kSlotAxis, m_viewVersion, m_axisVerts, vpWorldLines, PrimitiveType::Line, true, true);
+                drawScenePass(viewState, sceneVersion, 0, vp, vpLines, vpSilhouettes, true);
+                return;
             }
 
-            // 场景几何走缓存提交：版本未变时 GPU 缓冲直接复用，不重新上传
-            // 点图元画在线之前、填充之后：图案填充的点（POINTLIST，恒定 1 屏幕像素）
-            // 与场景线同版本，不随视图变化
-            renderer.SubmitCached(kSlotScenePoint, sceneVersion, viewState.ScenePoints, vp, PrimitiveType::Point, true, true);
-            renderer.SubmitCached(kSlotSceneFill,  sceneVersion, viewState.SceneFill,   vp, PrimitiveType::Triangle, true, true);
-            renderer.SubmitCached(kSlotDynFill,   viewState.SceneDynVersion, viewState.SceneDynFill, vp, PrimitiveType::Triangle, true, true);
-            // 文字字形（实例化）：三角形在填充之后、线之前，轮廓线在线之后
-            renderer.SubmitGlyphsCached(kSlotGlyph, viewState.SceneGlyphVersion, viewState.GlyphMeshes, viewState.Glyphs, viewState.GlyphBatches,
-                                        vp, PrimitiveType::Triangle, true, true);
-            renderer.SubmitCached(kSlotScene,     sceneVersion,              viewState.Scene,        vpLines, PrimitiveType::Line, true, true);
-            renderer.SubmitCached(kSlotDyn,       viewState.SceneDynVersion, viewState.SceneDyn,     vpLines, PrimitiveType::Line, true, true);
-            renderer.SubmitCached(kSlotSilhouette, viewState.ShadedVersion,  viewState.Silhouettes,  vpSilhouettes, PrimitiveType::Line, true, true);
-            renderer.SubmitGlyphsCached(kSlotGlyph, viewState.SceneGlyphVersion, viewState.GlyphMeshes, viewState.Glyphs, viewState.GlyphBatches,
-                                        vpLines, PrimitiveType::Line, true, true);
-            if (viewState.FontTexture)
-                renderer.SubmitTexturedCached(kSlotSceneText, viewState.SceneGlyphVersion, viewState.TextScene, vp, viewState.FontTexture, false, true);
+            constexpr PaintStyle kMainBlendStyle{ PaintTintMode::Monochrome, PaintBlendMode::Alpha, 0.0f, 0.90f, 1.0f, 1.0f };
+            const PaintStyle compBlendStyle{
+                PaintTintMode::Monochrome, PaintBlendMode::Screen, 1.0f, 0.28f, 0.16f,
+                std::clamp(compare->CompareOpacity, 0.0f, 1.0f)
+            };
+            const PaintStyle compAlignStyle{
+                PaintTintMode::Monochrome, PaintBlendMode::Screen, 1.0f, 0.28f, 0.16f, 0.82f
+            };
+            constexpr PaintStyle kDimMainStyle{ PaintTintMode::None, PaintBlendMode::Alpha, 1.0f, 1.0f, 1.0f, 0.22f };
+
+            switch (compare->Mode)
+            {
+            case CompareDisplayMode::CurrentOnly:
+                drawScenePass(viewState, sceneVersion, 0, vp, vpLines, vpSilhouettes, true);
+                break;
+            case CompareDisplayMode::CompareOnly:
+                drawScenePass(*compare->State, compSceneVersion, kCompareSlotOffset, compVp, compVpLines, compVpSilhouettes, false);
+                break;
+            case CompareDisplayMode::Blend:
+                renderer.SetPaintStyle(kMainBlendStyle);
+                drawScenePass(viewState, sceneVersion, 0, vp, vpLines, vpSilhouettes, true);
+                if (compBlendStyle.Opacity > 0.001f)
+                {
+                    renderer.SetPaintStyle(compBlendStyle);
+                    drawScenePass(*compare->State, compSceneVersion, kCompareSlotOffset, compVp, compVpLines, compVpSilhouettes, false);
+                }
+                break;
+            case CompareDisplayMode::Split:
+            {
+                const int sx = std::clamp(compare->SplitX, 0, pw);
+                if (sx > 0)
+                {
+                    renderer.SetScissorRect({ true, 0, 0, sx, ph });
+                    drawScenePass(viewState, sceneVersion, 0, vp, vpLines, vpSilhouettes, true);
+                }
+                if (sx < pw)
+                {
+                    renderer.SetScissorRect({ true, sx, 0, pw - sx, ph });
+                    drawScenePass(*compare->State, compSceneVersion, kCompareSlotOffset, compVp, compVpLines, compVpSilhouettes, false);
+                }
+                renderer.SetScissorRect({});
+                break;
+            }
+            case CompareDisplayMode::AlignPickBase:
+                if (!compare->SoloCompare)
+                {
+                    renderer.SetPaintStyle(kDimMainStyle);
+                    drawScenePass(viewState, sceneVersion, 0, vp, vpLines, vpSilhouettes, true);
+                }
+                renderer.SetPaintStyle({});
+                drawScenePass(*compare->State, compSceneVersion, kCompareSlotOffset, compVp, compVpLines, compVpSilhouettes, false);
+                break;
+            case CompareDisplayMode::AlignPickMain:
+                renderer.SetPaintStyle({});
+                drawScenePass(viewState, sceneVersion, 0, vp, vpLines, vpSilhouettes, true);
+                renderer.SetPaintStyle(compAlignStyle);
+                drawScenePass(*compare->State, compSceneVersion, kCompareSlotOffset, compVp, compVpLines, compVpSilhouettes, false);
+                break;
+            default:
+                drawScenePass(viewState, sceneVersion, 0, vp, vpLines, vpSilhouettes, true);
+                break;
+            }
+            renderer.SetScissorRect({});
+            renderer.SetPaintStyle({});
         };
 
-        // ── 缓存层：键 = 场景版本 + 视图版本（相机 / 尺寸 / 开关）+ 字体纹理 ──
+        // ── 缓存层：键 = 场景版本 + 视图版本（相机 / 尺寸 / 开关）+ 字体纹理 + 对比状态 ──
         if (!m_layerTried)
         {
             m_layerTried = true;
             m_sceneLayer = renderer.CreateLayerTarget();
         }
-        const int pw = static_cast<int>(m_width), ph = static_cast<int>(m_height);
         if (m_sceneLayer && pw > 0 && ph > 0)
         {
             if (m_sceneLayer->GetWidth() != pw || m_sceneLayer->GetHeight() != ph)
@@ -248,14 +352,33 @@ namespace MiniCAD
                 m_layerValid = false;
             }
             uint64_t key = 1469598103934665603ull;
-            key = HashCombine(key, &viewState.SceneVersion, sizeof(viewState.SceneVersion));
+            key = HashCombine(key, &sceneVersion, sizeof(sceneVersion));
             key = HashCombine(key, &viewState.SceneDynVersion, sizeof(viewState.SceneDynVersion));
             key = HashCombine(key, &viewState.GlyphMeshes.Version, sizeof(viewState.GlyphMeshes.Version));
             key = HashCombine(key, &viewState.SceneGlyphVersion, sizeof(viewState.SceneGlyphVersion));
             key = HashCombine(key, &m_viewVersion, sizeof(m_viewVersion));
             key = HashCombine(key, &viewState.FontTexture, sizeof(viewState.FontTexture));
-            key = HashCombine(key, &m_lightBackground, sizeof(m_lightBackground));
+            key = HashCombine(key, &effectiveLight, sizeof(effectiveLight));
             key = HashCombine(key, &viewState.ShadedVersion, sizeof(viewState.ShadedVersion));
+            const unsigned char compFlag = hasCompare ? 1 : 0;
+            key = HashCombine(key, &compFlag, sizeof(compFlag));
+            if (hasCompare)
+            {
+                key = HashCombine(key, &compare->Mode, sizeof(compare->Mode));
+                key = HashCombine(key, &compare->Dx, sizeof(compare->Dx));
+                key = HashCombine(key, &compare->Dy, sizeof(compare->Dy));
+                key = HashCombine(key, &compare->Scale, sizeof(compare->Scale));
+                key = HashCombine(key, &compare->CompareOpacity, sizeof(compare->CompareOpacity));
+                key = HashCombine(key, &compare->SplitX, sizeof(compare->SplitX));
+                key = HashCombine(key, &compare->SoloCompare, sizeof(compare->SoloCompare));
+                key = HashCombine(key, &compSceneVersion, sizeof(compSceneVersion));
+                key = HashCombine(key, &compare->State->SceneDynVersion, sizeof(compare->State->SceneDynVersion));
+                key = HashCombine(key, &compare->State->GlyphMeshes.Version, sizeof(compare->State->GlyphMeshes.Version));
+                key = HashCombine(key, &compare->State->SceneGlyphVersion, sizeof(compare->State->SceneGlyphVersion));
+                key = HashCombine(key, &compare->State->FontTexture, sizeof(compare->State->FontTexture));
+                key = HashCombine(key, &compare->State->ShadedVersion, sizeof(compare->State->ShadedVersion));
+                key = HashCombine(key, &compare->State->RenderOrigin, sizeof(compare->State->RenderOrigin));
+            }
             if (!m_layerValid || key != m_layerKey)
             {
                 renderer.BeginFrame(*m_sceneLayer, m_viewportDesc);
@@ -313,18 +436,21 @@ namespace MiniCAD
                 renderer.Submit(sel.border, screenVP, PrimitiveType::Line,     true, true);
             }
 
+            const ViewState& interactVs = (hasCompare && compare->PickCompare) ? *compare->State : viewState;
             {
-                auto snap = BuildSnapGeometry(viewState);
+                auto snap = BuildSnapGeometry(interactVs);
                 renderer.Submit(snap.border, screenVP, PrimitiveType::Line, true, true);
             }
 
-            if (viewState.ShowCrosshair)
+            if (interactVs.ShowCrosshair)
             {
-                auto cursor = m_cursor.BuildCursor(viewState, m_width, m_height);
+                auto cursor = m_cursor.BuildCursor(interactVs, m_width, m_height);
                 renderer.Submit(cursor, screenVP, PrimitiveType::Line, true, true);
             }
         }
         renderer.EndFrame();
+        renderer.SetClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        renderer.SetLightBackground(m_lightBackground);
     }
 
     void Viewport::RefreshViewGeometry(const ViewState& vs)

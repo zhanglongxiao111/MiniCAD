@@ -60,6 +60,8 @@ namespace MiniCAD
 		// 保存为 DWG / DXF 时的版本：打开 DWG / DXF 时取自文件，另存为时由用户选择
 		void           SetCadSaveVersion(CadSaveVersion v) { m_cadVersion = v; }
 		CadSaveVersion GetCadSaveVersion() const          { return m_cadVersion; }
+		// 嵌入模式：导出带批注 DWG 时以原图为底
+		const CadSource* GetCadSource() const             { return m_cadSource.get(); }
 		// progress：DWG / DXF 的读取进度（0～1），在调用线程上定期调用；其他格式不报告
 		bool LoadFromFile(const std::string& path, std::string* error = nullptr, const ImportProgress& progress = nullptr);
 
