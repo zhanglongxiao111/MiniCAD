@@ -1,0 +1,83 @@
+# 嵌入版持续集成：编译 MiniCADWeb（WebAssembly）与无界面读字工具 SaDwgText（Node WASM）
+# 与上游 .github/workflows/build.yml 分文件存放，追上游 main 时零冲突。
+name: Build Embed WASM
+
+on:
+  push:
+    branches: [sa-embed]
+    tags: ["v*-sa.*"]
+  pull_request:
+    branches: [sa-embed]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  EMSDK_VERSION: "5.0.7"
+  PACKAGE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'sa-embed-dev' }}
+
+jobs:
+  embed-wasm:
+    name: Web Embed + SaDwgText (WASM)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: ${{ env.EMSDK_VERSION }}
+          actions-cache-folder: .emsdk-cache
+
+      - name: Configure
+        run: emcmake cmake -S . -B out/web -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build MiniCADWeb and SaDwgText
+        run: cmake --build out/web --target MiniCADWeb SaDwgText
+
+      - name: Package embed bundle
+        run: |
+          bundle="MiniCAD-embed-${PACKAGE_VERSION}"
+          mkdir -p "dist/${bundle}/web" "dist/${bundle}/node"
+          cp out/web/MiniCADWeb/index.js out/web/MiniCADWeb/index.wasm out/web/MiniCADWeb/index.data "dist/${bundle}/web/"
+          cp -r out/web/MiniCADWeb/fonts "dist/${bundle}/web/"
+          cp out/web/SaDwgText.js out/web/SaDwgText.wasm "dist/${bundle}/node/"
+          cp LICENSE THIRD_PARTY_NOTICES.md README-EMBED.md "dist/${bundle}/"
+          (cd "dist/${bundle}" && sha256sum web/index.js web/index.wasm web/index.data node/SaDwgText.js node/SaDwgText.wasm > SHA256SUMS)
+          (cd dist && zip -r "${bundle}.zip" "${bundle}")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiniCAD-Embed-WASM
+          path: dist/*.zip
+          retention-days: 14
+
+  release:
+    name: Publish Embed Release
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && contains(github.ref_name, '-sa.')
+    needs: [embed-wasm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: MiniCAD-Embed-WASM
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: MiniCAD Embed ${{ github.ref_name }}
+          body: |
+            MiniCAD 嵌入增强版 WebAssembly 与无界面文字提取（`SaDwgText`）构建产物。
+            说明与导出接口清单见 `README-EMBED.md`。
+          files: dist/*.zip
