@@ -65,3 +65,10 @@ EXB 导入（`src/Import/Exb/ExbGeometry.cpp`）里记录的切分、扩展属�
 
 - 来源：https://github.com/monozukuri-ai/ezexb
 - 许可证：MIT License，Copyright (c) 2026 neka-nat
+
+## SQLite
+
+无头图纸解析工具 `SaDwgTool` 内嵌官方单文件 SQLite 源码合并包（`3rd/sqlite3/sqlite3.c`、`3rd/sqlite3/sqlite3.h`，开启 `SQLITE_ENABLE_RTREE`），用于将 DWG/DXF 语义与空间索引导出为标准 SQLite 数据库。
+
+- 来源：https://www.sqlite.org/（版本 3.54.1，`sqlite-amalgamation-3540100.zip`）
+- 许可证：Public Domain（公共领域，作者已放弃全部著作权，无附加限制）

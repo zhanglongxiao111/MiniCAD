@@ -16,6 +16,7 @@ namespace MiniCAD::Tch
     {
         MiniDWG::XYZ Start, End;
         double LeftWidth = 0, RightWidth = 0;
+        double Height = 0;      // 墙高（老版本前缀解码缺失时为 0）
         std::array<double, 4> Joins{};
         int OpeningCount = 0;   // 墙上的门窗数；门窗句柄在句柄流中（TCH_OPENING 引用）
         double Angle = 0;       // 弧墙的圆心角（弧度，正值为自起点逆时针到终点）；直墙为 0
@@ -140,6 +141,7 @@ namespace MiniCAD::Tch
             const double height = (r.SetPositionInBits(geoEnd + 144), r.ReadRawDouble());
             const double insulation = 0;
             if (r.Failed()) return fail("old wall geometry is incomplete");
+            result.Height = height;
             result.Scale = base.Scale;
             if (const char* why = CheckWall(result, height, insulation)) return fail(why);
             wall = result;
@@ -190,6 +192,7 @@ namespace MiniCAD::Tch
                 f.Handle(); f.Handle(); f.Handle();
             }
             if (!f.Exact()) return fail("native wall fields do not consume the payload exactly");
+            result.Height = height;
             result.Scale = f.Scale;
             if (const char* why = CheckWall(result, height, insulation)) return fail(why);
             wall = result;
@@ -302,6 +305,7 @@ namespace MiniCAD::Tch
                 return fail("unsupported native wall flags " + std::to_string(flags));
             result.Flags = static_cast<std::uint32_t>(flags);
             result.Angle = curveParameter;
+            result.Height = height;
             if (const char* why = CheckWall(result, height, insulation)) return fail(why);
             DwgBitReader handles(data.Handles, data.Version, Codec::CodePage::Gbk);
             for (int i = 0; i < baseHandles; ++i) handles.ReadHandle(entity.ObjectHandle);

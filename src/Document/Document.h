@@ -63,7 +63,9 @@ namespace MiniCAD
 		// 嵌入模式：导出带批注 DWG 时以原图为底
 		const CadSource* GetCadSource() const             { return m_cadSource.get(); }
 		// progress：DWG / DXF 的读取进度（0～1），在调用线程上定期调用；其他格式不报告
-		bool LoadFromFile(const std::string& path, std::string* error = nullptr, const ImportProgress& progress = nullptr);
+		// semantic：非空时在导入同一遍顺带采集原图元数据与天正原生语义（不重复解析）
+		bool LoadFromFile(const std::string& path, std::string* error = nullptr, const ImportProgress& progress = nullptr,
+		                  CadSemanticSnapshot* semantic = nullptr);
 
 		// 字符串级存取(Web 端下载/上传等无文件系统场景)。
 		// 加载按内容嗅探格式(MCAD 魔数 → 二进制,否则 JSON),不改变路径。

@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # 版本号的唯一来源：发布时只改这里（MiniCADVersion.h 由它生成，见 apps/Common：exe 版本信息、关于对话框、状态栏）
 set(MINICAD_VERSION 0.8.4)
 
-project(MiniCAD VERSION ${MINICAD_VERSION} LANGUAGES CXX)
+project(MiniCAD VERSION ${MINICAD_VERSION} LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -78,6 +78,13 @@ if(EMSCRIPTEN)
     else()
         add_subdirectory("apps/Web")
     endif()
+endif()
+
+# 无头 64 位原生图纸解析 / 渲染 / 差分引擎（不依赖 MiniGUI / GPU / AutoCAD）
+option(MINICAD_BUILD_DWG_TOOL "Build native SaDwgTool CLI" ON)
+if(MINICAD_BUILD_DWG_TOOL AND NOT EMSCRIPTEN AND NOT ANDROID)
+    include(cmake/SQLite3.cmake)
+    add_subdirectory("apps/SaDwgTool")
 endif()
 
 # ── 测试（桌面端）：tests/Core、tests/UI、tests/Serialization ─────────

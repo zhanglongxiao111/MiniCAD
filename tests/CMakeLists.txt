@@ -125,6 +125,20 @@ function(minicad_test_output target)
     )
 endfunction()
 
+if(MINICAD_BUILD_DWG_TOOL AND NOT EMSCRIPTEN AND NOT ANDROID)
+    add_executable(SaDwgToolTests "Core/SaDwgToolTests.cpp")
+    target_link_libraries(SaDwgToolTests PRIVATE SaDwgToolCore MiniDWG)
+    if(MSVC)
+        target_compile_options(SaDwgToolTests PRIVATE /utf-8 /bigobj)
+        target_compile_definitions(SaDwgToolTests PRIVATE
+        UNICODE NOMINMAX WIN32_LEAN_AND_MEAN
+        MINICAD_TEST_FONTS_DIR="${CMAKE_SOURCE_DIR}/assets/fonts"
+    )
+    endif()
+    minicad_test_output(SaDwgToolTests)
+    add_test(NAME SaDwgToolTests COMMAND SaDwgToolTests)
+endif()
+
 # ── MiniCAD 核心库测试 ────────────────────────────────────────────
 add_executable(MiniCADTests
     "Core/SpatialIndexTests.cpp"

@@ -40,6 +40,7 @@ namespace MiniCAD
     bool CadSaveVersionSupported(CadFileKind kind, CadSaveVersion version); 
 
     struct CadSource;
+    struct CadSemanticSnapshot;
 
     namespace Solid { class ISolidKernel; }
 
@@ -58,7 +59,12 @@ namespace MiniCAD
     using ImportProgress = std::function<void(float)>;
     bool ImportCad(const std::vector<std::uint8_t>& data, Scene& scene, std::string* error = nullptr,
                    CadSaveVersion* version = nullptr, std::shared_ptr<const CadSource>* source = nullptr,
-                   const ImportProgress& progress = nullptr, const std::string& sourcePath = {});
+                   const ImportProgress& progress = nullptr, const std::string& sourcePath = {},
+                   CadSemanticSnapshot* semantic = nullptr);
+
+    // 直接从 UTF-8 路径读取 DWG/DXF 到空场景并同步采集原图语义快照（单趟解析、零拷贝）
+    bool LoadCadFileWithSemantics(const std::string& utf8Path, Scene& scene, CadSemanticSnapshot& semantic,
+                                  std::string* error = nullptr);
 
     // 没读进来的外部参照（文件找不到或读取失败；卸载的不算）：块名与图纸里保存的路径。
     // 块参照在插入点显示这个路径（InsertEntity）

@@ -214,7 +214,8 @@ namespace MiniCAD
         return true;
     }
 
-    bool Document::LoadFromFile(const std::string& path, std::string* error, const ImportProgress& progress)
+    bool Document::LoadFromFile(const std::string& path, std::string* error, const ImportProgress& progress,
+                                CadSemanticSnapshot* semantic)
     {
         if (error) error->clear();
         auto fail = [&](const std::string& reason)
@@ -269,7 +270,7 @@ namespace MiniCAD
                     LOG_WARN_TR("EXB 图纸已识别，但其中没有可解析的实体，当前显示空图纸");
                 return true;
             }
-            if (!ImportCad(bytes, m_scene, &err, &m_cadVersion, &m_cadSource, progress, path))
+            if (!ImportCad(bytes, m_scene, &err, &m_cadVersion, &m_cadSource, progress, path, semantic))
             {
                 return fail(err.empty() ? Tr("图纸已损坏或版本不受支持") : err);
             }

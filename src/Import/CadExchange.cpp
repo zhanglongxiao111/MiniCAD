@@ -1,4 +1,6 @@
 #include "Import/CadExchange.h"
+#include "Import/CadSemanticSnapshot.h"
+#include "Core/PathUtils.h"
 #include "Serialization/Database/CadDatabase.h"
 #include "Serialization/Database/Mesh.h"
 #include "Import/TchWall.h"
@@ -250,6 +252,83 @@ namespace MiniCAD
             return raw != nullptr && raw->DxfName.starts_with("TCH_");
         }
 
+        std::string RawDxfNameOf(const Dwg::CadObject& o)
+        {
+            if (const Dwg::RawObjectData* raw = Dwg::RawDataOf(o); raw != nullptr && !raw->DxfName.empty())
+                return raw->DxfName;
+            return std::string(o.GetDxfName());
+        }
+
+        std::string TchMaterialName(int code)
+        {
+            switch (code)
+            {
+            case 0:  return "未指定";       // i18n: 数据
+            case 10: return "轻质隔墙";     // i18n: 数据
+            case 20: return "玻璃幕墙";     // i18n: 数据
+            case 30:
+            case 31:
+            case 32: return "填充墙";       // i18n: 数据
+            case 40: return "砖墙";         // i18n: 数据
+            case 50: return "石墙";         // i18n: 数据
+            case 60: return "钢筋混凝土";   // i18n: 数据
+            case 70: return "钢";           // i18n: 数据
+            default: return "未知(" + std::to_string(code) + ")"; // i18n: 数据
+            }
+        }
+
+        const char* TchOpeningKindName(int kindCode)
+        {
+            switch (kindCode)
+            {
+            case 0: return "门";       // i18n: 数据
+            case 1: return "窗";       // i18n: 数据
+            case 2: return "洞口";     // i18n: 数据
+            case 5: return "带形窗";   // i18n: 数据
+            case 8: return "组合门窗"; // i18n: 数据
+            default: return "洞口";    // i18n: 数据
+            }
+        }
+
+        const char* TchFloorTypeName(int floor)
+        {
+            switch (floor)
+            {
+            case 0: return "首层";     // i18n: 数据
+            case 1: return "中间层";   // i18n: 数据
+            case 2: return "顶层";     // i18n: 数据
+            default: return "";
+            }
+        }
+
+        const char* UnitsNameFromType(Dwg::UnitsType u)
+        {
+            switch (u)
+            {
+            case Dwg::UnitsType::Unitless:    return "unitless";
+            case Dwg::UnitsType::Inches:      return "inch";
+            case Dwg::UnitsType::Feet:        return "ft";
+            case Dwg::UnitsType::Miles:       return "mile";
+            case Dwg::UnitsType::Millimeters: return "mm";
+            case Dwg::UnitsType::Centimeters: return "cm";
+            case Dwg::UnitsType::Meters:      return "m";
+            case Dwg::UnitsType::Kilometers:  return "km";
+            case Dwg::UnitsType::Decimeters:  return "dm";
+            default:                          return "other";
+            }
+        }
+
+        const char* FileFormatName(Dwg::CadFileFormat f)
+        {
+            switch (f)
+            {
+            case Dwg::CadFileFormat::Dwg:       return "DWG";
+            case Dwg::CadFileFormat::DxfAscii:
+            case Dwg::CadFileFormat::DxfBinary: return "DXF";
+            default:                            return "UNKNOWN";
+            }
+        }
+
         // 读入 DWG / DXF；format 为 Unknown 时按内容识别
         std::unique_ptr<Dwg::CadDatabase> ReadDatabase(const std::vector<std::uint8_t>& data, Dwg::CadFileFormat format,
                                                        Dwg::NotificationHandler notify, ImportProgress progress = nullptr)
@@ -443,8 +522,10 @@ namespace MiniCAD
         class Importer
         {
         public:
-            Importer(const Dwg::CadDatabase& db, Scene& scene, CadSource* source, ImportProgress progress = nullptr)
-                : m_db(db), m_scene(scene), m_source(source), m_progress(std::move(progress)) {}
+            Importer(const Dwg::CadDatabase& db, Scene& scene, CadSource* source, ImportProgress progress = nullptr,
+                     CadSemanticSnapshot* semantic = nullptr, Dwg::CadFileFormat format = Dwg::CadFileFormat::Unknown)
+                : m_db(db), m_scene(scene), m_source(source), m_progress(std::move(progress)),
+                  m_semantic(semantic), m_fileFormat(format) {}
 
             // 外部参照的解析环境（宿主图纸有路径时才有；没有就不读外部文件）
             void SetXrefContext(std::shared_ptr<XrefContext> ctx) { m_xref = std::move(ctx); }
@@ -563,6 +644,7 @@ namespace MiniCAD
 
             void Run()
             {
+                RecordSemanticHeader();
                 // 文字样式先于线型：复杂线型的文字/形段用组码 340 引用 STYLE，
                 // ImportLineTypes 里 LookupStyle 要能查到它，否则退回 Standard 会按错的字高/字体画符号。
                 ImportTextStyles();
@@ -593,6 +675,7 @@ namespace MiniCAD
                 m_scene.ResolveAllInserts();
                 m_scene.MarkDirty();
                 RecordSource();
+                RecordSemanticSummary();
 
                 for (const auto& [name, count] : m_skipped)
                     LOG_WARN_TR("DWG/DXF 导入：不支持的实体 {0} × {1} 已跳过", name.c_str(), count);
@@ -789,13 +872,32 @@ namespace MiniCAD
                         // True-color Index() is -1 as a sentinel, not a negative ACI (off layer).
                         // 冻结（标志位 1）与关闭一样不显示；MiniCAD 不区分冻结与关闭
                         const bool frozen = (static_cast<int>(src.Flags) & 1) != 0;
-                        dst->SetVisible(src.IsOn && !frozen && (src.Color.IsTrueColor() || src.Color.Index() >= 0));
-                        dst->SetLocked((static_cast<int>(src.Flags) & 4) != 0);     // 标志位 4：锁定
+                        const bool isOn = src.IsOn && (src.Color.IsTrueColor() || src.Color.Index() >= 0);
+                        const bool locked = (static_cast<int>(src.Flags) & 4) != 0;
+                        dst->SetVisible(isOn && !frozen);
+                        dst->SetLocked(locked);     // 标志位 4：锁定
                         LineTypeID lt = LookupLineType(src.LineTypeHandle);
                         if (lt == LineTypeTable::ByLayerID || lt == LineTypeTable::ByBlockID)
                             lt = LineTypeTable::ContinuousID;   // 图层线型不允许 ByLayer / ByBlock
                         dst->SetLineType(lt);
                         dst->SetLineweight(LineweightFromRaw(static_cast<std::int16_t>(src.LineWeight)));
+
+                        if (m_semantic)
+                        {
+                            CadSemanticSnapshot::LayerRawFlags lf;
+                            lf.Handle       = static_cast<uint64_t>(src.ObjectHandle);
+                            lf.Name         = dst->GetName();
+                            lf.HasTrueColor = src.Color.IsTrueColor();
+                            if (lf.HasTrueColor)
+                                lf.TrueColorRgb = static_cast<uint32_t>(src.Color.TrueColor());
+                            else
+                                lf.ColorAci = std::abs(static_cast<int>(src.Color.Index()));
+                            lf.IsOn         = isOn;
+                            lf.IsFrozen     = frozen;
+                            lf.IsLocked     = locked;
+                            lf.IsPlottable  = src.PlotFlag;
+                            m_semantic->LayerFlagsById[id] = std::move(lf);
+                        }
                     }
                     m_layers[src.ObjectHandle] = id;
                 });
@@ -1127,6 +1229,8 @@ namespace MiniCAD
                 BlockEntity* blk = m_scene.GetBlockTable().Find(it->second);
                 if (blk == nullptr || !blk->IsEmpty())
                     return;
+                const std::string prevBlock = m_currentBlockName;
+                m_currentBlockName = Prefixed(rec.Name);
                 for (Dwg::Handle h : DrawOrder(rec))
                     if (const auto* e = m_db.FindAs<Dwg::Entity>(h))
                         if (Tick(); auto conv = Convert(*e))
@@ -1135,6 +1239,7 @@ namespace MiniCAD
                                 m_scene.ResolveInsert(static_cast<InsertEntity&>(*conv));
                             blk->AddEntity(std::move(conv));
                         }
+                m_currentBlockName = prevBlock;
             }
 
             void ImportModelSpace()
@@ -1142,14 +1247,20 @@ namespace MiniCAD
                 const Dwg::BlockRecord* model = m_db.ModelSpace();
                 if (model == nullptr)
                     return;
+                m_currentSpace = "model";
+                m_currentLayoutName = "Model";
+                m_currentBlockName.clear();
                 for (Dwg::Handle h : DrawOrder(*model))
                 {
                     const auto* e = m_db.FindAs<Dwg::Entity>(h);
                     if (e == nullptr)
                         continue;
                     Tick();
-                    if (m_source != nullptr && IsTch(*e))
+                    const bool isTch = IsTch(*e);
+                    if (m_source != nullptr && isTch)
                         ++m_source->TchCount;
+                    if (m_semantic != nullptr && isTch && m_targetBlock == nullptr)
+                        ++m_semantic->TchObjectCount;
                     if (auto conv = Convert(*e))
                     {
                         if (m_targetBlock != nullptr)
@@ -1164,6 +1275,8 @@ namespace MiniCAD
                         m_scene.AddEntity(std::move(conv));
                         if (m_source != nullptr)
                             m_source->Links[id].Handle = h;
+                        if (m_semantic != nullptr)
+                            m_semantic->EntityOrigins[id] = { static_cast<uint64_t>(h), RawDxfNameOf(*e), isTch };
                     }
                 }
             }
@@ -1283,6 +1396,12 @@ namespace MiniCAD
                     if (lower.rfind("*paper_space", 0) != 0)
                         continue;      // 只看图纸空间块
 
+                    const int layIdx = m_scene.FindLayout(static_cast<uint64_t>(record->ObjectHandle));
+                    m_currentSpace = "paper";
+                    m_currentLayoutName = (layIdx >= 0 && layIdx < static_cast<int>(m_scene.Layouts().size()))
+                        ? m_scene.Layouts()[static_cast<size_t>(layIdx)].Name
+                        : record->Name;
+                    m_currentBlockName.clear();
                     for (Dwg::Handle h : DrawOrder(*record))
                     {
                         const auto* e = m_db.FindAs<Dwg::Entity>(h);
@@ -1327,6 +1446,9 @@ namespace MiniCAD
                         }
 
                         Tick();
+                        const bool isTch = IsTch(*e);
+                        if (m_semantic != nullptr && isTch)
+                            ++m_semantic->TchObjectCount;
                         if (auto conv = Convert(*e))
                         {
                             // 标记图纸空间归属：渲染 / 拾取据此只显示当前布局的实体
@@ -1339,6 +1461,8 @@ namespace MiniCAD
                             m_scene.AddEntity(std::move(conv));
                             if (m_source != nullptr)
                                 m_source->Links[id].Handle = h;
+                            if (m_semantic != nullptr)
+                                m_semantic->EntityOrigins[id] = { static_cast<uint64_t>(h), RawDxfNameOf(*e), isTch };
                         }
                     }
                 }
@@ -1636,15 +1760,19 @@ namespace MiniCAD
                         }
                     }
                     if (auto it = m_openings.find(src.ObjectHandle); it != m_openings.end())
+                    {
+                        if (m_semantic) RecordTchOpening(src, it->second);
                         if (auto converted = ConvertOpening(src, it->second))
                         {
                             ++m_tchConverted[unknown->Raw.DxfName];
                             return converted;
                         }
+                    }
                     std::string nativeReason; 
                     Tch::TchDimension dimension;
                     if (Tch::DecodeDimension(*unknown, dimension, &nativeReason))
                     {
+                        if (m_semantic) RecordTchDimension(src, dimension);
                         TextStyleID textStyle = TextStyleTable::StandardID;
                         const Tch::TchDimStyle style = DimStyleOf(dimension.DimStyle, textStyle);
                         ++m_tchConverted[unknown->Raw.DxfName];
@@ -1653,6 +1781,7 @@ namespace MiniCAD
                     Tch::TchRadiusDim radiusDim;
                     if (Tch::DecodeRadiusDim(*unknown, radiusDim, &nativeReason))
                     {
+                        if (m_semantic) RecordTchRadiusDim(src, radiusDim);
                         TextStyleID textStyle = TextStyleTable::StandardID;
                         const Tch::TchDimStyle style = DimStyleOf(radiusDim.DimStyle, textStyle);
                         ++m_tchConverted[unknown->Raw.DxfName];
@@ -1718,18 +1847,31 @@ namespace MiniCAD
                     Tch::TchRectStair stair;
                     if (Tch::DecodeRectStair(*unknown, stair, &nativeReason))
                     {
+                        if (m_semantic) RecordTchRectStair(src, stair);
                         ++m_tchConverted[unknown->Raw.DxfName];
                         return MakeTchGraphics(src, Tch::BuildRectStair(stair), LookupStyle(stair.TextStyle), std::nullopt, stair.ArrowLayer);
                     }
                     Tch::TchElevation elevation;
                     if (Tch::DecodeElevation(*unknown, elevation, &nativeReason))
                     {
+                        if (m_semantic) RecordTchText(src, "TCH_ELEVATION", elevation.X, elevation.Y, 0.0, elevation.TextHeight * elevation.Scale, 0.0, elevation.Value);
                         ++m_tchConverted[unknown->Raw.DxfName];
                         return MakeTchSymbol(src, Tch::BuildElevation(elevation), LookupStyle(elevation.Style));
                     }
                     Tch::TchMultiLeader leader;
                     if (Tch::DecodeMultiLeader(*unknown, leader, &nativeReason))
                     {
+                        if (m_semantic)
+                        {
+                            std::string combined = leader.Upper;
+                            if (!leader.Lower.empty())
+                            {
+                                if (!combined.empty()) combined += " / ";
+                                combined += leader.Lower;
+                            }
+                            if (!combined.empty())
+                                RecordTchText(src, "TCH_MULTILEADER", leader.ElbowX, leader.ElbowY, 0.0, leader.TextHeight * leader.Scale, 0.0, combined);
+                        }
                         ++m_tchConverted[unknown->Raw.DxfName];
                         const TextStyleID style = LookupStyle(leader.Style);
                         return MakeTchSymbol(src, Tch::BuildMultiLeader(leader, TchTextRules(leader.Style, style)), style);
@@ -1779,6 +1921,7 @@ namespace MiniCAD
                     Tch::TchSpace tchSpace;
                     if (Tch::DecodeSpace(*unknown, tchSpace, &nativeReason))
                     {
+                        if (m_semantic) RecordTchSpace(src, tchSpace);
                         ++m_tchConverted[unknown->Raw.DxfName];
                         return MakeTchGraphics(src, Tch::BuildSpace(tchSpace), TextStyleTable::StandardID);
                     }
@@ -1851,42 +1994,49 @@ namespace MiniCAD
                     Tch::TchParallelStair parallelStair;
                     if (Tch::DecodeParallelStair(*unknown, parallelStair, &nativeReason))
                     {
+                        if (m_semantic) RecordTchMultiStair(src, unknown->Raw.DxfName, parallelStair.X, parallelStair.Y, parallelStair.Rotation, parallelStair.StepHeight, parallelStair.Tread, parallelStair.SideWidth, parallelStair.Landing, parallelStair.SpaceWidth, parallelStair.Steps1, parallelStair.Steps2, parallelStair.Floor, parallelStair.StartSide != 0, parallelStair.Scale);
                         ++m_tchConverted[unknown->Raw.DxfName];
                         return MakeTchGraphics(src, Tch::BuildParallelStair(parallelStair), LookupStyle(parallelStair.TextStyle), std::nullopt, parallelStair.ArrowLayer);
                     }
                     Tch::TchCornerStair cornerStair;
                     if (Tch::DecodeCornerStair(*unknown, cornerStair, &nativeReason))
                     {
+                        if (m_semantic) RecordTchMultiStair(src, unknown->Raw.DxfName, cornerStair.X, cornerStair.Y, cornerStair.Rotation, cornerStair.StepHeight, cornerStair.Tread, cornerStair.SideWidth, cornerStair.LandingDepth, cornerStair.SideWidth * 2.0 + cornerStair.MidWidth, cornerStair.Steps1, cornerStair.Steps2, cornerStair.Floor, cornerStair.StartSide != 0, cornerStair.Scale);
                         ++m_tchConverted[unknown->Raw.DxfName];
                         return MakeTchGraphics(src, Tch::BuildCornerStair(cornerStair), LookupStyle(cornerStair.TextStyle), std::nullopt, cornerStair.ArrowLayer);
                     }
                     Tch::TchDoubleMulStair doubleMulStair;
                     if (Tch::DecodeDoubleMulStair(*unknown, doubleMulStair, &nativeReason))
                     {
+                        if (m_semantic) RecordTchMultiStair(src, unknown->Raw.DxfName, doubleMulStair.X, doubleMulStair.Y, doubleMulStair.Rotation, doubleMulStair.StepHeight, doubleMulStair.Tread, doubleMulStair.SideWidth, doubleMulStair.MidPlatLength, doubleMulStair.MidPlatWidth, doubleMulStair.Steps1, doubleMulStair.Steps2, doubleMulStair.Floor, doubleMulStair.StartSide != 0, doubleMulStair.Scale);
                         ++m_tchConverted[unknown->Raw.DxfName];
                         return MakeTchGraphics(src, Tch::BuildDoubleMulStair(doubleMulStair), LookupStyle(doubleMulStair.TextStyle), std::nullopt, doubleMulStair.ArrowLayer);
                     }
                     Tch::TchScissorsStair scissorsStair;
                     if (Tch::DecodeScissorsStair(*unknown, scissorsStair, &nativeReason))
                     {
+                        if (m_semantic) RecordTchMultiStair(src, unknown->Raw.DxfName, scissorsStair.X, scissorsStair.Y, scissorsStair.Rotation, scissorsStair.StepHeight, scissorsStair.Tread, scissorsStair.Width, scissorsStair.Landing, scissorsStair.SpaceWidth, scissorsStair.Steps1, scissorsStair.Steps2, scissorsStair.Floor, scissorsStair.StartSide != 0, scissorsStair.Scale);
                         ++m_tchConverted[unknown->Raw.DxfName];
                         return MakeTchGraphics(src, Tch::BuildScissorsStair(scissorsStair), LookupStyle(scissorsStair.TextStyle), std::nullopt, scissorsStair.ArrowLayer);
                     }
                     Tch::TchCrossStair crossStair;
                     if (Tch::DecodeCrossStair(*unknown, crossStair, &nativeReason))
                     {
+                        if (m_semantic) RecordTchMultiStair(src, unknown->Raw.DxfName, crossStair.X, crossStair.Y, crossStair.Rotation, crossStair.StepHeight, crossStair.Tread, crossStair.Width, crossStair.LeftTop, crossStair.SpaceWidth, crossStair.Steps, crossStair.Steps, crossStair.Floor, crossStair.StartSide != 0, crossStair.Scale);
                         ++m_tchConverted[unknown->Raw.DxfName];
                         return MakeTchGraphics(src, Tch::BuildCrossStair(crossStair), LookupStyle(crossStair.TextStyle), std::nullopt, crossStair.ArrowLayer);
                     }
                     Tch::TchTriangleStair triangleStair;
                     if (Tch::DecodeTriangleStair(*unknown, triangleStair, &nativeReason))
                     {
+                        if (m_semantic) RecordTchMultiStair(src, unknown->Raw.DxfName, triangleStair.X, triangleStair.Y, triangleStair.Rotation, triangleStair.StepHeight, triangleStair.Tread, triangleStair.Width, 0.0, triangleStair.Width * 2.0, triangleStair.Steps, triangleStair.Steps, triangleStair.Floor, triangleStair.StartSide != 0, triangleStair.Scale);
                         ++m_tchConverted[unknown->Raw.DxfName];
                         return MakeTchGraphics(src, Tch::BuildTriangleStair(triangleStair), LookupStyle(triangleStair.TextStyle), std::nullopt, triangleStair.ArrowLayer);
                     }
                     Tch::TchRectCornerStair rectCornerStair;
                     if (Tch::DecodeRectCornerStair(*unknown, rectCornerStair, &nativeReason))
                     {
+                        if (m_semantic) RecordTchMultiStair(src, unknown->Raw.DxfName, rectCornerStair.X, rectCornerStair.Y, rectCornerStair.Rotation, rectCornerStair.StepHeight, rectCornerStair.Tread, rectCornerStair.Width[0], rectCornerStair.SlabAlong[0], rectCornerStair.Width[0] * 2.0, rectCornerStair.Steps[0], rectCornerStair.Steps[1], rectCornerStair.Floor, rectCornerStair.StartSide != 0, rectCornerStair.Scale);
                         ++m_tchConverted[unknown->Raw.DxfName];
                         return MakeTchGraphics(src, Tch::BuildRectCornerStair(rectCornerStair), LookupStyle(rectCornerStair.TextStyle), std::nullopt, rectCornerStair.ArrowLayer);
                     }
@@ -1970,6 +2120,9 @@ namespace MiniCAD
                     Tch::TchText tchText;
                     if (Tch::DecodeText(*unknown, tchText, &nativeReason))
                     {
+                        if (m_semantic)
+                            RecordTchText(src, tchText.Multiline ? "TCH_MTEXT" : "TCH_TEXT",
+                                          tchText.X, tchText.Y, 0.0, tchText.Height * tchText.Scale, tchText.Rotation, tchText.Value);
                         ++m_tchConverted[unknown->Raw.DxfName];
                         const TextStyleID textStyle = LookupStyle(tchText.Style);
                         const auto rules = TchTextRules(tchText.Style, textStyle);
@@ -1979,6 +2132,7 @@ namespace MiniCAD
                     Tch::TchSheet sheet;
                     if (Tch::DecodeSheet(*unknown, sheet, &nativeReason))
                     {
+                        if (m_semantic) RecordTchSheet(src, sheet);
                         ++m_tchConverted[unknown->Raw.DxfName];
                         const TextStyleID mainStyle = LookupStyle(sheet.Style.TextStyle), titleStyle = LookupStyle(sheet.Title.Style.TextStyle);
                         return MakeTchGraphics(src, Tch::BuildSheet(sheet, TchTextRules(sheet.Style.TextStyle, mainStyle),
@@ -2062,6 +2216,7 @@ namespace MiniCAD
                     Tch::TchAxisLabel axisLabel;
                     if (Tch::DecodeAxisLabel(*unknown, axisLabel, &nativeReason))
                     {
+                        if (m_semantic) RecordTchAxisLabel(src, axisLabel);
                         ++m_tchConverted[unknown->Raw.DxfName];
                         return MakeTchSymbol(src, Tch::BuildAxisLabel(axisLabel), LookupStyle(axisLabel.TextStyle), std::nullopt,
                                              Dwg::kNullHandle, axisLabel.TextLayer);
@@ -2069,6 +2224,7 @@ namespace MiniCAD
                     Tch::TchColumn column;
                     if (Tch::DecodeColumn(*unknown, column, &nativeReason))
                     {
+                        if (m_semantic) RecordTchColumn(src, column);
                         // 柱：闭合轮廓多段线；图纸设置开启填充时按材料填充（tianzheng.dwg 的钢筋混凝土柱实心），轮廓压在填充上面
                         std::vector<Math::Point3> pts;
                         std::vector<double> bulges;
@@ -2096,9 +2252,12 @@ namespace MiniCAD
                     const bool curtainWall = unknown->Raw.DxfName == "TCH_CURTAIN_WALL";
                     const bool curtainFields = curtainWall && Tch::DecodeCurtainWall(*unknown, wall);
                     const bool plainCurtain = curtainFields && (wall.Flags & 0x4) == 0;
+                    if (m_semantic && curtainFields && !plainCurtain)
+                        RecordTchWall(src, wall, true);
                     auto countWall = [&] { if (curtainWall) ++m_tchConverted[unknown->Raw.DxfName]; else ++m_tianzhengWalls; };
                     if (plainCurtain || Tch::DecodeWall(*unknown, wall, &nativeReason))
                     {
+                        if (m_semantic) RecordTchWall(src, wall, curtainWall);
                         auto endLineAt = [&](int end) {
                             if (wall.HasConnections && !wall.Connections[end * 2] && !wall.Connections[end * 2 + 1]) return true;
                             bool differs = false;
@@ -3958,10 +4117,621 @@ namespace MiniCAD
             template <class E>
             static bool Any(E flags) { return static_cast<std::int64_t>(flags) != 0; }
 
+            // ── 语义采集钩子（仅 m_semantic != nullptr 时执行）──────────
+            std::string SemanticLayerName(Dwg::Handle layerHandle) const
+            {
+                if (auto it = m_layers.find(layerHandle); it != m_layers.end())
+                    if (const Layer* l = m_scene.GetLayerManager().GetLayer(it->second))
+                        return l->GetName();
+                return {};
+            }
+
+            std::string SemanticLayerName(const Dwg::Entity& src) const
+            {
+                std::string name = SemanticLayerName(src.LayerHandle);
+                return name.empty() ? "0" : name;
+            }
+
+            static double RadToDeg(double r) { return r * (180.0 / kPi); }
+
+            void RecordSemanticHeader()
+            {
+                if (!m_semantic) return;
+                m_semantic->Format       = FileFormatName(m_fileFormat);
+                m_semantic->DwgVersion   = std::string(Dwg::VersionString(m_db.GetVersion()));
+                m_semantic->CodePage     = m_db.Header.CodePage;
+                m_semantic->InsunitsCode = static_cast<int>(m_db.Header.InsUnits);
+                m_semantic->InsunitsName = UnitsNameFromType(m_db.Header.InsUnits);
+                m_semantic->Measurement  = (m_db.Header.MeasurementUnits == Dwg::MeasurementUnits::English) ? "imperial" : "metric";
+                m_semantic->LtScale      = m_db.Header.LineTypeScale > 0.0 ? m_db.Header.LineTypeScale : 1.0;
+                m_semantic->PsLtScale    = m_db.Header.PaperSpaceLineTypeScaling != Dwg::SpaceLineTypeScaling::Viewport;
+            }
+
+            void RecordSemanticSummary()
+            {
+                if (!m_semantic) return;
+                m_semantic->TchConfigFill        = m_tchConfig.Fill;
+                m_semantic->TchConfigDetailScale = m_tchConfig.DetailScale;
+
+                int decoded = m_tianzhengWalls;
+                for (const auto& [name, cnt] : m_tchConverted)
+                    decoded += cnt;
+                m_semantic->TchDecodedCount = decoded;
+
+                int tchFailed = 0;
+                for (const auto& [name, reasons] : m_tchFailures)
+                    for (const auto& [reason, handles] : reasons)
+                    {
+                        const bool isTch = name.starts_with("TCH_");
+                        if (isTch) tchFailed += static_cast<int>(handles.size());
+                        CadSemanticSnapshot::DiagnosticItem item;
+                        item.Kind         = isTch ? "tch_failed" : "undecoded_proxy";
+                        item.DxfName      = name;
+                        item.Reason       = reason;
+                        item.Count        = static_cast<int>(handles.size());
+                        item.SampleHandle = handles.empty() ? 0 : static_cast<uint64_t>(*handles.begin());
+                        m_semantic->Diagnostics.push_back(std::move(item));
+                    }
+                m_semantic->TchFailedCount = tchFailed;
+
+                for (const auto& [name, count] : m_skipped)
+                {
+                    CadSemanticSnapshot::DiagnosticItem item;
+                    item.Kind    = "skipped_entity";
+                    item.DxfName = name;
+                    item.Count   = count;
+                    m_semantic->Diagnostics.push_back(std::move(item));
+                }
+
+                for (const UnresolvedXref& x : FindUnresolvedXrefs(m_scene))
+                {
+                    CadSemanticSnapshot::DiagnosticItem item;
+                    item.Kind    = "unresolved_xref";
+                    item.DxfName = x.Name;
+                    item.Reason  = x.Path;
+                    item.Count   = 1;
+                    m_semantic->Diagnostics.push_back(std::move(item));
+                }
+            }
+
+            void RecordTchWall(const Dwg::Entity& src, const Tch::TchWall& w, bool isCurtain)
+            {
+                if (!m_semantic) return;
+                CadSemanticSnapshot::TchWallRecord rec;
+                rec.Handle         = static_cast<uint64_t>(src.ObjectHandle);
+                rec.DxfName        = isCurtain ? "TCH_CURTAIN_WALL" : "TCH_WALL";
+                rec.Layer          = SemanticLayerName(src);
+                rec.Space          = m_currentSpace;
+                rec.LayoutName     = m_currentLayoutName;
+                rec.BlockName      = m_currentBlockName;
+                rec.StartX = w.Start.X; rec.StartY = w.Start.Y; rec.StartZ = w.Start.Z;
+                rec.EndX   = w.End.X;   rec.EndY   = w.End.Y;   rec.EndZ   = w.End.Z;
+                rec.ArcAngleRad    = w.Angle;
+                rec.LeftWidth      = w.LeftWidth;
+                rec.RightWidth     = w.RightWidth;
+                rec.TotalThickness = w.LeftWidth + w.RightWidth;
+                if (w.Height > 0.0 && std::isfinite(w.Height))
+                {
+                    rec.HasHeight = true;
+                    rec.Height    = w.Height;
+                }
+                rec.Flags          = w.Flags;
+                rec.MaterialCode   = w.Material;
+                rec.MaterialName   = TchMaterialName(w.Material);
+                rec.Scale          = w.Scale;
+                rec.OpeningCount   = w.OpeningCount;
+                if (auto it = m_wallOpenings.find(src.ObjectHandle); it != m_wallOpenings.end())
+                    rec.OpeningCount = std::max(rec.OpeningCount, static_cast<int>(it->second.size()));
+                rec.Joins          = w.Joins;
+                rec.HasConnections = w.HasConnections;
+                for (size_t i = 0; i < 4; ++i)
+                    rec.ConnectedHandles[i] = static_cast<uint64_t>(w.Connections[i]);
+
+                double arcX = 0, arcY = 0, arcR = 0;
+                if (w.ArcCenter(arcX, arcY, arcR))
+                {
+                    rec.HasArc    = true;
+                    rec.ArcCx     = arcX;
+                    rec.ArcCy     = arcY;
+                    rec.ArcRadius = arcR;
+                    rec.Length    = arcR * std::abs(w.Angle);
+                    const double outerR = arcR + std::max(w.LeftWidth, w.RightWidth);
+                    const double innerR = std::max(0.0, arcR - std::max(w.LeftWidth, w.RightWidth));
+                    const double a0 = std::atan2(w.Start.Y - arcY, w.Start.X - arcX);
+                    const double ccw = w.Angle > 0 ? 1.0 : -1.0;
+                    const double span = std::abs(w.Angle);
+                    rec.MinX = 1e300; rec.MinY = 1e300; rec.MaxX = -1e300; rec.MaxY = -1e300;
+                    const int steps = std::max(8, static_cast<int>(std::ceil(span / (kPi / 16.0))));
+                    for (int k = 0; k <= steps; ++k)
+                    {
+                        const double a = a0 + ccw * span * (static_cast<double>(k) / steps);
+                        const double ca = std::cos(a), sa = std::sin(a);
+                        for (double r : { innerR, outerR })
+                        {
+                            const double px = arcX + r * ca, py = arcY + r * sa;
+                            rec.MinX = std::min(rec.MinX, px); rec.MaxX = std::max(rec.MaxX, px);
+                            rec.MinY = std::min(rec.MinY, py); rec.MaxY = std::max(rec.MaxY, py);
+                        }
+                    }
+                }
+                else
+                {
+                    const double dx = w.End.X - w.Start.X, dy = w.End.Y - w.Start.Y;
+                    rec.Length = std::hypot(dx, dy);
+                    const double nx = rec.Length > 1e-9 ? -dy / rec.Length : 0.0;
+                    const double ny = rec.Length > 1e-9 ?  dx / rec.Length : 0.0;
+                    const std::array<std::pair<double, double>, 4> corners = {{
+                        { w.Start.X + nx * w.LeftWidth,  w.Start.Y + ny * w.LeftWidth },
+                        { w.End.X   + nx * w.LeftWidth,  w.End.Y   + ny * w.LeftWidth },
+                        { w.End.X   - nx * w.RightWidth, w.End.Y   - ny * w.RightWidth },
+                        { w.Start.X - nx * w.RightWidth, w.Start.Y - ny * w.RightWidth },
+                    }};
+                    rec.MinX = rec.MaxX = corners[0].first;
+                    rec.MinY = rec.MaxY = corners[0].second;
+                    for (const auto& [px, py] : corners)
+                    {
+                        rec.MinX = std::min(rec.MinX, px); rec.MaxX = std::max(rec.MaxX, px);
+                        rec.MinY = std::min(rec.MinY, py); rec.MaxY = std::max(rec.MaxY, py);
+                    }
+                }
+                m_semantic->TchWalls.push_back(std::move(rec));
+            }
+
+            void RecordTchOpeningOne(const Dwg::Entity& src, const Tch::TchOpening& o, uint64_t parentHandle)
+            {
+                if (!m_semantic) return;
+                CadSemanticSnapshot::TchOpeningRecord rec;
+                rec.Handle       = static_cast<uint64_t>(src.ObjectHandle);
+                rec.ParentHandle = parentHandle;
+                rec.Layer        = SemanticLayerName(src);
+                rec.LabelLayer   = SemanticLayerName(o.LabelLayer);
+                rec.Space        = m_currentSpace;
+                rec.LayoutName   = m_currentLayoutName;
+                rec.BlockName    = m_currentBlockName;
+                rec.KindCode     = static_cast<int>(o.Type);
+                rec.KindName     = TchOpeningKindName(rec.KindCode);
+                rec.Label        = o.Label;
+                rec.X = o.Position.X; rec.Y = o.Position.Y; rec.SillZ = o.Position.Z;
+                rec.Width        = o.Width;
+                rec.Height       = o.Height;
+                rec.Thickness    = o.Thickness;
+                rec.AngleRad     = o.Angle;
+                rec.Mirror       = o.Mirror;
+                rec.MirrorX      = o.MirrorX();
+                rec.MirrorY      = o.MirrorY();
+                rec.WallHandle   = static_cast<uint64_t>(o.Wall);
+                rec.LabelX       = o.LabelX;
+                rec.LabelY       = o.LabelY;
+                rec.LabelHeight  = o.LabelHeight;
+                rec.Scale        = o.Scale;
+                rec.Flags        = o.Flags;
+                rec.DisplayFlags = o.DisplayFlags;
+
+                const double hw = std::max(o.Width * 0.5, 50.0);
+                const double ht = std::max(o.Thickness * 0.5, 120.0);
+                const double ca = std::abs(std::cos(o.Angle)), sa = std::abs(std::sin(o.Angle));
+                const double ex = hw * ca + ht * sa;
+                const double ey = hw * sa + ht * ca;
+                rec.MinX = o.Position.X - ex; rec.MaxX = o.Position.X + ex;
+                rec.MinY = o.Position.Y - ey; rec.MaxY = o.Position.Y + ey;
+                m_semantic->TchOpenings.push_back(std::move(rec));
+
+                // 组合门窗子项递归展平（parent_handle 指向父门窗句柄）
+                for (const Tch::TchOpening& part : o.Parts)
+                    RecordTchOpeningOne(src, part, static_cast<uint64_t>(src.ObjectHandle));
+            }
+
+            void RecordTchOpening(const Dwg::Entity& src, const Tch::TchOpening& o)
+            {
+                RecordTchOpeningOne(src, o, 0);
+            }
+
+            void RecordTchColumn(const Dwg::Entity& src, const Tch::TchColumn& c)
+            {
+                if (!m_semantic) return;
+                CadSemanticSnapshot::TchColumnRecord rec;
+                rec.Handle       = static_cast<uint64_t>(src.ObjectHandle);
+                rec.Layer        = SemanticLayerName(src);
+                rec.Space        = m_currentSpace;
+                rec.LayoutName   = m_currentLayoutName;
+                rec.BlockName    = m_currentBlockName;
+                rec.X = c.Position.X; rec.Y = c.Position.Y; rec.BaseZ = c.Position.Z;
+                rec.Height       = c.Height;
+                rec.MaterialCode = c.Material;
+                rec.MaterialName = TchMaterialName(c.Material);
+                rec.Scale        = c.Scale;
+                rec.MinX = rec.MaxX = c.Position.X;
+                rec.MinY = rec.MaxY = c.Position.Y;
+                bool first = true;
+                double signedArea2 = 0.0;
+                double bulgeArea = 0.0;
+                const size_t n = c.Outline.size();
+                for (size_t i = 0; i < n; ++i)
+                {
+                    const auto& v = c.Outline[i];
+                    const auto& q = c.Outline[(i + 1) % n];
+                    rec.Outline.push_back({ v.X, v.Y, v.Bulge });
+                    if (first) { rec.MinX = rec.MaxX = v.X; rec.MinY = rec.MaxY = v.Y; first = false; }
+                    else
+                    {
+                        rec.MinX = std::min(rec.MinX, v.X); rec.MaxX = std::max(rec.MaxX, v.X);
+                        rec.MinY = std::min(rec.MinY, v.Y); rec.MaxY = std::max(rec.MaxY, v.Y);
+                    }
+                    signedArea2 += v.X * q.Y - q.X * v.Y;
+                    if (std::abs(v.Bulge) > 1e-9)
+                    {
+                        const double chord = std::hypot(q.X - v.X, q.Y - v.Y);
+                        const double theta = 4.0 * std::atan(v.Bulge);
+                        if (std::abs(std::sin(theta * 0.5)) > 1e-9)
+                        {
+                            const double r = chord / (2.0 * std::sin(std::abs(theta) * 0.5));
+                            const double seg = 0.5 * r * r * (std::abs(theta) - std::sin(std::abs(theta)));
+                            bulgeArea += (v.Bulge > 0 ? seg : -seg);
+                        }
+                    }
+                }
+                const double areaRaw = std::abs(0.5 * signedArea2 + bulgeArea);
+                if (n >= 2 && areaRaw > 1e-6)
+                {
+                    const double divisor = (m_db.Header.InsUnits == Dwg::UnitsType::Meters) ? 1.0
+                                         : (m_db.Header.InsUnits == Dwg::UnitsType::Centimeters) ? 1e4
+                                         : 1e6;
+                    rec.HasArea = true;
+                    rec.AreaM2  = areaRaw / divisor;
+                }
+                m_semantic->TchColumns.push_back(std::move(rec));
+            }
+
+            void RecordTchSpace(const Dwg::Entity& src, const Tch::TchSpace& s)
+            {
+                if (!m_semantic) return;
+                CadSemanticSnapshot::TchSpaceRecord rec;
+                rec.Handle     = static_cast<uint64_t>(src.ObjectHandle);
+                rec.Layer      = SemanticLayerName(src);
+                rec.Space      = m_currentSpace;
+                rec.LayoutName = m_currentLayoutName;
+                rec.BlockName  = m_currentBlockName;
+                rec.Name       = s.Name;
+                rec.Scale      = s.Scale;
+                double area2 = 0.0;
+                double cx6 = 0.0, cy6 = 0.0;
+                double perim = 0.0;
+                bool first = true;
+                const size_t n = s.Outline.size();
+                for (size_t i = 0; i < n; ++i)
+                {
+                    const auto& p = s.Outline[i];
+                    const auto& q = s.Outline[(i + 1) % n];
+                    const double cross = p.X * q.Y - q.X * p.Y;
+                    area2 += cross;
+                    cx6   += (p.X + q.X) * cross;
+                    cy6   += (p.Y + q.Y) * cross;
+                    perim += std::hypot(q.X - p.X, q.Y - p.Y);
+                    rec.Outline.emplace_back(p.X, p.Y);
+                    if (first) { rec.MinX = rec.MaxX = p.X; rec.MinY = rec.MaxY = p.Y; first = false; }
+                    else
+                    {
+                        rec.MinX = std::min(rec.MinX, p.X); rec.MaxX = std::max(rec.MaxX, p.X);
+                        rec.MinY = std::min(rec.MinY, p.Y); rec.MaxY = std::max(rec.MaxY, p.Y);
+                    }
+                }
+                const double divisor = (m_db.Header.InsUnits == Dwg::UnitsType::Meters) ? 1.0
+                                     : (m_db.Header.InsUnits == Dwg::UnitsType::Centimeters) ? 1e4
+                                     : 1e6;
+                rec.AreaM2      = (std::abs(area2) * 0.5) / divisor;
+                rec.PerimeterMm = perim;
+                if (std::abs(area2) > 1e-6)
+                {
+                    rec.CentroidX = cx6 / (3.0 * area2);
+                    rec.CentroidY = cy6 / (3.0 * area2);
+                }
+                else
+                {
+                    rec.CentroidX = 0.5 * (rec.MinX + rec.MaxX);
+                    rec.CentroidY = 0.5 * (rec.MinY + rec.MaxY);
+                }
+                m_semantic->TchSpaces.push_back(std::move(rec));
+            }
+
+            void RecordTchRectStair(const Dwg::Entity& src, const Tch::TchRectStair& s)
+            {
+                if (!m_semantic) return;
+                CadSemanticSnapshot::TchStairRecord rec;
+                rec.Handle        = static_cast<uint64_t>(src.ObjectHandle);
+                rec.StairKind     = "TCH_RECTSTAIR";
+                rec.Layer         = SemanticLayerName(src);
+                rec.Space         = m_currentSpace;
+                rec.LayoutName    = m_currentLayoutName;
+                rec.BlockName     = m_currentBlockName;
+                rec.X = s.X; rec.Y = s.Y; rec.RotationDeg = RadToDeg(s.Rotation);
+                rec.StepHeight    = s.StepHeight;
+                rec.TreadWidth    = s.TreadWidth;
+                rec.FlightWidth   = s.FlightWidth;
+                rec.LandingWidth  = s.LandingWidth;
+                rec.TotalWidth    = s.TotalWidth;
+                rec.Steps1        = s.Steps1;
+                rec.Steps2        = s.Steps2;
+                rec.FloorType     = s.Floor;
+                rec.FloorTypeName = TchFloorTypeName(s.Floor);
+                rec.Mirror        = s.Mirror;
+                rec.Scale         = s.Scale;
+
+                const double runLen = std::max(s.Steps1, s.Steps2) * s.TreadWidth + (s.ShowLanding ? s.LandingWidth : 0.0);
+                const double w = s.TotalWidth;
+                const double cr = std::cos(s.Rotation), sr = std::sin(s.Rotation);
+                const std::array<std::pair<double, double>, 4> local = {{
+                    { 0.0, 0.0 }, { w, 0.0 }, { w, runLen }, { 0.0, runLen }
+                }};
+                rec.MinX = rec.MaxX = s.X;
+                rec.MinY = rec.MaxY = s.Y;
+                for (const auto& [lx, ly] : local)
+                {
+                    const double wx = s.X + lx * cr - ly * sr;
+                    const double wy = s.Y + lx * sr + ly * cr;
+                    rec.MinX = std::min(rec.MinX, wx); rec.MaxX = std::max(rec.MaxX, wx);
+                    rec.MinY = std::min(rec.MinY, wy); rec.MaxY = std::max(rec.MaxY, wy);
+                }
+                m_semantic->TchStairs.push_back(std::move(rec));
+            }
+
+            void RecordTchMultiStair(const Dwg::Entity& src, const std::string& kind,
+                                     double x, double y, double rotRad, double stepH, double treadW,
+                                     double flightW, double landingW, double totalW, int steps1, int steps2,
+                                     int floor, bool mirror, double scale)
+            {
+                if (!m_semantic) return;
+                CadSemanticSnapshot::TchStairRecord rec;
+                rec.Handle        = static_cast<uint64_t>(src.ObjectHandle);
+                rec.StairKind     = kind;
+                rec.Layer         = SemanticLayerName(src);
+                rec.Space         = m_currentSpace;
+                rec.LayoutName    = m_currentLayoutName;
+                rec.BlockName     = m_currentBlockName;
+                rec.X = x; rec.Y = y; rec.RotationDeg = RadToDeg(rotRad);
+                rec.StepHeight    = stepH;
+                rec.TreadWidth    = treadW;
+                rec.FlightWidth   = flightW;
+                rec.LandingWidth  = landingW;
+                rec.TotalWidth    = totalW;
+                rec.Steps1        = steps1;
+                rec.Steps2        = steps2;
+                rec.FloorType     = floor;
+                rec.FloorTypeName = TchFloorTypeName(floor);
+                rec.Mirror        = mirror;
+                rec.Scale         = scale;
+
+                const double runLen = std::max(1, std::max(steps1, steps2)) * std::max(treadW, 100.0) + std::max(landingW, 0.0);
+                const double w = std::max(totalW, flightW);
+                const double cr = std::cos(rotRad), sr = std::sin(rotRad);
+                const std::array<std::pair<double, double>, 4> local = {{
+                    { 0.0, 0.0 }, { w, 0.0 }, { w, runLen }, { 0.0, runLen }
+                }};
+                rec.MinX = rec.MaxX = x;
+                rec.MinY = rec.MaxY = y;
+                for (const auto& [lx, ly] : local)
+                {
+                    const double wx = x + lx * cr - ly * sr;
+                    const double wy = y + lx * sr + ly * cr;
+                    rec.MinX = std::min(rec.MinX, wx); rec.MaxX = std::max(rec.MaxX, wx);
+                    rec.MinY = std::min(rec.MinY, wy); rec.MaxY = std::max(rec.MaxY, wy);
+                }
+                m_semantic->TchStairs.push_back(std::move(rec));
+            }
+
+            void RecordTchDimension(const Dwg::Entity& src, const Tch::TchDimension& d)
+            {
+                if (!m_semantic) return;
+                CadSemanticSnapshot::TchDimensionRecord rec;
+                rec.Handle        = static_cast<uint64_t>(src.ObjectHandle);
+                rec.DxfName       = RawDxfNameOf(src);
+                rec.Layer         = SemanticLayerName(src);
+                rec.Space         = m_currentSpace;
+                rec.LayoutName    = m_currentLayoutName;
+                rec.BlockName     = m_currentBlockName;
+                rec.X = d.Position.X; rec.Y = d.Position.Y; rec.Z = d.Position.Z;
+                rec.AngleDeg      = RadToDeg(d.Angle);
+                rec.OffsetVal     = d.Offset;
+                rec.IsArc         = d.IsArc();
+                if (d.IsArc())
+                {
+                    rec.ArcRadius      = d.ArcRadius;
+                    rec.MeasuredRadius = d.MeasuredRadius;
+                }
+                rec.Spans         = d.Spans;
+                double totalSpan  = 0.0;
+                for (double sp : d.Spans) totalSpan += sp;
+                rec.TotalSpan     = totalSpan;
+                rec.TextOverrides = d.TextOverrides;
+                rec.Flags         = d.Flags;
+                rec.Scale         = d.Scale;
+
+                const double ux = std::cos(d.Angle), uy = std::sin(d.Angle);
+                const double nx = -uy, ny = ux;
+                const double off = d.Offset * d.Scale;
+                const double x0 = d.Position.X, y0 = d.Position.Y;
+                const double x1 = x0 + ux * totalSpan, y1 = y0 + uy * totalSpan;
+                const double x2 = x0 + nx * off, y2 = y0 + ny * off;
+                const double x3 = x1 + nx * off, y3 = y1 + ny * off;
+                rec.MinX = std::min({ x0, x1, x2, x3 });
+                rec.MaxX = std::max({ x0, x1, x2, x3 });
+                rec.MinY = std::min({ y0, y1, y2, y3 });
+                rec.MaxY = std::max({ y0, y1, y2, y3 });
+                m_semantic->TchDimensions.push_back(std::move(rec));
+            }
+
+            void RecordTchRadiusDim(const Dwg::Entity& src, const Tch::TchRadiusDim& d)
+            {
+                if (!m_semantic) return;
+                CadSemanticSnapshot::TchDimensionRecord rec;
+                rec.Handle     = static_cast<uint64_t>(src.ObjectHandle);
+                rec.DxfName    = "TCH_RADIUSDIM";
+                rec.Layer      = SemanticLayerName(src);
+                rec.Space      = m_currentSpace;
+                rec.LayoutName = m_currentLayoutName;
+                rec.BlockName  = m_currentBlockName;
+                rec.X = d.Center.X; rec.Y = d.Center.Y; rec.Z = d.Center.Z;
+                const double radius = std::hypot(d.TipX - d.Center.X, d.TipY - d.Center.Y);
+                rec.AngleDeg       = RadToDeg(std::atan2(d.TipY - d.Center.Y, d.TipX - d.Center.X));
+                rec.OffsetVal      = d.Leader;
+                rec.IsArc          = false;
+                rec.MeasuredRadius = radius;
+                const double val   = (d.Flags & 0x10) ? (radius * 2.0) : radius;
+                rec.Spans          = { val };
+                rec.TotalSpan      = val;
+                if (!d.TextOverride.empty())
+                    rec.TextOverrides[0] = d.TextOverride;
+                rec.Flags          = d.Flags;
+                rec.Scale          = d.Scale;
+                rec.MinX = std::min(d.Center.X, d.TipX);
+                rec.MaxX = std::max(d.Center.X, d.TipX);
+                rec.MinY = std::min(d.Center.Y, d.TipY);
+                rec.MaxY = std::max(d.Center.Y, d.TipY);
+                m_semantic->TchDimensions.push_back(std::move(rec));
+            }
+
+            void RecordTchAxisLabel(const Dwg::Entity& src, const Tch::TchAxisLabel& a)
+            {
+                if (!m_semantic) return;
+                const std::string layer     = SemanticLayerName(src);
+                const std::string textLayer = SemanticLayerName(a.TextLayer);
+                const double len = std::hypot(a.End.X - a.Start.X, a.End.Y - a.Start.Y);
+                const double dx = len > 1e-9 ? (a.End.X - a.Start.X) / len : 1.0;
+                const double dy = len > 1e-9 ? (a.End.Y - a.Start.Y) / len : 0.0;
+                const double rx = dy, ry = -dx;
+                double offset = 0.0;
+                for (size_t i = 0; i < a.Axes.size(); ++i)
+                {
+                    const auto& ax = a.Axes[i];
+                    const double here = offset;
+                    offset += ax.Spacing;
+                    if (i == 0 && (a.Mode & Tch::TchAxisLabel::SkipFirst))
+                        continue;
+                    double x1 = a.Start.X + rx * here, y1 = a.Start.Y + ry * here;
+                    double x2 = a.End.X   + rx * here, y2 = a.End.Y   + ry * here;
+                    if ((ax.Flags & 0x400) && ax.StartTrim < len + 1e-6) { x1 += dx * ax.StartTrim; y1 += dy * ax.StartTrim; }
+                    if ((ax.Flags & 0x800) && ax.EndTrim < len + 1e-6)   { x2 -= dx * ax.EndTrim;   y2 -= dy * ax.EndTrim; }
+                    CadSemanticSnapshot::TchAxisRecord rec;
+                    rec.GroupHandle     = static_cast<uint64_t>(src.ObjectHandle);
+                    rec.AxisIndex       = static_cast<int>(i);
+                    rec.Layer           = layer;
+                    rec.TextLayer       = textLayer;
+                    rec.Space           = m_currentSpace;
+                    rec.LayoutName      = m_currentLayoutName;
+                    rec.BlockName       = m_currentBlockName;
+                    rec.Label           = ax.Label;
+                    rec.Spacing         = ax.Spacing;
+                    rec.OffsetFromFirst = here;
+                    rec.X1 = x1; rec.Y1 = y1; rec.X2 = x2; rec.Y2 = y2;
+                    if (std::abs(x2 - x1) < 1.0)
+                    {
+                        rec.Orientation = "vertical";
+                        rec.Coord       = 0.5 * (x1 + x2);
+                    }
+                    else if (std::abs(y2 - y1) < 1.0)
+                    {
+                        rec.Orientation = "horizontal";
+                        rec.Coord       = 0.5 * (y1 + y2);
+                    }
+                    else
+                    {
+                        rec.Orientation = "oblique";
+                    }
+                    rec.Scale    = a.Scale;
+                    rec.ShowText = a.ShowText;
+                    rec.Flags    = ax.Flags;
+                    rec.MinX = std::min(x1, x2); rec.MaxX = std::max(x1, x2);
+                    rec.MinY = std::min(y1, y2); rec.MaxY = std::max(y1, y2);
+                    m_semantic->TchAxes.push_back(std::move(rec));
+                }
+            }
+
+            void RecordTchSheet(const Dwg::Entity& src, const Tch::TchSheet& t)
+            {
+                if (!m_semantic) return;
+                const size_t nr = t.Rows.size();
+                const size_t nc = t.Columns.size();
+                if (nr == 0 || nc == 0 || t.Cells.size() < nr * nc) return;
+
+                CadSemanticSnapshot::TchSheetRecord rec;
+                rec.Handle      = static_cast<uint64_t>(src.ObjectHandle);
+                rec.Layer       = SemanticLayerName(src);
+                rec.Space       = m_currentSpace;
+                rec.LayoutName  = m_currentLayoutName;
+                rec.BlockName   = m_currentBlockName;
+                rec.Title       = t.TitleVisible ? t.Title.Text : std::string();
+                rec.RowCount    = static_cast<int>(nr);
+                rec.ColCount    = static_cast<int>(nc);
+                rec.X = t.X; rec.Y = t.Y; rec.RotationDeg = RadToDeg(t.Rotation);
+
+                rec.Cells.assign(nr, std::vector<std::string>(nc));
+                for (size_t r = 0; r < nr; ++r)
+                    for (size_t c = 0; c < nc; ++c)
+                    {
+                        const auto& cell = t.Cells[r * nc + c];
+                        if (cell.Range >= 0 && static_cast<size_t>(cell.Range) < t.Ranges.size())
+                            rec.Cells[r][c] = t.Ranges[static_cast<size_t>(cell.Range)].Content.Text;
+                        else
+                            rec.Cells[r][c] = cell.Text;
+                    }
+
+                const double s = t.Scale > 0.0 ? t.Scale : 100.0;
+                double w = 0.0, h = 0.0;
+                for (const auto& col : t.Columns) w += std::max(0.0, col.Width) * s;
+                for (const auto& row : t.Rows)
+                    h += ((row.HeightMode == 4 && t.RowHeightStyle == 0) ? t.RowHeight : row.Height) * s;
+                const double titleH = t.TitleVisible ? std::max(0.0, t.TitleRow.Height) * s : 0.0;
+                const int anchor = Tch::Detail::TextAttachment(t.Anchor);
+                const int colA = (anchor >= 1 && anchor <= 9) ? (anchor - 1) % 3 : 0;
+                const int rowA = (anchor >= 1 && anchor <= 9) ? (anchor - 1) / 3 : 0;
+                const double ax = colA * w * 0.5;
+                const double ay = rowA == 0 ? titleH : rowA == 1 ? (titleH - h) * 0.5 : -h;
+                const double cs = std::cos(t.Rotation), sn = std::sin(t.Rotation);
+                const std::array<std::pair<double, double>, 4> corners = {{
+                    { 0.0, titleH }, { w, titleH }, { w, -h }, { 0.0, -h }
+                }};
+                bool first = true;
+                for (const auto& [lx0, ly0] : corners)
+                {
+                    const double lx = lx0 - ax, ly = ly0 - ay;
+                    const double wx = t.X + lx * cs - ly * sn;
+                    const double wy = t.Y + lx * sn + ly * cs;
+                    if (first) { rec.MinX = rec.MaxX = wx; rec.MinY = rec.MaxY = wy; first = false; }
+                    else
+                    {
+                        rec.MinX = std::min(rec.MinX, wx); rec.MaxX = std::max(rec.MaxX, wx);
+                        rec.MinY = std::min(rec.MinY, wy); rec.MaxY = std::max(rec.MaxY, wy);
+                    }
+                }
+                m_semantic->TchSheets.push_back(std::move(rec));
+            }
+
+            void RecordTchText(const Dwg::Entity& src, const char* kind, double x, double y, double /*z*/,
+                               double height, double rotationRad, const std::string& text)
+            {
+                if (!m_semantic || text.empty()) return;
+                CadSemanticSnapshot::TchTextRecord rec;
+                rec.OwnerHandle = static_cast<uint64_t>(src.ObjectHandle);
+                rec.SourceKind  = kind;
+                rec.Layer       = SemanticLayerName(src);
+                rec.Space       = m_currentSpace;
+                rec.LayoutName  = m_currentLayoutName;
+                rec.BlockName   = m_currentBlockName;
+                rec.X = x; rec.Y = y;
+                rec.Height      = height;
+                rec.RotationDeg = RadToDeg(rotationRad);
+                rec.Content     = text;
+                m_semantic->TchTexts.push_back(std::move(rec));
+            }
+
         private:
             const Dwg::CadDatabase& m_db;
             Scene&                  m_scene;
             CadSource*              m_source;
+            CadSemanticSnapshot*    m_semantic = nullptr;
+            Dwg::CadFileFormat      m_fileFormat = Dwg::CadFileFormat::Unknown;
+            std::string             m_currentSpace = "model";
+            std::string             m_currentLayoutName = "Model";
+            std::string             m_currentBlockName;
 
             std::map<Dwg::Handle, LayerID>     m_layers;
             std::map<Dwg::Handle, LineTypeID>  m_lineTypes;
@@ -5930,7 +6700,8 @@ namespace MiniCAD
     void SetCadImportSolidKernel(Solid::ISolidKernel* kernel) { g_importKernel.store(kernel); }
 
     bool ImportCad(const std::vector<std::uint8_t>& data, Scene& scene, std::string* error, CadSaveVersion* version,
-                   std::shared_ptr<const CadSource>* source, const ImportProgress& progress, const std::string& sourcePath)
+                   std::shared_ptr<const CadSource>* source, const ImportProgress& progress, const std::string& sourcePath,
+                   CadSemanticSnapshot* semantic)
     {
         auto fail = [&](const std::string& msg)
         {
@@ -5970,7 +6741,8 @@ namespace MiniCAD
             src->Version = db->GetVersion();
         }
         if (progress) progress(0.4f);
-        Importer importer(*db, scene, src.get(), stage(0.4f, 1.0f));
+        if (semantic) *semantic = CadSemanticSnapshot{};
+        Importer importer(*db, scene, src.get(), stage(0.4f, 1.0f), semantic, info.format);
         if (!sourcePath.empty())
             importer.SetXrefContext(HostXrefContext(sourcePath, {}));
         importer.Run();
@@ -5980,6 +6752,32 @@ namespace MiniCAD
         if (source != nullptr)
             *source = std::move(src);
         return true;
+    }
+
+    bool LoadCadFileWithSemantics(const std::string& utf8Path, Scene& scene, CadSemanticSnapshot& semantic, std::string* error)
+    {
+        if (error) error->clear();
+        std::ifstream file(Utf8ToPath(utf8Path), std::ios::binary);
+        if (!file.is_open())
+        {
+            if (error) *error = Tr("无法读取文件，请检查文件是否存在及访问权限");
+            return false;
+        }
+        file.seekg(0, std::ios::end);
+        const auto len = file.tellg();
+        if (len < 0)
+        {
+            if (error) *error = Tr("无法确定图纸文件大小");
+            return false;
+        }
+        std::vector<std::uint8_t> bytes(static_cast<size_t>(len));
+        file.seekg(0, std::ios::beg);
+        if (!bytes.empty() && !file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(len)))
+        {
+            if (error) *error = Tr("无法完整读取图纸文件");
+            return false;
+        }
+        return ImportCad(bytes, scene, error, nullptr, nullptr, nullptr, utf8Path, &semantic);
     }
 
     std::vector<UnresolvedXref> FindUnresolvedXrefs(const Scene& scene)
