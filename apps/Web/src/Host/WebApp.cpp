@@ -436,6 +436,12 @@ namespace MiniCAD
             g_app->GetFrame().EmbedSetModeListener([](int next) {
                 EM_ASM({ if (Module.onSaEmbedModeChanged) Module.onSaEmbedModeChanged($0); }, next);
             });
+            g_app->GetFrame().EmbedSetLayoutListener([](const MainFrame::EmbedLayoutInfo& info) {
+                EM_ASM({
+                    if (Module.onSaEmbedLayoutChanged)
+                        Module.onSaEmbedLayoutChanged($0, $1 !== 0, UTF8ToString($2));
+                }, info.index, info.isPaper ? 1 : 0, info.name.c_str());
+            });
             g_app->GetFrame().EmbedSetMode(mode);
         }
 
@@ -629,10 +635,44 @@ namespace MiniCAD
             return g_app && searchRoot ? g_app->GetFrame().EmbedReloadCompareXrefs(searchRoot) : 0;
         }
 
-        EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_SetCompareState(int mode, double scale, double dx, double dy, float overlapOpacity, float splitRatio, int soloCompare, int showMain, int showCompare)
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_GetMainLayout(const char* outPath)
+        {
+            if (!g_app || !outPath) return 0;
+            const auto info = g_app->GetFrame().EmbedGetMainLayout();
+            std::string cleanName = info.name;
+            for (char& c : cleanName)
+                if (c == '\t' || c == '\r' || c == '\n') c = ' ';
+            const std::string line = std::to_string(info.index) + "\t" + (info.isPaper ? "1" : "0") + "\t" + cleanName + "\n";
+            FILE* f = std::fopen(outPath, "wb");
+            if (!f) return 0;
+            std::fwrite(line.data(), 1, line.size(), f);
+            std::fclose(f);
+            return 1;
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_ListCompareLayouts(const char* outPath)
+        {
+            if (!g_app || !outPath) return 0;
+            const auto list = g_app->GetFrame().EmbedListCompareLayouts();
+            std::string text;
+            for (const auto& item : list)
+            {
+                std::string cleanName = item.name;
+                for (char& c : cleanName)
+                    if (c == '\t' || c == '\r' || c == '\n') c = ' ';
+                text += std::to_string(item.index) + "\t" + (item.isPaper ? "1" : "0") + "\t" + cleanName + "\n";
+            }
+            FILE* f = std::fopen(outPath, "wb");
+            if (!f) return 0;
+            std::fwrite(text.data(), 1, text.size(), f);
+            std::fclose(f);
+            return static_cast<int>(list.size());
+        }
+
+        EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_SetCompareState(int mode, double scale, double dx, double dy, float overlapOpacity, float splitRatio, int soloCompare, int showMain, int showCompare, int compareLayoutIndex)
         {
             if (g_app)
-                g_app->GetFrame().EmbedSetCompareState(mode, scale, dx, dy, overlapOpacity, splitRatio, soloCompare != 0, showMain != 0, showCompare != 0);
+                g_app->GetFrame().EmbedSetCompareState(mode, scale, dx, dy, overlapOpacity, splitRatio, soloCompare != 0, showMain != 0, showCompare != 0, compareLayoutIndex);
         }
 
         EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_StartPickPoint(int seq, int target)

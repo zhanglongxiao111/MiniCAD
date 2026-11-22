@@ -141,6 +141,10 @@ namespace MiniCAD
         std::vector<std::pair<std::string, std::string>> EmbedListXrefs() const;
         // 在 searchRoot（虚拟文件系统目录）里按文件名查找并读入外部参照，返回读入个数
         int EmbedReloadXrefs(const std::string& searchRoot);
+        struct EmbedLayoutInfo { int index = 0; std::string name; bool isPaper = false; };
+        void EmbedSetLayoutListener(std::function<void(const EmbedLayoutInfo&)> listener) { m_embedLayoutListener = std::move(listener); }
+        EmbedLayoutInfo EmbedGetMainLayout() const;
+        std::vector<EmbedLayoutInfo> EmbedListCompareLayouts() const;
         // 单引擎叠图与内存收口接口
         void EmbedOpenMainDrawing(const std::string& fsPath);
         bool EmbedCloseOtherDocuments(const std::string& keepPath);
@@ -153,7 +157,7 @@ namespace MiniCAD
         void EmbedCloseCompareDrawing();
         std::vector<std::pair<std::string, std::string>> EmbedListCompareXrefs() const;
         int  EmbedReloadCompareXrefs(const std::string& searchRoot);
-        void EmbedSetCompareState(int mode, double scale, double dx, double dy, float overlapOpacity, float splitRatio, bool soloCompare, bool showMain = true, bool showCompare = true);
+        void EmbedSetCompareState(int mode, double scale, double dx, double dy, float overlapOpacity, float splitRatio, bool soloCompare, bool showMain = true, bool showCompare = true, int compareLayoutIndex = -1);
         void EmbedZoomCompareAll();
         // 叠图对基点：target 0 = 主图，1 = 底图
         bool EmbedStartPickPoint(int seq, int target, std::function<void(int, double, double)> onPicked, std::function<void(int)> onCancelled);
@@ -626,10 +630,17 @@ namespace MiniCAD
         bool                                   m_saveStatusShown = false;   // 本次保存前已显示"正在保存"（据此区分失败与取消另存为）
 
         void SyncCompareCamera();
+        void SyncCompareLayout();
+        void NotifyEmbedLayoutChanged();
         void RouteComparePointer(const MiniGUI::ViewportPointerEvent& original);
 
         void EmbedCloseDocumentsExcept(Document* keep);
 
+        std::function<void(const EmbedLayoutInfo&)> m_embedLayoutListener;
+        const Document*            m_lastNotifiedLayoutDoc   = nullptr;
+        int                        m_lastNotifiedLayoutIndex = -1;
+        bool                       m_lastNotifiedLayoutPaper = false;
+        std::string                m_lastNotifiedLayoutName;
         std::string                m_mainOpenError;
         std::string                m_compareOpenError;
         std::unique_ptr<Document>  m_compareDoc;
@@ -637,16 +648,17 @@ namespace MiniCAD
         std::unique_ptr<Editor>    m_compareEditor;
         std::shared_ptr<OpenJob>   m_compareOpenJob;
         ViewInput                  m_compareInput;
-        CompareDisplayMode         m_compareDisplayMode = CompareDisplayMode::Off;
-        double                     m_compareScale       = 1.0;
-        double                     m_compareDx          = 0.0;
-        double                     m_compareDy          = 0.0;
+        CompareDisplayMode         m_compareDisplayMode    = CompareDisplayMode::Off;
+        double                     m_compareScale          = 1.0;
+        double                     m_compareDx             = 0.0;
+        double                     m_compareDy             = 0.0;
         float                      m_compareOverlapOpacity = 0.40f;
         float                      m_compareSplitRatio     = 0.5f;
         bool                       m_compareSolo           = false;
         bool                       m_compareShowMain       = true;
         bool                       m_compareShowCompare    = true;
-        int                        m_pickPointTarget    = -1;   // -1 = 未拾取，0 = 主图，1 = 底图
+        int                        m_compareLayoutIndex    = -1;   // -1 = 自动跟随主图布局，>= 0 = 手动指定对比图布局
+        int                        m_pickPointTarget       = -1;   // -1 = 未拾取，0 = 主图，1 = 底图
 
         // ── 视口指针状态（物理像素，视口内坐标）──────────────────
         ViewInput m_mainInput;      // 主视口的鼠标状态（光标是否在视口里：m_main.hovered）

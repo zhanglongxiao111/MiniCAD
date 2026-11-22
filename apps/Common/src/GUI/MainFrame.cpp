@@ -746,6 +746,134 @@ namespace MiniCAD
         compCam.SetState(cs);
     }
 
+    MainFrame::EmbedLayoutInfo MainFrame::EmbedGetMainLayout() const
+    {
+        EmbedLayoutInfo info{};
+        const Document* doc = m_docManager.GetMainDocument();
+        if (!doc)
+            return info;
+        const auto& layouts = doc->GetScene().Layouts();
+        const int idx = doc->ActiveLayout();
+        if (idx >= 0 && idx < static_cast<int>(layouts.size()))
+        {
+            const DrawingLayout& l = layouts[static_cast<size_t>(idx)];
+            info.index   = idx;
+            info.name    = l.Name;
+            info.isPaper = !l.Model;
+        }
+        return info;
+    }
+
+    std::vector<MainFrame::EmbedLayoutInfo> MainFrame::EmbedListCompareLayouts() const
+    {
+        std::vector<EmbedLayoutInfo> out;
+        if (!m_compareDoc)
+            return out;
+        const auto& layouts = m_compareDoc->GetScene().Layouts();
+        out.reserve(layouts.size());
+        for (int i = 0; i < static_cast<int>(layouts.size()); ++i)
+        {
+            const DrawingLayout& l = layouts[static_cast<size_t>(i)];
+            out.push_back(EmbedLayoutInfo{ i, l.Name, !l.Model });
+        }
+        return out;
+    }
+
+    void MainFrame::NotifyEmbedLayoutChanged()
+    {
+        const Document* doc = m_docManager.GetMainDocument();
+        const EmbedLayoutInfo info = EmbedGetMainLayout();
+        if (doc == m_lastNotifiedLayoutDoc
+            && info.index == m_lastNotifiedLayoutIndex
+            && info.isPaper == m_lastNotifiedLayoutPaper
+            && info.name == m_lastNotifiedLayoutName)
+        {
+            return;
+        }
+        m_lastNotifiedLayoutDoc   = doc;
+        m_lastNotifiedLayoutIndex = info.index;
+        m_lastNotifiedLayoutPaper = info.isPaper;
+        m_lastNotifiedLayoutName  = info.name;
+        if (doc && m_embedLayoutListener)
+            m_embedLayoutListener(info);
+    }
+
+    void MainFrame::SyncCompareLayout()
+    {
+        if (!m_compareDoc)
+            return;
+        const auto& compLayouts = m_compareDoc->GetScene().Layouts();
+        if (compLayouts.empty())
+            return;
+
+        int targetIdx = m_compareDoc->GetScene().ModelLayoutIndex();
+        if (m_compareLayoutIndex >= 0 && m_compareLayoutIndex < static_cast<int>(compLayouts.size()))
+        {
+            targetIdx = m_compareLayoutIndex;
+        }
+        else
+        {
+            const Document* mainDoc = m_docManager.GetMainDocument();
+            if (mainDoc && mainDoc->ActiveLayoutIsPaper())
+            {
+                const auto& mainLayouts = mainDoc->GetScene().Layouts();
+                const int mainIdx = mainDoc->ActiveLayout();
+                if (mainIdx >= 0 && mainIdx < static_cast<int>(mainLayouts.size()))
+                {
+                    auto lowerAscii = [](std::string s)
+                    {
+                        for (char& ch : s)
+                            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+                        return s;
+                    };
+                    const std::string wantName = lowerAscii(mainLayouts[static_cast<size_t>(mainIdx)].Name);
+                    int matched = -1;
+                    for (int i = 0; i < static_cast<int>(compLayouts.size()); ++i)
+                    {
+                        if (!compLayouts[static_cast<size_t>(i)].Model && lowerAscii(compLayouts[static_cast<size_t>(i)].Name) == wantName)
+                        {
+                            matched = i;
+                            break;
+                        }
+                    }
+                    if (matched < 0)
+                    {
+                        int ordinal = 0;
+                        for (int i = 0; i < mainIdx; ++i)
+                            if (!mainLayouts[static_cast<size_t>(i)].Model) ++ordinal;
+                        int lastPaper = -1;
+                        int cur = 0;
+                        for (int i = 0; i < static_cast<int>(compLayouts.size()); ++i)
+                        {
+                            if (compLayouts[static_cast<size_t>(i)].Model) continue;
+                            lastPaper = i;
+                            if (cur == ordinal) { matched = i; break; }
+                            ++cur;
+                        }
+                        if (matched < 0 && lastPaper >= 0)
+                            matched = lastPaper;
+                    }
+                    if (matched >= 0)
+                        targetIdx = matched;
+                }
+            }
+        }
+
+        if (targetIdx == m_compareDoc->ActiveLayout())
+            return;
+
+        CameraState dummy = m_compareViewport ? m_compareViewport->GetCamera().GetState() : CameraState{};
+        if (!m_compareDoc->SetActiveLayout(targetIdx, dummy))
+            return;
+        if (m_compareEditor)
+        {
+            m_compareEditor->RequestSceneRestitch();
+            m_compareEditor->BeginProgressiveBuild();
+        }
+        SyncCompareCamera();
+        RequestRenderAll();
+    }
+
     void MainFrame::EmbedOpenMainDrawing(const std::string& fsPath)
     {
         if (fsPath.empty())
@@ -837,6 +965,7 @@ namespace MiniCAD
         m_compareDoc.reset();
         m_compareViewport.reset();
         m_compareDisplayMode = CompareDisplayMode::Off;
+        m_compareLayoutIndex = -1;
         m_compareInput       = {};
         if (m_platform)
         {
@@ -859,6 +988,7 @@ namespace MiniCAD
         const bool   keepSolo     = m_compareSolo;
         const bool   keepShowMain = m_compareShowMain;
         const bool   keepShowComp = m_compareShowCompare;
+        const int    keepLayout   = m_compareLayoutIndex;
         EmbedCloseCompareDrawing();
         m_compareDisplayMode    = keepMode;
         m_compareScale          = keepScale;
@@ -869,6 +999,7 @@ namespace MiniCAD
         m_compareSolo           = keepSolo;
         m_compareShowMain       = keepShowMain;
         m_compareShowCompare    = keepShowComp;
+        m_compareLayoutIndex    = keepLayout;
 
         auto job  = std::make_shared<OpenJob>();
         job->path = fsPath;
@@ -903,6 +1034,7 @@ namespace MiniCAD
                 }
                 m_compareDoc      = std::move(job->doc);
                 m_compareViewport = std::make_unique<Viewport>(static_cast<float>(m_docManager.GetMainViewport().GetWidth()), static_cast<float>(m_docManager.GetMainViewport().GetHeight()));
+                SyncCompareLayout();
                 SyncCompareCamera();
                 m_compareEditor   = std::make_unique<Editor>();
                 m_compareEditor->CopySettingsFrom(m_docManager.GetMainEditor());
@@ -942,7 +1074,7 @@ namespace MiniCAD
         return n;
     }
 
-    void MainFrame::EmbedSetCompareState(int mode, double scale, double dx, double dy, float overlapOpacity, float splitRatio, bool soloCompare, bool showMain, bool showCompare)
+    void MainFrame::EmbedSetCompareState(int mode, double scale, double dx, double dy, float overlapOpacity, float splitRatio, bool soloCompare, bool showMain, bool showCompare, int compareLayoutIndex)
     {
         const int clamped = std::clamp(mode, 0, static_cast<int>(CompareDisplayMode::AlignPickMain));
         m_compareDisplayMode    = static_cast<CompareDisplayMode>(clamped);
@@ -954,6 +1086,8 @@ namespace MiniCAD
         m_compareSolo           = soloCompare;
         m_compareShowMain       = showMain;
         m_compareShowCompare    = showCompare;
+        m_compareLayoutIndex    = compareLayoutIndex >= 0 ? compareLayoutIndex : -1;
+        SyncCompareLayout();
         SyncCompareCamera();
         RequestRenderAll();
     }
@@ -962,8 +1096,50 @@ namespace MiniCAD
     {
         if (!m_compareDoc)
             return;
+        const Scene& scene = m_compareDoc->GetScene();
         AABB box = AABB::Empty();
-        if (!m_compareDoc->GetScene().GetExtents(box))
+        bool any = false;
+        for (const auto id : scene.GetAllIDs())
+        {
+            const Object* obj = scene.GetEntity(id);
+            if (!obj || !obj->IsKindOf<Entity>())
+                continue;
+            const Entity& e = static_cast<const Entity&>(*obj);
+            if (e.IsBoundless() || !e.GetAttr().Visible || !m_compareDoc->IsVisibleInActiveLayout(e.GetAttr()))
+                continue;
+            const Layer* layer = scene.GetLayerManager().GetLayer(e.GetAttr().LayerId);
+            if (layer && !layer->IsVisible())
+                continue;
+            const AABB b = e.GetBoundingBox();
+            if (!(b.Min.x <= b.Max.x) || !std::isfinite(b.Min.x) || !std::isfinite(b.Max.x)
+                || !std::isfinite(b.Min.y) || !std::isfinite(b.Max.y))
+                continue;
+            box.Expand(b);
+            any = true;
+        }
+        if (!any && m_compareDoc->ActiveLayoutIsPaper())
+        {
+            const auto& layouts = scene.Layouts();
+            const int idx = m_compareDoc->ActiveLayout();
+            if (idx >= 0 && idx < static_cast<int>(layouts.size()))
+            {
+                const DrawingLayout& sheet = layouts[static_cast<size_t>(idx)];
+                if (sheet.ViewHeight > 0.0)
+                {
+                    const double half = sheet.ViewHeight * 0.5;
+                    box.Min = { sheet.ViewCenterX - half, sheet.ViewCenterY - half, 0.0 };
+                    box.Max = { sheet.ViewCenterX + half, sheet.ViewCenterY + half, 0.0 };
+                    any = true;
+                }
+                else if (sheet.MaxX > sheet.MinX && sheet.MaxY > sheet.MinY)
+                {
+                    box.Min = { sheet.MinX, sheet.MinY, 0.0 };
+                    box.Max = { sheet.MaxX, sheet.MaxY, 0.0 };
+                    any = true;
+                }
+            }
+        }
+        if (!any)
             return;
         const double invS = (std::isfinite(m_compareScale) && m_compareScale > 1e-9) ? (1.0 / m_compareScale) : 1.0;
         const double minX = (box.Min.x - m_compareDx) * invS;
@@ -1728,6 +1904,8 @@ namespace MiniCAD
     {
         ForEachChrome([this](ViewChrome& c) { SyncLayoutTabs(c); });
         UpdateChromeVisibility();        // 切布局 / 切文档后：布局页不显示视图方块，没有文档的窗口不显示命令行等
+        SyncCompareLayout();
+        NotifyEmbedLayoutChanged();
     }
 
     void MainFrame::SyncLayoutTabs(ViewChrome& c)

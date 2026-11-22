@@ -49,7 +49,7 @@ jobs:
           cp -r out/web/MiniCADWeb/fonts "dist/${bundle}/web/"
           cp out/web/SaDwgText.js out/web/SaDwgText.wasm "dist/${bundle}/node/"
           cp LICENSE THIRD_PARTY_NOTICES.md README-EMBED.md "dist/${bundle}/"
-          (cd "dist/${bundle}" && sha256sum web/index.js web/index.wasm web/index.data node/SaDwgText.js node/SaDwgText.wasm > SHA256SUMS)
+          (cd "dist/${bundle}" && sha256sum web/index.js web/index.wasm web/index.data web/fonts/*.otf node/SaDwgText.js node/SaDwgText.wasm > SHA256SUMS)
           (cd dist && zip -r "${bundle}.zip" "${bundle}")
 
       - name: Upload artifact
