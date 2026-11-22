@@ -58,12 +58,13 @@ namespace MiniCAD::SaTool
                               int height,
                               RgbaImage& outImage);
 
-    // 在 RGBA 图像上绘制实心边框矩形与编号角标（供 diff 标出橙色差异区域框）。
+    // 在 RGBA 图像上于紧致框 [x0,y0,x1,y1] 外侧绘制实心边框矩形与编号角标（外扩 outerPadPx 留白，绝不遮挡框内青/红差异像素）。
     void DrawRegionBoxWithLabel(RgbaImage& image,
                                 int x0, int y0, int x1, int y1,
                                 int labelNumber,
                                 uint8_t r, uint8_t g, uint8_t b,
-                                int thickness = 3);
+                                int thickness = 3,
+                                int outerPadPx = 5);
 
     struct RenderResult
     {

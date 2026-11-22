@@ -2324,7 +2324,7 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
                 {
                     DrawRegionBoxWithLabel(img,
                                            r.BboxPx[0], r.BboxPx[1], r.BboxPx[2], r.BboxPx[3],
-                                           r.Id, 0xFFu, 0x8Cu, 0x00u, 3);
+                                           r.Id, 0xFFu, 0x8Cu, 0x00u, 3, 5);
                 }
             }
             if (!WritePngFile(opts.OutPngPath, img, &err))

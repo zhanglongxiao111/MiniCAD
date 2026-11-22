@@ -636,61 +636,85 @@ namespace MiniCAD::SaTool
                                 int x0, int y0, int x1, int y1,
                                 int labelNumber,
                                 uint8_t r, uint8_t g, uint8_t b,
-                                int thickness)
+                                int thickness,
+                                int outerPadPx)
     {
         if (image.Width <= 0 || image.Height <= 0)
             return;
-        x0 = std::clamp(x0, 0, image.Width - 1);
-        x1 = std::clamp(x1, 0, image.Width - 1);
-        y0 = std::clamp(y0, 0, image.Height - 1);
-        y1 = std::clamp(y1, 0, image.Height - 1);
         if (x0 > x1) std::swap(x0, x1);
         if (y0 > y1) std::swap(y0, y1);
 
-        auto put = [&](int x, int y, uint8_t cr, uint8_t cg, uint8_t cb) {
+        const int t   = std::max(1, thickness);
+        // 外框相对紧致差异框 [x0..x1, y0..y1] 向外扩充（默认外沿 +5px、线宽 3px -> 内侧保留 2px 呼吸留白）
+        const int pad = std::max(outerPadPx, t + 2);
+        const int ox0 = std::clamp(x0 - pad, 0, image.Width - 1);
+        const int oy0 = std::clamp(y0 - pad, 0, image.Height - 1);
+        const int ox1 = std::clamp(x1 + pad, 0, image.Width - 1);
+        const int oy1 = std::clamp(y1 + pad, 0, image.Height - 1);
+
+        auto isDiffInk = [](const uint8_t* p) -> bool {
+            // 保护 A 独有青 (#009EB8) 与 B 独有红 (#D91F1F)，画布边缘夹紧时也绝不吞掉真实差异线
+            return (p[0] == 0x00u && p[1] == 0x9Eu && p[2] == 0xB8u)
+                || (p[0] == 0xD9u && p[1] == 0x1Fu && p[2] == 0x1Fu);
+        };
+
+        auto putBorder = [&](int x, int y, uint8_t cr, uint8_t cg, uint8_t cb) {
             if (x < 0 || x >= image.Width || y < 0 || y >= image.Height)
                 return;
             uint8_t* p = image.Pixels.data()
                        + (static_cast<size_t>(y) * static_cast<size_t>(image.Width) + static_cast<size_t>(x)) * 4u;
+            if (isDiffInk(p))
+                return;
             p[0] = cr; p[1] = cg; p[2] = cb; p[3] = 255u;
         };
 
-        const int t = std::max(1, thickness);
+        auto putBadge = [&](int x, int y, uint8_t cr, uint8_t cg, uint8_t cb) {
+            if (x < 0 || x >= image.Width || y < 0 || y >= image.Height)
+                return;
+            uint8_t* p = image.Pixels.data()
+                       + (static_cast<size_t>(y) * static_cast<size_t>(image.Width) + static_cast<size_t>(x)) * 4u;
+            if (isDiffInk(p))
+                return;
+            p[0] = cr; p[1] = cg; p[2] = cb; p[3] = 255u;
+        };
+
         for (int k = 0; k < t; ++k)
         {
-            for (int x = x0; x <= x1; ++x)
+            for (int x = ox0; x <= ox1; ++x)
             {
-                put(x, y0 + k, r, g, b);
-                put(x, y1 - k, r, g, b);
+                putBorder(x, oy0 + k, r, g, b);
+                putBorder(x, oy1 - k, r, g, b);
             }
-            for (int y = y0; y <= y1; ++y)
+            for (int y = oy0; y <= oy1; ++y)
             {
-                put(x0 + k, y, r, g, b);
-                put(x1 - k, y, r, g, b);
+                putBorder(ox0 + k, y, r, g, b);
+                putBorder(ox1 - k, y, r, g, b);
             }
         }
 
         if (labelNumber <= 0)
             return;
 
-        // 在框左上角画橙底白字角标（#1, #2...），方便人工与视觉模型核对区域编号
+        // 在外框左上角外侧画橙底白字角标（#1, #2...），顶部放不下时放到底部外侧，避免遮挡框内差异
         const std::string text = "#" + std::to_string(labelNumber);
         const int scale = 2;
         const int glyphW = 5 * scale;
         const int glyphH = 7 * scale;
         const int gap    = scale;
-        const int pad    = 3;
-        const int badgeW = static_cast<int>(text.size()) * (glyphW + gap) - gap + pad * 2;
-        const int badgeH = glyphH + pad * 2;
-        const int bx0    = std::clamp(x0, 0, std::max(0, image.Width - badgeW));
-        const int by0    = (y0 >= badgeH) ? (y0 - badgeH) : y0;
+        const int bpad   = 3;
+        const int badgeW = static_cast<int>(text.size()) * (glyphW + gap) - gap + bpad * 2;
+        const int badgeH = glyphH + bpad * 2;
+        const int bx0    = std::clamp(ox0, 0, std::max(0, image.Width - badgeW));
+        int by0          = oy0 - badgeH;
+        if (by0 < 0)
+            by0 = (oy1 + 1 + badgeH <= image.Height) ? (oy1 + 1) : 0;
 
         for (int y = by0; y < by0 + badgeH; ++y)
             for (int x = bx0; x < bx0 + badgeW; ++x)
-                put(x, y, r, g, b);
+                putBadge(x, y, r, g, b);
 
-        int cx = bx0 + pad;
-        const int cy = by0 + pad;
+        int cx = bx0 + bpad;
+        const int cy = by0 + bpad;
         for (char ch : text)
         {
             const uint8_t* rows = Glyph5x7(ch);
@@ -704,7 +728,7 @@ namespace MiniCAD::SaTool
                         {
                             for (int sy = 0; sy < scale; ++sy)
                                 for (int sx = 0; sx < scale; ++sx)
-                                    put(cx + col * scale + sx, cy + row * scale + sy, 255u, 255u, 255u);
+                                    putBadge(cx + col * scale + sx, cy + row * scale + sy, 255u, 255u, 255u);
                         }
                     }
                 }

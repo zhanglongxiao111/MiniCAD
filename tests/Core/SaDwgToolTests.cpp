@@ -789,6 +789,48 @@ namespace
         int pw = 0, ph = 0;
         Check(HasPngMagic(diffOpts.OutPngPath, pw, ph), "diff 输出有效三态叠加 PNG");
 
+        // 回归测试：橙色区域框外扩留白，绝不吞没紧贴 bbox 四边的 1px 红/青差异像素
+        {
+            const int W = 120, H = 100;
+            std::vector<uint8_t> mA(static_cast<size_t>(W) * H, 0u);
+            std::vector<uint8_t> mB(static_cast<size_t>(W) * H, 0u);
+            std::vector<uint8_t> aO(static_cast<size_t>(W) * H, 0u);
+            std::vector<uint8_t> bO(static_cast<size_t>(W) * H, 0u);
+            // 矩形四边恰好落在 tight bbox [20..80, 20..70] 上
+            int expectedRed = 0;
+            for (int x = 20; x <= 80; ++x)
+            {
+                mB[20 * W + x] = bO[20 * W + x] = 1u;
+                mB[70 * W + x] = bO[70 * W + x] = 1u;
+            }
+            for (int y = 20; y <= 70; ++y)
+            {
+                mB[y * W + 20] = bO[y * W + 20] = 1u;
+                mB[y * W + 80] = bO[y * W + 80] = 1u;
+            }
+            for (uint8_t v : bO) expectedRed += v;
+            // 紧贴画布边缘的青色差异线 [0..10, 0..10] 也应受保护
+            int expectedCyan = 0;
+            for (int x = 0; x <= 10; ++x) { mA[0 * W + x] = aO[0 * W + x] = 1u; }
+            for (uint8_t v : aO) expectedCyan += v;
+
+            RgbaImage img;
+            CompositeDiffOverlay(mA, mB, aO, bO, W, H, img);
+            DrawRegionBoxWithLabel(img, 20, 20, 80, 70, 1, 0xFFu, 0x8Cu, 0x00u, 3, 5);
+            DrawRegionBoxWithLabel(img, 0, 0, 10, 0, 2, 0xFFu, 0x8Cu, 0x00u, 3, 5);
+
+            int keptRed = 0, keptCyan = 0, orangePx = 0;
+            for (size_t i = 0; i < img.Pixels.size(); i += 4)
+            {
+                const uint8_t r = img.Pixels[i], g = img.Pixels[i + 1], b = img.Pixels[i + 2];
+                if (r == 0xD9u && g == 0x1Fu && b == 0x1Fu) ++keptRed;
+                if (r == 0x00u && g == 0x9Eu && b == 0xB8u) ++keptCyan;
+                if (r == 0xFFu && g == 0x8Cu && b == 0x00u) ++orangePx;
+            }
+            Check(keptRed == expectedRed && keptCyan == expectedCyan && orangePx > 0,
+                  "橙色差异区域框外扩留白且不覆盖紧贴边框/画布边缘的红/青差异像素");
+        }
+
         sqlite3* ddb = nullptr;
         Check(sqlite3_open_v2(diffOpts.OutDbPath.c_str(), &ddb, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK,
               "diff --out-db 生成可读 4 表比对库");
