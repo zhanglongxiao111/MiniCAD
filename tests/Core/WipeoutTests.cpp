@@ -237,6 +237,73 @@ int RunWipeoutTests()
         Check(v.size() == 6 && v[0].pos.x == -5 && v[1].pos.x == 15, "ClipLines：from 之前的线段保持不变");
     }
 
+    // ── 布局视口裁剪（keepInside=true）：精确凸裁、退化三角形不爆炸、线段原地裁剪 ────
+    {
+        // 退化/共线三角形落在矩形视口内：绝对不能按 depth=5 递归四分成 4^5=1024 个垃圾三角形
+        std::vector<Vertex_P3_C4> deg = {
+            V(2, 2), V(5, 5), V(5, 5),
+            V(1, 3), V(4, 3), V(8, 3),
+        };
+        WipeClip::ClipFills(deg, poly, 5, 0, /*keepInside*/ true);
+        Check(deg.size() <= 6, "ClipFills(keepInside)：退化三角形不递归爆炸");
+    }
+    {
+        // 跨视口边界的大三角形：凸矩形精确裁切后面积精确等于 100 且顶点数极少（<= 15）
+        std::vector<Vertex_P3_C4> big = { V(-20, -20), V(40, -20), V(-20, 40) };
+        WipeClip::ClipFills(big, poly, 5, 0, /*keepInside*/ true);
+        Check(std::abs(Area(big) - 100.0) < 1e-3, "ClipFills(keepInside)：凸矩形精确保留内部面积");
+        Check(big.size() <= 15, "ClipFills(keepInside)：凸矩形不四分爆炸");
+    }
+    {
+        // ClipLines(keepInside=true)：保留内部段、裁掉外部段、from 之前不变
+        std::vector<Vertex_P3_C4> segs = {
+            V(-99, -99), V(-98, -98), // prefix (< from)
+            V(-5, 5), V(15, 5),       // crossing -> [0, 10]
+            V(2, 2), V(8, 8),         // fully inside
+            V(20, 2), V(30, 8),       // fully outside
+        };
+        WipeClip::ClipLines(segs, poly, 2, /*keepInside*/ true);
+        Check(segs.size() == 6
+              && segs[0].pos.x == -99 && segs[1].pos.x == -98
+              && std::abs(segs[2].pos.x - 0.0f) < 1e-4 && std::abs(segs[3].pos.x - 10.0f) < 1e-4
+              && std::abs(segs[4].pos.x - 2.0f) < 1e-4 && std::abs(segs[5].pos.x - 8.0f) < 1e-4,
+              "ClipLines(keepInside)：凸矩形精确裁剪且保留 from 之前");
+    }
+    {
+        // Batch::ClipFills：验证 first > 0 时结果同样精确
+        std::vector<Vertex_P3_C4> v = {
+            V(50, 50), V(60, 50), V(55, 60),    // 不被遮罩碰到的前缀（first = 3）
+            V(-5, -5), V(15, -5), V(15, 15),    // 跨遮罩
+        };
+        WipeClip::Batch b(1);
+        b.Add(kSquare, { 6 });
+        b.ClipFills(v, 0);
+        Check(v.size() >= 6 && v[0].pos.x == 50 && std::abs(Area(v) - (50.0 + 150.0)) < 1e-3,
+              "Batch::ClipFills：first > 0 时前缀不变且剩余面积精确");
+    }
+    {
+        // Batch::ClipLines：原地编辑路径（先分裂增顶、中间夹未碰段、后删除减顶，覆盖 shift > 0 与容量充裕 / 不足两条分支）
+        auto runCase = [&](size_t reserveExtra) -> bool
+        {
+            std::vector<Vertex_P3_C4> v;
+            v.reserve(8 + reserveExtra);
+            v.push_back(V(-5, 5));  v.push_back(V(15, 5));   // 穿过方形 → 拆成 2 段 (+2 顶点)
+            v.push_back(V(30, 30)); v.push_back(V(40, 30));  // 未被碰到（必须保持在中间）
+            v.push_back(V(2, 2));   v.push_back(V(8, 8));    // 完全在内 → 删除 (-2 顶点)
+            v.push_back(V(50, 50)); v.push_back(V(60, 50));  // 尾部未碰段
+            WipeClip::Batch b(1);
+            b.Add(kSquare, { 8 });
+            b.ClipLines(v, 0);
+            return v.size() == 8
+                && std::abs(v[0].pos.x - (-5.0f)) < 1e-4 && std::abs(v[1].pos.x - 0.0f) < 1e-4
+                && std::abs(v[2].pos.x - 10.0f) < 1e-4   && std::abs(v[3].pos.x - 15.0f) < 1e-4
+                && std::abs(v[4].pos.x - 30.0f) < 1e-4   && std::abs(v[5].pos.x - 40.0f) < 1e-4
+                && std::abs(v[6].pos.x - 50.0f) < 1e-4   && std::abs(v[7].pos.x - 60.0f) < 1e-4;
+        };
+        Check(runCase(16), "Batch::ClipLines：shift > 0 容量充裕时原地编辑顺序与坐标精确");
+        Check(runCase(0),  "Batch::ClipLines：shift > 0 超容量时精确合并顺序与坐标精确");
+    }
+
     JsonSerializer ws;
     EntityIO::Write(ws, w);
     JsonSerializer rs;

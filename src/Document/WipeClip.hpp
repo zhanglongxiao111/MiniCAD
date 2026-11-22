@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -118,6 +120,10 @@ namespace MiniCAD::WipeClip
         // 三角形的边是否穿过多边形边界，或多边形整个落在三角形里
         inline bool TriTouchesBoundary(const Poly& poly, const Math::Float3 v[3])
         {
+            const double area2 = (static_cast<double>(v[1].x) - v[0].x) * (static_cast<double>(v[2].y) - v[0].y)
+                               - (static_cast<double>(v[1].y) - v[0].y) * (static_cast<double>(v[2].x) - v[0].x);
+            if (std::abs(area2) <= 1e-18)
+                return false;
             const size_t n = poly.pts.size();
             for (int e = 0; e < 3; ++e)
             {
@@ -287,6 +293,67 @@ namespace MiniCAD::WipeClip
             return poly.BoxOverlaps(std::min(a.pos.x, b.pos.x), std::min(a.pos.y, b.pos.y),
                                     std::max(a.pos.x, b.pos.x), std::max(a.pos.y, b.pos.y));
         };
+        if (keepInside && poly.convex)
+        {
+            // 凸多边形保留内部（布局视口矩形裁剪）：Cyrus–Beck 原地精确裁剪，零临时向量、零逐段堆分配
+            const size_t n = poly.pts.size();
+            size_t w = from;
+            for (size_t k = from; k + 1 < v.size(); k += 2)
+            {
+                const Vertex_P3_C4 a = v[k];
+                const Vertex_P3_C4 b = v[k + 1];
+                if (!overlaps(a, b))
+                    continue;
+                const double rx = static_cast<double>(b.pos.x) - a.pos.x;
+                const double ry = static_cast<double>(b.pos.y) - a.pos.y;
+                double t0 = 0.0, t1 = 1.0;
+                bool visible = true;
+                for (size_t i = 0; i < n; ++i)
+                {
+                    const auto& p = poly.pts[i];
+                    const auto& q = poly.pts[(i + 1) % n];
+                    const double ex  = q.x - p.x;
+                    const double ey  = q.y - p.y;
+                    const double num = ex * (a.pos.y - p.y) - ey * (a.pos.x - p.x);
+                    const double den = ex * ry - ey * rx;
+                    if (std::abs(den) <= 1e-18)
+                    {
+                        if (num < 0.0) { visible = false; break; }
+                    }
+                    else
+                    {
+                        const double t = -num / den;
+                        if (den > 0.0)
+                        {
+                            if (t > t1) { visible = false; break; }
+                            if (t > t0) t0 = t;
+                        }
+                        else
+                        {
+                            if (t < t0) { visible = false; break; }
+                            if (t < t1) t1 = t;
+                        }
+                    }
+                }
+                if (!visible || (t1 - t0 < 1e-9 && (rx * rx + ry * ry) > 1e-18))
+                    continue;
+                auto at = [&](double t) -> Vertex_P3_C4
+                {
+                    if (t <= 0.0) return a;
+                    if (t >= 1.0) return b;
+                    Vertex_P3_C4 m;
+                    m.pos   = { static_cast<float>(a.pos.x + rx * t), static_cast<float>(a.pos.y + ry * t),
+                                static_cast<float>(a.pos.z + (b.pos.z - a.pos.z) * t) };
+                    m.color = a.color;
+                    return m;
+                };
+                v[w++] = (t0 <= 0.0) ? a : at(t0);
+                v[w++] = (t1 >= 1.0) ? b : at(t1);
+            }
+            v.resize(w);
+            return;
+        }
+
         size_t first = from;
         if (!keepInside)
         {
@@ -296,25 +363,23 @@ namespace MiniCAD::WipeClip
         }
         else
         {
-            // 保留内部：不重叠的线段要直接丢掉。先原地压缩一遍，
-            // 只留下与矩形包围盒有交叠的线段，后面再按多边形边界精确切。
-            std::vector<Vertex_P3_C4> kept;
-            kept.reserve(v.size() - from);
+            // 保留内部（非凸多边形）：先原地压缩，只留下与多边形包围盒有交叠的线段
+            size_t w = from;
             for (size_t k = from; k + 1 < v.size(); k += 2)
                 if (overlaps(v[k], v[k + 1]))
                 {
-                    kept.push_back(v[k]);
-                    kept.push_back(v[k + 1]);
+                    v[w++] = v[k];
+                    v[w++] = v[k + 1];
                 }
-            v.resize(from);
-            v.insert(v.end(), kept.begin(), kept.end());
+            v.resize(w);
             if (v.size() < from + 2) return;
-            // 压缩后没有需要再判断的前缀，统一从 from 开始按多边形精确切
         }
 
         std::vector<Vertex_P3_C4> out;
         out.reserve(v.size() - first);
         const size_t n = poly.pts.size();
+        std::vector<double> ts;
+        ts.reserve(n + 2);
 
         for (size_t k = first; k + 1 < v.size(); k += 2)
         {
@@ -327,7 +392,9 @@ namespace MiniCAD::WipeClip
             }
 
             const double rx = b.pos.x - a.pos.x, ry = b.pos.y - a.pos.y;
-            std::vector<double> ts = { 0.0, 1.0 };
+            ts.clear();
+            ts.push_back(0.0);
+            ts.push_back(1.0);
             for (size_t i = 0; i < n; ++i)
             {
                 const auto& p = poly.pts[i];
@@ -359,8 +426,15 @@ namespace MiniCAD::WipeClip
                 out.push_back(i + 2 == ts.size() ? b : at(ts[i + 1]));
             }
         }
-        v.resize(first);
-        v.insert(v.end(), out.begin(), out.end());
+        if (first == 0)
+        {
+            v.swap(out);
+        }
+        else
+        {
+            v.resize(first);
+            v.insert(v.end(), out.begin(), out.end());
+        }
     }
 
     // 填充三角形流（每三个顶点一个）：删去落在多边形内的部分
@@ -381,6 +455,67 @@ namespace MiniCAD::WipeClip
             const double y1 = std::max({ t[0].pos.y, t[1].pos.y, t[2].pos.y });
             return poly.BoxOverlaps(x0, y0, x1, y1);
         };
+        if (keepInside && poly.convex)
+        {
+            // 凸多边形保留内部（布局视口矩形裁剪）：Sutherland–Hodgman 精确半平面裁剪，
+            // 避免递归四分导致退化 / 跨边界三角形按 4^maxDepth 爆炸
+            const size_t n = poly.pts.size();
+            auto allInside = [&](const Vertex_P3_C4* t)
+            {
+                for (size_t i = 0; i < n; ++i)
+                {
+                    const auto& p = poly.pts[i];
+                    const auto& q = poly.pts[(i + 1) % n];
+                    const double ex = q.x - p.x, ey = q.y - p.y;
+                    for (int j = 0; j < 3; ++j)
+                        if (ex * (t[j].pos.y - p.y) - ey * (t[j].pos.x - p.x) < 0.0)
+                            return false;
+                }
+                return true;
+            };
+            std::vector<Vertex_P3_C4> out;
+            out.reserve(v.size() - from);
+            detail::Piece cur, tmp;
+            cur.reserve(n + 4);
+            tmp.reserve(n + 4);
+            for (size_t k = from; k + 2 < v.size(); k += 3)
+            {
+                const Vertex_P3_C4* t = &v[k];
+                if (!overlaps(t))
+                    continue;
+                if (allInside(t))
+                {
+                    out.insert(out.end(), t, t + 3);
+                    continue;
+                }
+                cur.assign(t, t + 3);
+                for (size_t i = 0; i < n && cur.size() >= 3; ++i)
+                {
+                    detail::ClipHalf(cur, poly.pts[i], poly.pts[(i + 1) % n], true, tmp);
+                    cur.swap(tmp);
+                }
+                if (cur.size() >= 3 && std::abs(detail::PieceArea2(cur)) > 0.0)
+                {
+                    for (size_t j = 1; j + 1 < cur.size(); ++j)
+                    {
+                        out.push_back(cur[0]);
+                        out.push_back(cur[j]);
+                        out.push_back(cur[j + 1]);
+                    }
+                }
+            }
+            if (from == 0)
+            {
+                v.swap(out);
+            }
+            else
+            {
+                v.resize(from);
+                v.insert(v.end(), out.begin(), out.end());
+            }
+            return;
+        }
+
         size_t first = from;
         if (!keepInside)
         {
@@ -390,14 +525,16 @@ namespace MiniCAD::WipeClip
         }
         else
         {
-            // 保留内部：不重叠的三角形直接丢掉
-            std::vector<Vertex_P3_C4> kept;
-            kept.reserve(v.size() - from);
+            // 保留内部（非凸多边形）：不重叠的三角形原地丢掉
+            size_t w = from;
             for (size_t k = from; k + 2 < v.size(); k += 3)
                 if (overlaps(&v[k]))
-                    kept.insert(kept.end(), &v[k], &v[k] + 3);
-            v.resize(from);
-            v.insert(v.end(), kept.begin(), kept.end());
+                {
+                    v[w++] = v[k];
+                    v[w++] = v[k + 1];
+                    v[w++] = v[k + 2];
+                }
+            v.resize(w);
             if (v.size() < from + 3) return;
         }
 
@@ -415,8 +552,15 @@ namespace MiniCAD::WipeClip
             else
                 detail::ClipTri(poly, t, maxDepth, out, keepInside);
         }
-        v.resize(first);
-        v.insert(v.end(), out.begin(), out.end());
+        if (first == 0)
+        {
+            v.swap(out);
+        }
+        else
+        {
+            v.resize(first);
+            v.insert(v.end(), out.begin(), out.end());
+        }
     }
 
     // 点流（每个顶点一个点）：keepInside=false 删去落在多边形内的点（区域覆盖）；
@@ -568,8 +712,8 @@ namespace MiniCAD::WipeClip
         {
             if (m_polys.empty() || v.size() < from + 2) return;
             BuildGrid();
-            std::vector<Vertex_P3_C4> out;
-            size_t first = SIZE_MAX;
+            std::vector<Vertex_P3_C4> repl;
+            std::vector<Edit> edits;
             std::vector<double> ts;
             std::vector<std::pair<double, double>> pieces, next;
             for (size_t k = from; k + 1 < v.size(); k += 2)
@@ -578,15 +722,7 @@ namespace MiniCAD::WipeClip
                 Candidates(std::min(a.pos.x, b.pos.x), std::min(a.pos.y, b.pos.y),
                            std::max(a.pos.x, b.pos.x), std::max(a.pos.y, b.pos.y), k, stream);
                 if (m_cand.empty())
-                {
-                    if (first != SIZE_MAX) { out.push_back(a); out.push_back(b); }
                     continue;
-                }
-                if (first == SIZE_MAX)
-                {
-                    first = k;
-                    out.reserve(v.size() - k);
-                }
 
                 // 依次用每个候选多边形切掉段内落在其中的部分（参数区间）
                 const double rx = b.pos.x - a.pos.x, ry = b.pos.y - a.pos.y;
@@ -640,16 +776,17 @@ namespace MiniCAD::WipeClip
                     m.color = a.color;
                     return m;
                 };
+                const size_t off = repl.size();
                 for (const auto& [t0, t1] : pieces)
                 {
-                    out.push_back(at(t0));
-                    out.push_back(at(t1));
+                    repl.push_back(at(t0));
+                    repl.push_back(at(t1));
                 }
+                edits.push_back({ k, off, repl.size() - off });
             }
-            if (first == SIZE_MAX) return;
-            Touch(stream, first);
-            v.resize(first);
-            v.insert(v.end(), out.begin(), out.end());
+            if (edits.empty()) return;
+            Touch(stream, edits.front().pos);
+            ApplyEdits(v, 2, edits, repl);
         }
 
         // 填充三角形流（每三个顶点一个），只处理下标 from 起的顶点
@@ -657,23 +794,15 @@ namespace MiniCAD::WipeClip
         {
             if (m_polys.empty() || v.size() < from + 3) return;
             BuildGrid();
-            std::vector<Vertex_P3_C4> out, cur;
-            size_t first = SIZE_MAX;
+            std::vector<Vertex_P3_C4> repl, cur;
+            std::vector<Edit> edits;
             for (size_t k = from; k + 2 < v.size(); k += 3)
             {
                 const Vertex_P3_C4* t = &v[k];
                 Candidates(std::min({ t[0].pos.x, t[1].pos.x, t[2].pos.x }), std::min({ t[0].pos.y, t[1].pos.y, t[2].pos.y }),
                            std::max({ t[0].pos.x, t[1].pos.x, t[2].pos.x }), std::max({ t[0].pos.y, t[1].pos.y, t[2].pos.y }), k, stream);
                 if (m_cand.empty())
-                {
-                    if (first != SIZE_MAX) out.insert(out.end(), t, t + 3);
                     continue;
-                }
-                if (first == SIZE_MAX)
-                {
-                    first = k;
-                    out.reserve(v.size() - k);
-                }
                 // 凸遮罩精确求差（片段数只与遮罩边数有关）；非凸遮罩最后合在一起细分一次，
                 // 不能逐个遮罩细分——每个遮罩把三角形再四分 maxDepth 层，几个遮罩叠在一起就是指数膨胀
                 m_pieces.assign(1, detail::Piece(t, t + 3));
@@ -709,16 +838,17 @@ namespace MiniCAD::WipeClip
                     {
                         cur.push_back(pc[0]); cur.push_back(pc[j]); cur.push_back(pc[j + 1]);
                     }
+                const size_t off = repl.size();
                 if (m_nonConvex.empty())
-                    out.insert(out.end(), cur.begin(), cur.end());
+                    repl.insert(repl.end(), cur.begin(), cur.end());
                 else
                     for (size_t j = 0; j + 2 < cur.size(); j += 3)
-                        detail::ClipTriMulti(m_nonConvex, &cur[j], maxDepth, out);
+                        detail::ClipTriMulti(m_nonConvex, &cur[j], maxDepth, repl);
+                edits.push_back({ k, off, repl.size() - off });
             }
-            if (first == SIZE_MAX) return;
-            Touch(stream, first);
-            v.resize(first);
-            v.insert(v.end(), out.begin(), out.end());
+            if (edits.empty()) return;
+            Touch(stream, edits.front().pos);
+            ApplyEdits(v, 3, edits, repl);
         }
 
         // 纹理文字流（每个字符 6 个顶点）：字符中心落在任一适用的多边形内则删去，只处理下标 from 起的顶点
@@ -864,6 +994,87 @@ namespace MiniCAD::WipeClip
         {
             size_t& first = m_firstTouched[static_cast<size_t>(stream)];
             first = std::min(first, index);
+        }
+
+        struct Edit
+        {
+            size_t pos;   // 原顶点流中受影响的图元起点
+            size_t off;   // repl 中替换顶点的起点
+            size_t cnt;   // 替换顶点数
+        };
+
+        // 按绘制序把受遮罩影响的少量图元替换回 v：
+        // 若 v 剩余容量足够容纳最大前缀净增量 maxGain，则 100% 原地 memmove 完成（零额外整流拷贝）；
+        // 否则按最终精确长度一次分配 merged，彻底消除整流翻倍峰值（大图纸可省上百 MB 峰值堆内存）
+        static void ApplyEdits(std::vector<Vertex_P3_C4>& v, size_t stride,
+                               const std::vector<Edit>& edits, const std::vector<Vertex_P3_C4>& repl)
+        {
+            static_assert(std::is_trivially_copyable_v<Vertex_P3_C4>);
+            const size_t oldSize = v.size();
+            const size_t first   = edits.front().pos;
+            std::ptrdiff_t delta = 0, maxGain = 0;
+            for (const Edit& e : edits)
+            {
+                delta += static_cast<std::ptrdiff_t>(e.cnt) - static_cast<std::ptrdiff_t>(stride);
+                if (delta > maxGain) maxGain = delta;
+            }
+            const size_t shift     = static_cast<size_t>(maxGain);
+            const size_t finalSize = static_cast<size_t>(static_cast<std::ptrdiff_t>(oldSize) + delta);
+
+            if (oldSize + shift <= v.capacity())
+            {
+                if (shift > 0)
+                {
+                    v.resize(oldSize + shift);
+                    std::memmove(v.data() + first + shift, v.data() + first,
+                                 (oldSize - first) * sizeof(Vertex_P3_C4));
+                }
+                size_t dst = first;
+                size_t src = first + shift;
+                for (const Edit& e : edits)
+                {
+                    const size_t gap = (e.pos + shift) - src;
+                    if (gap > 0)
+                    {
+                        if (dst != src)
+                            std::memmove(v.data() + dst, v.data() + src, gap * sizeof(Vertex_P3_C4));
+                        dst += gap;
+                        src += gap;
+                    }
+                    if (e.cnt > 0)
+                    {
+                        std::memcpy(v.data() + dst, repl.data() + e.off, e.cnt * sizeof(Vertex_P3_C4));
+                        dst += e.cnt;
+                    }
+                    src += stride;
+                }
+                const size_t tail = (oldSize + shift) - src;
+                if (tail > 0)
+                {
+                    if (dst != src)
+                        std::memmove(v.data() + dst, v.data() + src, tail * sizeof(Vertex_P3_C4));
+                    dst += tail;
+                }
+                v.resize(dst);
+                return;
+            }
+
+            std::vector<Vertex_P3_C4> merged;
+            merged.reserve(finalSize);
+            size_t src = 0;
+            for (const Edit& e : edits)
+            {
+                if (e.pos > src)
+                    merged.insert(merged.end(), v.begin() + static_cast<std::ptrdiff_t>(src),
+                                  v.begin() + static_cast<std::ptrdiff_t>(e.pos));
+                if (e.cnt > 0)
+                    merged.insert(merged.end(), repl.begin() + static_cast<std::ptrdiff_t>(e.off),
+                                  repl.begin() + static_cast<std::ptrdiff_t>(e.off + e.cnt));
+                src = e.pos + stride;
+            }
+            if (src < oldSize)
+                merged.insert(merged.end(), v.begin() + static_cast<std::ptrdiff_t>(src), v.end());
+            v.swap(merged);
         }
 
         int                             m_streams;

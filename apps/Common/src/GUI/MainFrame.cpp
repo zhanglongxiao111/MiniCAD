@@ -866,10 +866,7 @@ namespace MiniCAD
         if (!m_compareDoc->SetActiveLayout(targetIdx, dummy))
             return;
         if (m_compareEditor)
-        {
-            m_compareEditor->RequestSceneRestitch();
-            m_compareEditor->BeginProgressiveBuild();
-        }
+            m_compareEditor->BeginProgressiveBuild(0.0);
         SyncCompareCamera();
         RequestRenderAll();
     }
@@ -1039,7 +1036,8 @@ namespace MiniCAD
                 m_compareEditor   = std::make_unique<Editor>();
                 m_compareEditor->CopySettingsFrom(m_docManager.GetMainEditor());
                 m_compareEditor->Bind(*m_compareDoc, *m_compareViewport);
-                m_compareEditor->BeginProgressiveBuild();
+                if (!m_compareDoc->ActiveLayoutIsPaper())
+                    m_compareEditor->BeginProgressiveBuild();
                 RequestRenderAll();
             });
     }

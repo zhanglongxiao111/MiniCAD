@@ -4124,12 +4124,34 @@ namespace MiniCAD
             ChooseRenderOrigin(isShown);
 
         // 块定义级细分缓存（BlockTessCache）只在成批细分时留着：不在分帧细分时本次更新结束就清空，不长期占内存。
+        // 大体量的临时细分缓冲（如布局页视口合成后可达数十 MB）与已清空的动态流同样在结束时归还，避免长期驻留堆内存。
         // 图纸有改动时先清空（块定义可能也改了）；显示设置变了（invalidateAll）记下的结果也作废
-        struct ReleaseBlockCache
+        struct ReleaseTransientCaches
         {
             Editor& editor;
-            ~ReleaseBlockCache() { if (!editor.m_build.active) editor.m_blockTessCache.Clear(); }
-        } releaseBlockCache{ *this };
+            ~ReleaseTransientCaches()
+            {
+                if (!editor.m_build.active)
+                {
+                    editor.m_blockTessCache.Clear();
+                    constexpr size_t kShrinkLimit = 65536;
+                    auto shrinkIfLarge = [](auto& v)
+                    {
+                        if (v.capacity() > kShrinkLimit)
+                        {
+                            using V = std::decay_t<decltype(v)>;
+                            V{}.swap(v);
+                        }
+                    };
+                    shrinkIfLarge(editor.m_scratchLines);
+                    shrinkIfLarge(editor.m_scratchFills);
+                    shrinkIfLarge(editor.m_scratchTexts);
+                    shrinkIfLarge(editor.m_scratchGlyphs);
+                    if (editor.m_sceneDynVertices.empty())     shrinkIfLarge(editor.m_sceneDynVertices);
+                    if (editor.m_sceneDynFillVertices.empty()) shrinkIfLarge(editor.m_sceneDynFillVertices);
+                }
+            }
+        } releaseTransientCaches{ *this };
         if (invalidateAll || scene.IsDirty())
             m_blockTessCache.Clear();
 
@@ -4236,6 +4258,12 @@ namespace MiniCAD
         {
             m_entityVertexCache.clear();
             DropBuildPart();
+            // 切布局等全量重建前先归还旧布局的大体量缓冲，免得与新布局的细分峰值叠加
+            std::vector<Vertex_P3_C4>{}.swap(m_sceneVertices);
+            std::vector<Vertex_P3_C4>{}.swap(m_sceneFillVertices);
+            std::vector<Vertex_P3_C4>{}.swap(m_scenePointVertices);
+            std::vector<Vertex_P3_C4>{}.swap(m_sceneDynVertices);
+            std::vector<Vertex_P3_C4>{}.swap(m_sceneDynFillVertices);
         }
         else
         {
@@ -4334,9 +4362,9 @@ namespace MiniCAD
            imageCount += c.images.size();
         });
 
-        // 遮罩（wipeout）会裁剪已拼接的顶点，裁剪可能多出少量顶点，预留只是下限
-        m_sceneVertices.reserve(lineCount);
-        m_sceneFillVertices.reserve(fillCount);
+        // 遮罩（wipeout）会裁剪已拼接的顶点，留少量余量让 Batch::ClipLines/ClipFills 原地完成，避免整流翻倍分配
+        m_sceneVertices.reserve(lineCount + lineCount / 64);
+        m_sceneFillVertices.reserve(fillCount + fillCount / 32);
         m_textVertices.reserve(textCount);
         m_glyphInstances.reserve(glyphCount);
         m_sceneImages.reserve(imageCount);
@@ -4645,6 +4673,22 @@ namespace MiniCAD
             std::vector<GlyphInstance>{}.swap(m_glyphSorted);
             std::vector<GlyphBatch>{}.swap(m_glyphBatches);
         }
+        // 临时细分缓冲若曾因大视口/大块撑大，上传完成后一并归还容量
+        constexpr size_t kShrinkLimit = 65536;
+        auto shrinkIfLarge = [](auto& v)
+        {
+            if (v.capacity() > kShrinkLimit)
+            {
+                using V = std::decay_t<decltype(v)>;
+                V{}.swap(v);
+            }
+        };
+        shrinkIfLarge(m_scratchLines);
+        shrinkIfLarge(m_scratchFills);
+        shrinkIfLarge(m_scratchTexts);
+        shrinkIfLarge(m_scratchGlyphs);
+        if (m_sceneDynVertices.empty())     shrinkIfLarge(m_sceneDynVertices);
+        if (m_sceneDynFillVertices.empty()) shrinkIfLarge(m_sceneDynFillVertices);
         m_sceneStreamsReleased = true;
     }
 
