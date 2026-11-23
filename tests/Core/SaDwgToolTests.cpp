@@ -594,10 +594,109 @@ namespace
               "CLI 解析 --version");
         Check(ParseCliArgs({ "--help" }, cmd, code, msg) && cmd.Kind == CommandKind::Help,
               "CLI 解析 --help");
+        Check(ParseCliArgs({ "-h" }, cmd, code, msg) && cmd.Kind == CommandKind::Help,
+              "CLI 解析 -h");
+        Check(ParseCliArgs({ "help" }, cmd, code, msg) && cmd.Kind == CommandKind::Help,
+              "CLI 解析 help");
+        Check(ParseCliArgs({ "export-db", "--help" }, cmd, code, msg)
+                  && cmd.Kind == CommandKind::Help && cmd.HelpTopic == CommandKind::ExportDb,
+              "CLI 解析 export-db --help");
+        Check(ParseCliArgs({ "render", "--help" }, cmd, code, msg)
+                  && cmd.Kind == CommandKind::Help && cmd.HelpTopic == CommandKind::Render,
+              "CLI 解析 render --help");
+        Check(ParseCliArgs({ "render", "-h" }, cmd, code, msg)
+                  && cmd.Kind == CommandKind::Help && cmd.HelpTopic == CommandKind::Render,
+              "CLI 解析 render -h");
+        Check(ParseCliArgs({ "diff", "--help" }, cmd, code, msg)
+                  && cmd.Kind == CommandKind::Help && cmd.HelpTopic == CommandKind::Diff,
+              "CLI 解析 diff --help");
+        Check(ParseCliArgs({ "diff", "-h" }, cmd, code, msg)
+                  && cmd.Kind == CommandKind::Help && cmd.HelpTopic == CommandKind::Diff,
+              "CLI 解析 diff -h");
+        Check(ParseCliArgs({ "diff", "a.dwg", "--help" }, cmd, code, msg)
+                  && cmd.Kind == CommandKind::Help && cmd.HelpTopic == CommandKind::Diff,
+              "CLI 解析 diff <arg> --help");
+        Check(ParseCliArgs({ "help", "diff" }, cmd, code, msg)
+                  && cmd.Kind == CommandKind::Help && cmd.HelpTopic == CommandKind::Diff,
+              "CLI 解析 help diff");
+
+        const std::string usage = BuildUsageText();
+        Check(usage.find("export-db") != std::string::npos
+                  && usage.find("render") != std::string::npos
+                  && usage.find("diff") != std::string::npos
+                  && usage.find("--out-png") != std::string::npos
+                  && usage.find("xmin,ymin,xmax,ymax") != std::string::npos,
+              "CLI 总览帮助包含子命令、关键选项与逗号 bbox 说明");
+
+        const std::string exportHelp = BuildUsageText(CommandKind::ExportDb);
+        Check(exportHelp.find("--reuse-if-fresh") != std::string::npos
+                  && exportHelp.find("--force") != std::string::npos
+                  && exportHelp.find("--no-block-entities") != std::string::npos,
+              "export-db 子命令帮助包含完整选项");
+
+        const std::string renderHelp = BuildUsageText(CommandKind::Render);
+        Check(renderHelp.find("--compare") != std::string::npos
+                  && renderHelp.find("--layout") != std::string::npos
+                  && renderHelp.find("xmin,ymin,xmax,ymax") != std::string::npos
+                  && renderHelp.find("--max-px") != std::string::npos,
+              "render 子命令帮助包含完整选项与逗号 bbox 说明");
+
+        const std::string diffHelp = BuildUsageText(CommandKind::Diff);
+        Check(diffHelp.find("--out-png") != std::string::npos
+                  && diffHelp.find("--out-json") != std::string::npos
+                  && diffHelp.find("--out-db") != std::string::npos
+                  && diffHelp.find("--tolerance-mm") != std::string::npos
+                  && diffHelp.find("--min-region-mm") != std::string::npos
+                  && diffHelp.find("--region-gap-mm") != std::string::npos
+                  && diffHelp.find("xmin,ymin,xmax,ymax") != std::string::npos,
+              "diff 子命令帮助包含完整输出/尺度/bbox 选项");
+
+        Check(ParseCliArgs({ "diff", "a.dwg", "b.dwg", "--layout", "布局1" }, cmd, code, msg)
+                  && !cmd.Diff.MmPerPxExplicit && !cmd.Diff.ToleranceMmExplicit
+                  && !cmd.Diff.MinRegionMmExplicit && !cmd.Diff.RegionGapMmExplicit,
+              "CLI diff 未显式传入尺度参数时 Explicit 标记均为 false");
+        Check(ParseCliArgs({ "diff", "a.dwg", "b.dwg",
+                             "--mm-per-px", "2.5", "--tolerance", "4.0",
+                             "--min-region-mm", "6.0", "--region-gap-mm", "12.0" },
+                           cmd, code, msg)
+                  && cmd.Diff.MmPerPxExplicit && Near(cmd.Diff.MmPerPx, 2.5)
+                  && cmd.Diff.ToleranceMmExplicit && Near(cmd.Diff.ToleranceMm, 4.0)
+                  && cmd.Diff.MinRegionMmExplicit && Near(cmd.Diff.MinRegionMm, 6.0)
+                  && cmd.Diff.RegionGapMmExplicit && Near(cmd.Diff.RegionGapMm, 12.0),
+              "CLI diff 显式传入 4 个尺度参数（含 --tolerance 别名）均记录 Explicit=true");
+
         Check(!ParseCliArgs({}, cmd, code, msg),
               "CLI 空参数返回失败");
         Check(!ParseCliArgs({ "render", "a.dwg", "o.png", "--bbox", "10", "0", "5", "20" }, cmd, code, msg),
               "CLI 拒绝非法 bbox (xmax <= xmin)");
+        Check(ParseCliArgs({ "render", "a.dwg", "o.png", "--bbox", "-10.5,-20.25,100.5,200.75" }, cmd, code, msg)
+                  && cmd.Render.HasBbox
+                  && Near(cmd.Render.Bbox[0], -10.5) && Near(cmd.Render.Bbox[1], -20.25)
+                  && Near(cmd.Render.Bbox[2], 100.5) && Near(cmd.Render.Bbox[3], 200.75),
+              "CLI render 解析逗号分隔 --bbox");
+        Check(ParseCliArgs({ "render", "a.dwg", "o.png", "--bbox", "10", "20", "100", "200" }, cmd, code, msg)
+                  && cmd.Render.HasBbox
+                  && Near(cmd.Render.Bbox[0], 10.0) && Near(cmd.Render.Bbox[1], 20.0)
+                  && Near(cmd.Render.Bbox[2], 100.0) && Near(cmd.Render.Bbox[3], 200.0),
+              "CLI render 保持兼容空格分隔 --bbox");
+        Check(ParseCliArgs({ "diff", "a.dwg", "b.dwg", "--bbox", "100,200,500,600" }, cmd, code, msg)
+                  && cmd.Diff.HasBbox
+                  && Near(cmd.Diff.Bbox[0], 100.0) && Near(cmd.Diff.Bbox[1], 200.0)
+                  && Near(cmd.Diff.Bbox[2], 500.0) && Near(cmd.Diff.Bbox[3], 600.0),
+              "CLI diff 解析逗号分隔 --bbox");
+        Check(ParseCliArgs({ "diff", "a.dwg", "b.dwg", "--bbox", "100, 200, 500, 600" }, cmd, code, msg)
+                  && cmd.Diff.HasBbox && Near(cmd.Diff.Bbox[0], 100.0) && Near(cmd.Diff.Bbox[3], 600.0),
+              "CLI diff 解析带空格的逗号分隔 --bbox");
+        Check(!ParseCliArgs({ "render", "a.dwg", "o.png", "--bbox", "10,20,30" }, cmd, code, msg),
+              "CLI 拒绝少于 4 项的逗号 --bbox");
+        Check(!ParseCliArgs({ "render", "a.dwg", "o.png", "--bbox", "10,20,30,40,50" }, cmd, code, msg),
+              "CLI 拒绝多于 4 项的逗号 --bbox");
+        Check(!ParseCliArgs({ "render", "a.dwg", "o.png", "--bbox", "10,20,30," }, cmd, code, msg),
+              "CLI 拒绝尾逗号非法 --bbox");
+        Check(!ParseCliArgs({ "diff", "a.dwg", "b.dwg", "--bbox", "100,0,50,200" }, cmd, code, msg),
+              "CLI 拒绝逗号 --bbox (xmax <= xmin)");
+        Check(!ParseCliArgs({ "diff", "a.dwg", "b.dwg", "--bbox", "10,abc,30,40" }, cmd, code, msg),
+              "CLI 拒绝非数字逗号 --bbox");
         Check(!ParseCliArgs({ "render", "a.dwg", "o.png", "--max-px", "99999" }, cmd, code, msg),
               "CLI 拒绝超硬顶 --max-px");
         Check(ParseCliArgs({ "diff", "a.dwg", "b.dwg", "--auto-align", "--out-png", "d.png", "--out-db", "d.sqlite" },
@@ -921,6 +1020,137 @@ namespace
                   && Near(lrep.Alignment.Dy, -1200.0, 2.0),
               "次选轨 layer_lines 精确恢复偏移 (dx=+2500, dy=-1200)");
     }
+
+    // 构造带纸张空间小尺寸几何变化（15mm x 10mm）的 A3 图纸，验证纸张布局 diff 自动尺度适配
+    bool BuildPaperSpaceSampleDwg(const std::string& utf8Path, bool modifiedVersion)
+    {
+        CadDatabase db;
+        db.SetVersion(CadVersion::AC1027);
+        db.CreateDefaults();
+        db.Header.InsUnits = UnitsType::Millimeters;
+
+        auto addLine = [&](BlockRecord* blk, double x0, double y0, double x1, double y1) {
+            auto l = std::make_unique<Line>();
+            l->StartPoint = { x0, y0, 0 };
+            l->EndPoint   = { x1, y1, 0 };
+            db.AddEntity(blk, std::move(l));
+        };
+
+        // 模型空间：10000 x 8000 mm 建筑外框（用于验证 Model 空间仍保持 20/30/800/1200 默认值）
+        addLine(db.ModelSpace(), 0, 0, 10000, 0);
+        addLine(db.ModelSpace(), 10000, 0, 10000, 8000);
+        addLine(db.ModelSpace(), 10000, 8000, 0, 8000);
+        addLine(db.ModelSpace(), 0, 8000, 0, 0);
+        if (modifiedVersion)
+        {
+            addLine(db.ModelSpace(), 2000, 2000, 4000, 2000);
+            addLine(db.ModelSpace(), 4000, 2000, 4000, 3500);
+        }
+
+        // 纸张空间：A3 图框 420 x 297 mm + 内部基准线 + B 侧新增 15mm x 10mm 小尺寸变更
+        if (BlockRecord* ps = db.PaperSpace())
+        {
+            addLine(ps, 0, 0, 420, 0);
+            addLine(ps, 420, 0, 420, 297);
+            addLine(ps, 420, 297, 0, 297);
+            addLine(ps, 0, 297, 0, 0);
+            addLine(ps, 20, 20, 400, 20);
+            addLine(ps, 20, 277, 400, 277);
+
+            auto txt = std::make_unique<MiniDWG::TextEntity>();
+            txt->InsertPoint = { 300, 40, 0 };
+            txt->Height      = 5.0;
+            txt->Value       = modifiedVersion ? "3.200" : "4.200";
+            db.AddEntity(ps, std::move(txt));
+
+            if (modifiedVersion)
+            {
+                // 15mm x 10mm 纸张图面变化：模型默认 tolerance=30 / min_region=800 会全吞成 0，
+                // 纸张自动默认 mm_per_px=1 / tolerance=1 / min_region=2 / region_gap=8 应准确检出
+                addLine(ps, 120, 100, 135, 100);
+                addLine(ps, 135, 100, 135, 110);
+                addLine(ps, 135, 110, 120, 110);
+                addLine(ps, 120, 110, 120, 100);
+            }
+        }
+
+        DwgWriteOptions opt;
+        opt.Version = CadVersion::AC1027;
+        const auto bytes = WriteDwg(db, opt);
+        return !bytes.empty() && WriteBytesToUtf8Path(utf8Path, bytes);
+    }
+
+    void TestPaperSpaceDiffDefaults(const std::string& workDir)
+    {
+        const std::string dwgA = workDir + "/paper_a.dwg";
+        const std::string dwgB = workDir + "/paper_b.dwg";
+        Check(BuildPaperSpaceSampleDwg(dwgA, false), "生成纸张空间样图 A");
+        Check(BuildPaperSpaceSampleDwg(dwgB, true), "生成含 15x10mm 小尺寸变更的纸张空间样图 B");
+
+        // 1. 纸张空间不传尺度参数：自动切到 1.0 / 1.0 / 2.0 / 8.0 并检出几何与文字变化
+        ParsedCommand parsedPaper;
+        std::string code, msg;
+        Check(ParseCliArgs({ "diff", dwgA, dwgB, "--layout", "index:1" }, parsedPaper, code, msg),
+              "CLI 解析纸张布局 diff 默认参数");
+#ifdef MINICAD_TEST_FONTS_DIR
+        parsedPaper.Diff.FontsDir = MINICAD_TEST_FONTS_DIR;
+#endif
+        DiffReport paperRep;
+        bool usageErr = false;
+        Check(RunDiffCommand(parsedPaper.Diff, paperRep, &code, &msg, &usageErr),
+              "纸张布局默认尺度 diff 执行成功");
+        Check(Near(paperRep.MmPerPx, 1.0, 0.05)
+                  && Near(paperRep.ToleranceMm, 1.0)
+                  && Near(paperRep.MinRegionMm, 2.0)
+                  && Near(paperRep.RegionGapMm, 8.0),
+              "纸张布局自动切换默认尺度 mm_per_px=1 / tolerance_mm=1 / min_region_mm=2 / region_gap_mm=8");
+        Check(paperRep.Regions.size() >= 1 && paperRep.BOnlyPixels > 0,
+              "纸张布局默认尺度自动检出 15x10mm 小尺寸几何变化 (regions.count >= 1)");
+        Check(paperRep.TextModifiedCount >= 1,
+              "纸张布局检出文字改字 (4.200 -> 3.200)");
+
+        const std::string paperJson = FormatDiffReportJson(paperRep, false, false);
+        Check(paperJson.find("\"mm_per_px\":1") != std::string::npos
+                  && paperJson.find("\"tolerance_mm\":1") != std::string::npos
+                  && paperJson.find("\"min_region_mm\":2") != std::string::npos
+                  && paperJson.find("\"region_gap_mm\":8") != std::string::npos,
+              "纸张布局 diff 报告 JSON 准确反映生效后的实际尺度参数");
+
+        // 2. 纸张空间显式覆盖部分参数：仅被显式传入的参数按用户值，其余保持纸张默认
+        ParsedCommand parsedOverride;
+        Check(ParseCliArgs({ "diff", dwgA, dwgB, "--layout", "index:1",
+                             "--tolerance-mm", "30.0", "--min-region-mm", "50.0" },
+                           parsedOverride, code, msg),
+              "CLI 解析纸张布局显式覆盖容差与最小区域参数");
+#ifdef MINICAD_TEST_FONTS_DIR
+        parsedOverride.Diff.FontsDir = MINICAD_TEST_FONTS_DIR;
+#endif
+        DiffReport overRep;
+        Check(RunDiffCommand(parsedOverride.Diff, overRep, &code, &msg, &usageErr),
+              "纸张布局显式覆盖参数 diff 执行成功");
+        Check(Near(overRep.MmPerPx, 1.0, 0.05)
+                  && Near(overRep.ToleranceMm, 30.0)
+                  && Near(overRep.MinRegionMm, 50.0)
+                  && Near(overRep.RegionGapMm, 8.0)
+                  && overRep.Regions.empty(),
+              "纸张布局显式参数生效且未覆盖项保持纸张默认");
+
+        // 3. 模型空间默认参数保持 20 / 30 / 800 / 1200 不变
+        ParsedCommand parsedModel;
+        Check(ParseCliArgs({ "diff", dwgA, dwgB }, parsedModel, code, msg),
+              "CLI 解析模型空间 diff 默认参数");
+#ifdef MINICAD_TEST_FONTS_DIR
+        parsedModel.Diff.FontsDir = MINICAD_TEST_FONTS_DIR;
+#endif
+        DiffReport modelRep;
+        Check(RunDiffCommand(parsedModel.Diff, modelRep, &code, &msg, &usageErr),
+              "模型空间默认参数 diff 执行成功");
+        Check(Near(modelRep.MmPerPx, 20.0, 0.05)
+                  && Near(modelRep.ToleranceMm, 30.0)
+                  && Near(modelRep.MinRegionMm, 800.0)
+                  && Near(modelRep.RegionGapMm, 1200.0),
+              "模型空间保持原有默认尺度 20 / 30 / 800 / 1200 不变");
+    }
 }
 
 int main(int argc, char** argv)
@@ -947,6 +1177,7 @@ int main(int argc, char** argv)
     TestExportDbAndReuse(workDir);
     TestTianzhengExportAndDiff(workDir);
     TestRenderAndLayerAutoAlign(workDir);
+    TestPaperSpaceDiffDefaults(workDir);
 
     fs::remove_all(tmpRoot, ec);
 

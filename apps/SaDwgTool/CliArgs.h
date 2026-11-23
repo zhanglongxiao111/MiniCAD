@@ -73,12 +73,16 @@ namespace MiniCAD::SaTool
         std::string AlignLayersB;
         double      AlignTolMm      = 5.0;
         double      AlignMinSpanMm  = 5000.0;
-        double      MmPerPx         = 20.0;
-        int         MaxPx           = 4096;
-        double      ToleranceMm     = 30.0;
-        double      MinRegionMm     = 800.0;
-        double      RegionGapMm     = 1200.0;
-        double      MaxRegionMm     = 15000.0;
+        double      MmPerPx             = 20.0;
+        bool        MmPerPxExplicit     = false;
+        int         MaxPx               = 4096;
+        double      ToleranceMm         = 30.0;
+        bool        ToleranceMmExplicit = false;
+        double      MinRegionMm         = 800.0;
+        bool        MinRegionMmExplicit = false;
+        double      RegionGapMm         = 1200.0;
+        bool        RegionGapMmExplicit = false;
+        double      MaxRegionMm         = 15000.0;
         std::string IncludeLayersRegex;
         std::string ExcludeLayersRegex;
         bool        IncludeAnnotations = false;
@@ -93,7 +97,8 @@ namespace MiniCAD::SaTool
 
     struct ParsedCommand
     {
-        CommandKind     Kind = CommandKind::None;
+        CommandKind     Kind      = CommandKind::None;
+        CommandKind     HelpTopic = CommandKind::None; // None = 总览，否则对应子命令详细帮助
         ExportDbOptions ExportDb;
         RenderOptions   Render;
         DiffOptions     Diff;
@@ -105,5 +110,5 @@ namespace MiniCAD::SaTool
     bool ParseCliArgs(const std::vector<std::string>& args, ParsedCommand& out,
                       std::string& errorCode, std::string& errorMsg);
 
-    std::string BuildUsageText();
+    std::string BuildUsageText(CommandKind topic = CommandKind::None);
 }

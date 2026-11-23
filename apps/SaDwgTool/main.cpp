@@ -73,7 +73,7 @@ namespace
             }
             case CommandKind::Help:
             {
-                WriteStdoutLine(BuildUsageText());
+                WriteStdoutLine(BuildUsageText(cmd.HelpTopic));
                 return 0;
             }
             case CommandKind::ExportDb:

@@ -2143,6 +2143,13 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
         const std::string layNameA = layA.Model ? "Model" : layA.Name;
         const std::string layNameB = layB.Model ? "Model" : layB.Name;
 
+        // 纸张空间（布局）未显式传尺度参数时，自动切换为纸张毫米默认值，避免模型空间 30mm 容差 / 800mm 区域阈值吞没小尺寸变化
+        const bool   isPaperSpace       = !layA.Model;
+        const double effectiveMmPerPx     = (isPaperSpace && !opts.MmPerPxExplicit)     ? 1.0 : opts.MmPerPx;
+        const double effectiveToleranceMm = (isPaperSpace && !opts.ToleranceMmExplicit) ? 1.0 : opts.ToleranceMm;
+        const double effectiveMinRegionMm = (isPaperSpace && !opts.MinRegionMmExplicit) ? 2.0 : opts.MinRegionMm;
+        const double effectiveRegionGapMm = (isPaperSpace && !opts.RegionGapMmExplicit) ? 8.0 : opts.RegionGapMm;
+
         std::array<double, 4> cropInA{};
         if (opts.HasBbox)
         {
@@ -2191,7 +2198,7 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
         const double dy = align.Dy;
 
         CanvasLayout canvasA;
-        if (!ComputeCanvasLayout(cropInA, opts.MmPerPx, opts.MaxPx, kHardMaxTotalPx, canvasA, &err))
+        if (!ComputeCanvasLayout(cropInA, effectiveMmPerPx, opts.MaxPx, kHardMaxTotalPx, canvasA, &err))
             return fail("INVALID_CANVAS", err, true);
         if (canvasA.Clamped)
         {
@@ -2229,7 +2236,7 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
         const uint64_t inkA = RasterizeSceneMask(tessA, canvasA, 1.0f, maskA);
         const uint64_t inkB = RasterizeSceneMask(tessB, canvasB, 1.0f, maskB);
 
-        const int tolerancePx = std::max(1, static_cast<int>(std::ceil(opts.ToleranceMm / canvasA.MmPerPx)));
+        const int tolerancePx = std::max(1, static_cast<int>(std::ceil(effectiveToleranceMm / canvasA.MmPerPx)));
         std::vector<uint8_t> dilA, dilB;
         DilateMaskSeparable(maskA, canvasA.WidthPx, canvasA.HeightPx, tolerancePx, dilA);
         DilateMaskSeparable(maskB, canvasA.WidthPx, canvasA.HeightPx, tolerancePx, dilB);
@@ -2255,7 +2262,7 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
         report.Alignment           = align;
         report.MmPerPx             = canvasA.MmPerPx;
         report.Clamped             = canvasA.Clamped;
-        report.ToleranceMm         = opts.ToleranceMm;
+        report.ToleranceMm         = effectiveToleranceMm;
         report.TolerancePx         = tolerancePx;
         report.WidthPx             = canvasA.WidthPx;
         report.HeightPx            = canvasA.HeightPx;
@@ -2292,11 +2299,11 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
         report.BOnlyRatio      = unionCnt > 0 ? static_cast<double>(bOnlyCnt) / static_cast<double>(unionCnt) : 0.0;
         report.InkBalanceRatio = static_cast<double>(inkA) / static_cast<double>(std::max<uint64_t>(inkB, 1u));
 
-        report.MinRegionMm = opts.MinRegionMm;
-        report.RegionGapMm = opts.RegionGapMm;
+        report.MinRegionMm = effectiveMinRegionMm;
+        report.RegionGapMm = effectiveRegionGapMm;
         report.MaxRegionMm = opts.MaxRegionMm;
         report.Regions     = ExtractDiffRegions(aOnly, bOnly, canvasA,
-                                                opts.MinRegionMm, opts.RegionGapMm, opts.MaxRegionMm);
+                                                effectiveMinRegionMm, effectiveRegionGapMm, opts.MaxRegionMm);
 
         // 轨 2：独立文字与属性比对（不受轨 1 排除注记影响）
         report.TextMatchTolMm = opts.TextMatchTolMm;
@@ -2310,7 +2317,7 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
                          snapB, spaceB, layNameB,
                          cropInA, dx, dy, opts.TchMatchTolMm, report.Regions, report);
 
-        report.CoverageNote = "在已覆盖范围与 ±" + JsonDouble(opts.ToleranceMm, 1)
+        report.CoverageNote = "在已覆盖范围与 ±" + JsonDouble(effectiveToleranceMm, 1)
                             + "mm 容差内检出差异；未纳入比较项见 annotations_included、include_layers、frames_excluded 及 undecoded_proxies / unresolved_xrefs。";
 
         // 输出三态差异叠加 PNG
