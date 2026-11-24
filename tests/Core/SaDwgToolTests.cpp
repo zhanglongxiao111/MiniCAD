@@ -4,14 +4,22 @@
 #include "CliArgs.h"
 #include "CpuRasterizer.h"
 #include "DiffEngine.h"
+#include "PathGuard.h"
 #include "PngWriter.h"
 #include "SceneTessellator.h"
 #include "SqliteExporter.h"
 #include "TchCipherWriter.h"
+#include "Core/Entity/BlockEntity.hpp"
+#include "Core/Entity/DimensionEntity.hpp"
+#include "Core/Entity/HatchEntity.hpp"
+#include "Core/Entity/InsertEntity.hpp"
+#include "Core/Entity/LineEntity.hpp"
+#include "Core/Entity/WipeoutEntity.hpp"
 #include "Core/Log.h"
 #include "Core/PathUtils.h"
 #include "Dwg/Write/DwgBitWriter.h"
 #include "Dwg/Write/DwgWriter.h"
+#include "Import/CadExchange.h"
 #include "sqlite3.h"
 
 #include <algorithm>
@@ -34,6 +42,12 @@ using TchTest::CipherWriter;
 namespace
 {
     int g_failed = 0;
+
+    std::string PathToUtf8(const fs::path& p)
+    {
+        const auto u8 = p.u8string();
+        return std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
+    }
 
     void Check(bool ok, const char* label)
     {
@@ -1151,36 +1165,1052 @@ namespace
                   && Near(modelRep.RegionGapMm, 1200.0),
               "模型空间保持原有默认尺度 20 / 30 / 800 / 1200 不变");
     }
-}
 
-int main(int argc, char** argv)
-{
-    LOG_SET_LEVEL(MiniCAD::LogLevel::Error);
-
-    // 可选导出真实天正合成样图到指定目录，供 Release SaDwgTool.exe CLI 端到端实测
-    if (argc >= 3 && std::string(argv[1]) == "--emit-tch-fixtures")
+    // ── CAD-14：Wipeout 保留遮罩语义 + 超长虚线按绘制序裁剪与相位保持 ─────────
+    void TestWipeoutAndLongDashDrawOrder(const std::string& workDir)
     {
-        const std::string outDir = argv[2];
-        const bool okA = BuildTianzhengSampleDwg(outDir + "/tch_before.dwg", 0.0, 0.0, false);
-        const bool okB = BuildTianzhengSampleDwg(outDir + "/tch_after.dwg", -1500.0, 800.0, true);
-        std::printf("emit tch fixtures: %s\n", (okA && okB) ? "OK" : "FAIL");
-        return (okA && okB) ? 0 : 1;
+        // 1. 细分管线直测：超过 200 周期的长虚线（6000mm / 20mm = 300 周期）先后跨过 Wipeout
+        {
+            MiniCAD::Scene scene;
+            MiniCAD::LineTypeRecord dashRec;
+            dashRec.Name          = "TEST_DASH_20";
+            dashRec.Pattern       = { 10.0, -10.0 };
+            dashRec.PatternLength = 20.0;
+            const MiniCAD::LineTypeID ltId = scene.GetLineTypeTable().AddOrReplace(dashRec);
+
+            // 绘制序 1：在 Wipeout 之前的超长虚线 y = 0, x in [0, 6000]
+            {
+                auto ln = std::make_unique<MiniCAD::LineEntity>(
+                    scene.NextObjectID(), MiniCAD::Math::Point3{ 0.0, 0.0, 0.0 },
+                    MiniCAD::Math::Point3{ 6000.0, 0.0, 0.0 });
+                ln->GetAttr().LineType      = ltId;
+                ln->GetAttr().LinetypeScale = 1.0;
+                scene.AddEntity(std::move(ln));
+            }
+            // 绘制序 2：无边框 Wipeout 遮罩 [2000..4000, -500..500]
+            {
+                auto wo = std::make_unique<MiniCAD::WipeoutEntity>(
+                    scene.NextObjectID(),
+                    std::vector<MiniCAD::Math::Point3>{
+                        { 2000.0, -500.0, 0.0 },
+                        { 4000.0, -500.0, 0.0 },
+                        { 4000.0,  500.0, 0.0 },
+                        { 2000.0,  500.0, 0.0 }
+                    });
+                wo->SetShowFrame(false);
+                scene.AddEntity(std::move(wo));
+            }
+            // 绘制序 3：在 Wipeout 之后的超长虚线 y = 100, x in [0, 6000]
+            {
+                auto ln = std::make_unique<MiniCAD::LineEntity>(
+                    scene.NextObjectID(), MiniCAD::Math::Point3{ 0.0, 100.0, 0.0 },
+                    MiniCAD::Math::Point3{ 6000.0, 100.0, 0.0 });
+                ln->GetAttr().LineType      = ltId;
+                ln->GetAttr().LinetypeScale = 1.0;
+                scene.AddEntity(std::move(ln));
+            }
+
+            MiniCAD::FontSystem fontSystem;
+#ifdef MINICAD_TEST_FONTS_DIR
+            InitHeadlessFontSystem(fontSystem, MINICAD_TEST_FONTS_DIR, false);
+#else
+            InitHeadlessFontSystem(fontSystem);
+#endif
+            TessellateFilter filter;
+            filter.ExcludeAnnotations = true; // 默认注记过滤必须保留 Wipeout
+            TessellatedScene tess;
+            std::string err;
+            const std::array<double, 4> bbox{ -100.0, -600.0, 6100.0, 600.0 };
+            Check(TessellateSceneLayout(scene, 0, bbox, /*worldPerPixel*/ 2.0, /*vpH*/ 600.0,
+                                        filter, fontSystem, tess, &err),
+                  "CAD-14: 超长虚线与 Wipeout 细分成功");
+            Check(tess.Stats.EntitiesRendered == 3 && tess.Stats.EntitiesFiltered == 0,
+                  "CAD-14: 默认注记过滤不删除 Wipeout 实体");
+
+            int beforeLeft = 0, beforeInside = 0, beforeRight = 0, afterInside = 0;
+            bool phaseOk = true;
+            for (size_t i = 0; i + 1 < tess.Lines.size(); i += 2)
+            {
+                const double x0 = tess.Lines[i].pos.x + tess.RenderOrigin.x;
+                const double y0 = tess.Lines[i].pos.y + tess.RenderOrigin.y;
+                const double x1 = tess.Lines[i + 1].pos.x + tess.RenderOrigin.x;
+                const double y1 = tess.Lines[i + 1].pos.y + tess.RenderOrigin.y;
+                const double lo = std::min(x0, x1);
+                const double hi = std::max(x0, x1);
+                if (std::abs(y0) < 1.0 && std::abs(y1) < 1.0)
+                {
+                    if (hi > 2000.5 && lo < 3999.5) ++beforeInside;
+                    if (hi <= 2000.5) ++beforeLeft;
+                    if (lo >= 3999.5)
+                    {
+                        ++beforeRight;
+                        // 相位校验：周期 20mm，实线段必落在 [20k, 20k+10]
+                        const double modLo = std::fmod(lo, 20.0);
+                        const double modHi = std::fmod(hi, 20.0);
+                        if (std::abs(modLo) > 0.25 && std::abs(modLo - 20.0) > 0.25) phaseOk = false;
+                        if (std::abs(modHi - 10.0) > 0.25) phaseOk = false;
+                    }
+                }
+                else if (std::abs(y0 - 100.0) < 1.0 && std::abs(y1 - 100.0) < 1.0)
+                {
+                    if (lo >= 2000.0 && hi <= 4000.0) ++afterInside;
+                }
+            }
+            Check(beforeLeft >= 90 && beforeRight >= 90 && beforeInside == 0,
+                  "CAD-14: 先于 Wipeout 的超长虚线在遮罩区内被完全裁剪且两侧正常展开");
+            Check(phaseOk,
+                  "CAD-14: 超长虚线跨过 Wipeout 后右侧实线段相位严格保持");
+            Check(afterInside >= 90,
+                  "CAD-14: 晚于 Wipeout 的超长虚线按绘制顺序不受先前 Wipeout 遮挡");
+        }
+
+        // 2. 端到端 diff 校验：默认 ExcludeAnnotations=true 下，Wipeout 遮挡后方差异线不误报
+        auto buildWipeoutDwg = [](const std::string& path, bool altHiddenLine) -> bool {
+            MiniCAD::Scene s;
+            // 外框 [0..4000, 0..3000]
+            s.AddEntity(std::make_unique<MiniCAD::LineEntity>(s.NextObjectID(), MiniCAD::Math::Point3{ 0, 0, 0 }, MiniCAD::Math::Point3{ 4000, 0, 0 }));
+            s.AddEntity(std::make_unique<MiniCAD::LineEntity>(s.NextObjectID(), MiniCAD::Math::Point3{ 4000, 0, 0 }, MiniCAD::Math::Point3{ 4000, 3000, 0 }));
+            s.AddEntity(std::make_unique<MiniCAD::LineEntity>(s.NextObjectID(), MiniCAD::Math::Point3{ 4000, 3000, 0 }, MiniCAD::Math::Point3{ 0, 3000, 0 }));
+            s.AddEntity(std::make_unique<MiniCAD::LineEntity>(s.NextObjectID(), MiniCAD::Math::Point3{ 0, 3000, 0 }, MiniCAD::Math::Point3{ 0, 0, 0 }));
+            // 被 Wipeout 完全遮挡的线（A/B 位置不同）
+            if (!altHiddenLine)
+                s.AddEntity(std::make_unique<MiniCAD::LineEntity>(s.NextObjectID(), MiniCAD::Math::Point3{ 1200, 1500, 0 }, MiniCAD::Math::Point3{ 2800, 1500, 0 }));
+            else
+                s.AddEntity(std::make_unique<MiniCAD::LineEntity>(s.NextObjectID(), MiniCAD::Math::Point3{ 1200, 1200, 0 }, MiniCAD::Math::Point3{ 2800, 1800, 0 }));
+            // 覆盖 [1000..3000, 1000..2000] 的 Wipeout
+            auto wo = std::make_unique<MiniCAD::WipeoutEntity>(
+                s.NextObjectID(),
+                std::vector<MiniCAD::Math::Point3>{
+                    { 1000, 1000, 0 }, { 3000, 1000, 0 }, { 3000, 2000, 0 }, { 1000, 2000, 0 }
+                });
+            wo->SetShowFrame(false);
+            s.AddEntity(std::move(wo));
+            const auto bytes = MiniCAD::ExportCad(s, MiniCAD::CadFileKind::Dwg, MiniCAD::CadSaveVersion::R2018);
+            return !bytes.empty() && WriteBytesToUtf8Path(path, bytes);
+        };
+
+        const std::string woA = workDir + "/wipeout_a.dwg";
+        const std::string woB = workDir + "/wipeout_b.dwg";
+        Check(buildWipeoutDwg(woA, false) && buildWipeoutDwg(woB, true), "CAD-14: 生成含 Wipeout 遮罩的比对 DWG");
+        DiffOptions dop;
+        dop.InputPathA          = woA;
+        dop.InputPathB          = woB;
+        dop.IncludeAnnotations  = false;
+        dop.MmPerPx             = 10.0;
+        dop.MmPerPxExplicit     = true;
+        dop.ToleranceMm         = 0.0;
+        dop.ToleranceMmExplicit = true;
+#ifdef MINICAD_TEST_FONTS_DIR
+        dop.FontsDir            = MINICAD_TEST_FONTS_DIR;
+#endif
+        DiffReport rep;
+        std::string code, msg;
+        bool usageErr = false;
+        Check(RunDiffCommand(dop, rep, &code, &msg, &usageErr), "CAD-14: 默认注记过滤下 Wipeout diff 执行成功");
+        Check(rep.AOnlyPixels == 0 && rep.BOnlyPixels == 0,
+              "CAD-14: 默认注记过滤保留 Wipeout 遮挡语义，被遮挡差异不产生误报");
     }
 
-    const fs::path tmpRoot = fs::temp_directory_path()
-        / ("sadwgtool_tests_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    std::error_code ec;
-    fs::create_directories(tmpRoot, ec);
-    const std::string workDir = tmpRoot.string();
+    // ── CAD-15：默认整图窗口取 A/B 并集 + 旧图空布局可正常检出新增 ───────────────
+    void TestUnionDefaultBboxAndEmptySide(const std::string& workDir)
+    {
+        auto writeBoxDwg = [](const std::string& path, bool hasBoxA, bool hasFarBoxB, const char* extraText) -> bool {
+            CadDatabase db;
+            db.SetVersion(CadVersion::AC1027);
+            db.CreateDefaults();
+            db.Header.InsUnits = UnitsType::Millimeters;
+            auto addRect = [&](double x0, double y0, double x1, double y1) {
+                auto addL = [&](double ax, double ay, double bx, double by) {
+                    auto l = std::make_unique<Line>();
+                    l->StartPoint = { ax, ay, 0 };
+                    l->EndPoint   = { bx, by, 0 };
+                    db.AddEntity(db.ModelSpace(), std::move(l));
+                };
+                addL(x0, y0, x1, y0); addL(x1, y0, x1, y1);
+                addL(x1, y1, x0, y1); addL(x0, y1, x0, y0);
+            };
+            if (hasBoxA)    addRect(0.0, 0.0, 2000.0, 2000.0);
+            if (hasFarBoxB) addRect(6000.0, 0.0, 8000.0, 2000.0);
+            if (extraText && *extraText)
+            {
+                auto t = std::make_unique<MiniDWG::TextEntity>();
+                t->InsertPoint = { 6500.0, 1000.0, 0.0 };
+                t->Height      = 250.0;
+                t->Value       = extraText;
+                db.AddEntity(db.ModelSpace(), std::move(t));
+            }
+            DwgWriteOptions opt;
+            opt.Version = CadVersion::AC1027;
+            const auto bytes = WriteDwg(db, opt);
+            return !bytes.empty() && WriteBytesToUtf8Path(path, bytes);
+        };
 
-    TestCliArgs();
-    TestExportDbAndReuse(workDir);
-    TestTianzhengExportAndDiff(workDir);
-    TestRenderAndLayerAutoAlign(workDir);
-    TestPaperSpaceDiffDefaults(workDir);
+        const std::string boxA   = workDir + "/union_a.dwg";
+        const std::string boxB   = workDir + "/union_b.dwg";
+        const std::string emptyA = workDir + "/empty_a.dwg";
+        const std::string onlyB  = workDir + "/only_b.dwg";
+        Check(writeBoxDwg(boxA, true, false, nullptr)
+                  && writeBoxDwg(boxB, true, true, "右扩新增")
+                  && writeBoxDwg(emptyA, false, false, nullptr)
+                  && writeBoxDwg(onlyB, false, true, "空图新增"),
+              "CAD-15: 生成并集范围与空布局样图");
 
-    fs::remove_all(tmpRoot, ec);
+        // 1. diff 未传 --bbox：窗口自动覆盖 B 外扩图元
+        {
+            DiffOptions dop;
+            dop.InputPathA          = boxA;
+            dop.InputPathB          = boxB;
+            dop.MmPerPx             = 20.0;
+            dop.MmPerPxExplicit     = true;
+            dop.ToleranceMm         = 10.0;
+            dop.ToleranceMmExplicit = true;
+            dop.MinRegionMm         = 200.0;
+            dop.MinRegionMmExplicit = true;
+#ifdef MINICAD_TEST_FONTS_DIR
+            dop.FontsDir            = MINICAD_TEST_FONTS_DIR;
+#endif
+            DiffReport rep;
+            std::string code, msg;
+            bool usageErr = false;
+            Check(RunDiffCommand(dop, rep, &code, &msg, &usageErr), "CAD-15: diff 默认并集窗口执行成功");
+            Check(rep.CropInASpace[2] >= 7999.0 && rep.BOnlyPixels > 0 && rep.Regions.size() >= 1 && rep.TextBOnlyCount >= 1,
+                  "CAD-15: diff 默认整图并集覆盖 B 侧外扩区域并报出新增几何与文字");
+        }
 
-    std::printf("\nSaDwgToolTests 完成：%d 项失败\n", g_failed);
-    return g_failed == 0 ? 0 : 1;
+        // 2. diff 旧图为空、新图有图元：不报错且正确报出新增
+        {
+            DiffOptions dop;
+            dop.InputPathA          = emptyA;
+            dop.InputPathB          = onlyB;
+            dop.MmPerPx             = 20.0;
+            dop.MmPerPxExplicit     = true;
+            dop.ToleranceMm         = 10.0;
+            dop.ToleranceMmExplicit = true;
+            dop.MinRegionMm         = 200.0;
+            dop.MinRegionMmExplicit = true;
+#ifdef MINICAD_TEST_FONTS_DIR
+            dop.FontsDir            = MINICAD_TEST_FONTS_DIR;
+#endif
+            DiffReport rep;
+            std::string code, msg;
+            bool usageErr = false;
+            Check(RunDiffCommand(dop, rep, &code, &msg, &usageErr),
+                  "CAD-15: diff 旧图空布局 + 新图有图元不提前报 EMPTY_LAYOUT");
+            Check(rep.AOnlyPixels == 0 && rep.BOnlyPixels > 0 && rep.Regions.size() >= 1 && rep.TextBOnlyCount >= 1,
+                  "CAD-15: diff 旧图空布局正确检出 B 侧全部新增图元与文字");
+        }
+
+        // 3. render --compare 未传 --bbox：外扩 B 与空布局 A 均成功并取并集
+        {
+            RenderOptions rc;
+            rc.InputPath     = emptyA;
+            rc.ComparePath   = onlyB;
+            rc.OutputPngPath = workDir + "/compare_empty_a.png";
+            rc.MaxPx         = 800;
+#ifdef MINICAD_TEST_FONTS_DIR
+            rc.FontsDir      = MINICAD_TEST_FONTS_DIR;
+#endif
+            RenderResult rr;
+            std::string code, msg;
+            bool usageErr = false;
+            int pw = 0, ph = 0;
+            Check(RunRenderCommand(rc, rr, &code, &msg, &usageErr)
+                      && rr.Bbox[0] <= 6001.0 && rr.Bbox[2] >= 7999.0
+                      && HasPngMagic(rc.OutputPngPath, pw, ph),
+                  "CAD-15: render --compare 在空 A / 非空 B 下自动按并集出图");
+        }
+    }
+
+    // ── CAD-16：纸张布局语义轨覆盖边界透明披露 ──────────────────────────────────
+    void TestPaperLayoutCoverageDisclosure(const std::string& workDir)
+    {
+        const std::string dwgA = workDir + "/paper_vp_a.dwg";
+        const std::string dwgB = workDir + "/paper_vp_b.dwg";
+        Check(BuildGeneralSampleDwg(dwgA, 0.0, 0.0, false)
+                  && BuildGeneralSampleDwg(dwgB, 0.0, 0.0, true),
+              "CAD-16: 生成含浮动视口的纸张布局样图");
+
+        DiffOptions dop;
+        dop.InputPathA = dwgA;
+        dop.InputPathB = dwgB;
+        dop.LayoutName = "index:1";
+        dop.OutDbPath  = workDir + "/paper_vp_diff.sqlite";
+#ifdef MINICAD_TEST_FONTS_DIR
+        dop.FontsDir   = MINICAD_TEST_FONTS_DIR;
+#endif
+        DiffReport rep;
+        std::string code, msg;
+        bool usageErr = false;
+        Check(RunDiffCommand(dop, rep, &code, &msg, &usageErr), "CAD-16: 含浮动视口纸张布局 diff 执行成功");
+        Check(rep.IsPaperSpaceLayout
+                  && rep.PaperViewportCountA >= 1 && rep.PaperViewportCountB >= 1
+                  && rep.PaperViewportSemanticsExcluded
+                  && !rep.CoverageNote.empty(),
+              "CAD-16: 报告明确标记纸张布局含浮动视口且语义轨未采集视口模型对象");
+
+        const std::string json = FormatDiffReportJson(rep, false, false);
+        Check(json.find("\"coverage\":") != std::string::npos
+                  && json.find("\"layout_space\":\"paper\"") != std::string::npos
+                  && json.find("\"text_scope\":\"paper_space_only\"") != std::string::npos
+                  && json.find("\"tch_scope\":\"paper_space_only\"") != std::string::npos
+                  && json.find("\"viewport_model_semantics_included\":false") != std::string::npos,
+              "CAD-16: JSON coverage 元数据完整披露纸张布局语义边界");
+
+        sqlite3* db = nullptr;
+        if (sqlite3_open_v2(dop.OutDbPath.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK)
+        {
+            const std::string textScope = SqlText(db, "SELECT value FROM diff_meta WHERE key='text_scope';");
+            const std::string vpInc     = SqlText(db, "SELECT value FROM diff_meta WHERE key='viewport_model_semantics_included';");
+            Check(textScope == "paper_space_only" && vpInc == "0",
+                  "CAD-16: diff_meta 表同步写入纸张布局语义边界字段");
+            sqlite3_close(db);
+        }
+        else
+        {
+            Check(false, "CAD-16: 打开 paper_vp_diff.sqlite");
+        }
+    }
+
+    // ── CAD-17：--tolerance-mm 0 对应真实 0px 与有效毫米容差输出 ─────────────────
+    void TestZeroToleranceAndEffectiveReporting(const std::string& workDir)
+    {
+        auto writeShiftedLine = [](const std::string& path, double lineX) -> bool {
+            CadDatabase db;
+            db.SetVersion(CadVersion::AC1027);
+            db.CreateDefaults();
+            db.Header.InsUnits = UnitsType::Millimeters;
+            auto addL = [&](double x0, double y0, double x1, double y1) {
+                auto l = std::make_unique<Line>();
+                l->StartPoint = { x0, y0, 0 };
+                l->EndPoint   = { x1, y1, 0 };
+                db.AddEntity(db.ModelSpace(), std::move(l));
+            };
+            // 稳定外框 [0..4000, 0..2000]
+            addL(0, 0, 4000, 0); addL(4000, 0, 4000, 2000);
+            addL(4000, 2000, 0, 2000); addL(0, 2000, 0, 0);
+            // 中间竖线平移 10mm（在 10mm/px 下恰好偏移 1px）
+            addL(lineX, 200, lineX, 1800);
+            DwgWriteOptions opt;
+            opt.Version = CadVersion::AC1027;
+            const auto bytes = WriteDwg(db, opt);
+            return !bytes.empty() && WriteBytesToUtf8Path(path, bytes);
+        };
+
+        const std::string dwgA = workDir + "/tol0_a.dwg";
+        const std::string dwgB = workDir + "/tol0_b.dwg";
+        Check(writeShiftedLine(dwgA, 2000.0) && writeShiftedLine(dwgB, 2010.0),
+              "CAD-17: 生成 10mm 偏移测试 DWG");
+
+        // 1. --tolerance-mm 0 @ 10mm/px -> 真实 0px，检出 1px 偏移
+        {
+            ParsedCommand parsed;
+            std::string code, msg;
+            Check(ParseCliArgs({ "diff", dwgA, dwgB, "--mm-per-px", "10", "--tolerance-mm", "0", "--min-region-mm", "50" },
+                               parsed, code, msg),
+                  "CAD-17: CLI 接受 --tolerance-mm 0");
+#ifdef MINICAD_TEST_FONTS_DIR
+            parsed.Diff.FontsDir = MINICAD_TEST_FONTS_DIR;
+#endif
+            DiffReport rep;
+            bool usageErr = false;
+            Check(RunDiffCommand(parsed.Diff, rep, &code, &msg, &usageErr), "CAD-17: 0 容差 diff 执行成功");
+            Check(rep.TolerancePx == 0 && Near(rep.ToleranceMm, 0.0) && Near(rep.EffectiveToleranceMm, 0.0),
+                  "CAD-17: --tolerance-mm 0 生效为 tolerance_px=0 且 effective_tolerance_mm=0");
+            Check(rep.AOnlyPixels > 0 && rep.BOnlyPixels > 0,
+                  "CAD-17: 0 像素容差精确检出 1 像素（10mm）偏移");
+            const std::string json = FormatDiffReportJson(rep, false, false);
+            Check(json.find("\"tolerance_px\":0") != std::string::npos
+                      && json.find("\"effective_tolerance_mm\":0") != std::string::npos,
+                  "CAD-17: JSON 报告输出 tolerance_px=0 与 effective_tolerance_mm=0");
+        }
+
+        // 2. --tolerance-mm 10 @ 10mm/px -> 1px，吸收 1px 偏移
+        {
+            DiffOptions dop;
+            dop.InputPathA          = dwgA;
+            dop.InputPathB          = dwgB;
+            dop.MmPerPx             = 10.0;
+            dop.MmPerPxExplicit     = true;
+            dop.ToleranceMm         = 10.0;
+            dop.ToleranceMmExplicit = true;
+#ifdef MINICAD_TEST_FONTS_DIR
+            dop.FontsDir            = MINICAD_TEST_FONTS_DIR;
+#endif
+            DiffReport rep;
+            std::string code, msg;
+            bool usageErr = false;
+            Check(RunDiffCommand(dop, rep, &code, &msg, &usageErr)
+                      && rep.TolerancePx == 1 && Near(rep.EffectiveToleranceMm, 10.0)
+                      && rep.AOnlyPixels == 0 && rep.BOnlyPixels == 0,
+                  "CAD-17: 1 像素容差吸收 10mm 偏移并汇报 effective_tolerance_mm=10");
+        }
+
+        // 3. --tolerance-mm 30 @ 20mm/px -> ceil(1.5)=2px -> effective_tolerance_mm=40
+        {
+            DiffOptions dop;
+            dop.InputPathA          = dwgA;
+            dop.InputPathB          = dwgB;
+            dop.MmPerPx             = 20.0;
+            dop.MmPerPxExplicit     = true;
+            dop.ToleranceMm         = 30.0;
+            dop.ToleranceMmExplicit = true;
+#ifdef MINICAD_TEST_FONTS_DIR
+            dop.FontsDir            = MINICAD_TEST_FONTS_DIR;
+#endif
+            DiffReport rep;
+            std::string code, msg;
+            bool usageErr = false;
+            Check(RunDiffCommand(dop, rep, &code, &msg, &usageErr)
+                      && rep.TolerancePx == 2 && Near(rep.ToleranceMm, 30.0) && Near(rep.EffectiveToleranceMm, 40.0),
+                  "CAD-17: 30mm@20mm/px 真实生效 2px 并准确报告 effective_tolerance_mm=40");
+        }
+    }
+
+    // ── CAD-18：天正空侧全增/全删 + 墙体高度差分与缺失值区分 ─────────────────────
+    void TestTchEmptySideAndWallHeightDiff(const std::string& workDir)
+    {
+        auto writeTchWallDwg = [](const std::string& path, bool hasWall, double wallHeight, bool includeAxis) -> bool {
+            CadDatabase db;
+            db.SetVersion(CadVersion::AC1027);
+            db.CreateDefaults();
+            db.Header.InsUnits = UnitsType::Millimeters;
+            if (hasWall || includeAxis)
+            {
+                db.Classes.push_back(MakeTchClass("TCH_WALL", "TDbWall", 500));
+                db.Classes.push_back(MakeTchClass("TCH_AXIS_LABEL", "TDbAxisLabel", 501));
+            }
+            if (includeAxis)
+            {
+                db.AddEntity(db.ModelSpace(), MakeTchAxisGroup(0, 9000, 0, 12000, { 4000.0, 0.0 }, { "1", "2" }));
+            }
+            if (hasWall)
+            {
+                db.AddEntity(db.ModelSpace(), MakeTchWall({ 0, 0, 0 }, { 4000, 0, 0 }, 120.0, wallHeight, 0, 40));
+            }
+            DwgWriteOptions opt;
+            opt.Version = CadVersion::AC1027;
+            const auto bytes = WriteDwg(db, opt);
+            return !bytes.empty() && WriteBytesToUtf8Path(path, bytes);
+        };
+
+        const std::string emptyDwg   = workDir + "/tch_empty.dwg";
+        const std::string axisOnly   = workDir + "/tch_axis_only.dwg";
+        const std::string wall2800   = workDir + "/tch_wall_2800.dwg";
+        const std::string wall3200   = workDir + "/tch_wall_3200.dwg";
+        Check(writeTchWallDwg(emptyDwg, false, 0.0, false)
+                  && writeTchWallDwg(axisOnly, false, 0.0, true)
+                  && writeTchWallDwg(wall2800, true, 2800.0, true)
+                  && writeTchWallDwg(wall3200, true, 3200.0, true),
+              "CAD-18: 生成天正墙体与空侧测试 DWG");
+
+        // 1. 两侧均为原生天正，裁剪框内单侧全删（A 有墙、B 裁剪框内无墙）
+        {
+            DiffOptions dop;
+            dop.InputPathA = wall2800;
+            dop.InputPathB = axisOnly;
+            dop.HasBbox    = true;
+            dop.Bbox       = { -500.0, -500.0, 4500.0, 1500.0 };
+#ifdef MINICAD_TEST_FONTS_DIR
+            dop.FontsDir   = MINICAD_TEST_FONTS_DIR;
+#endif
+            DiffReport rep;
+            std::string code, msg;
+            bool usageErr = false;
+            Check(RunDiffCommand(dop, rep, &code, &msg, &usageErr)
+                      && rep.TchAvailable && rep.TchWallCount == 1
+                      && rep.TchChanges.size() == 1 && rep.TchChanges[0].ChangeType == "a_only",
+                  "CAD-18: 裁剪框内单侧全删正常启用天正轨并报出 a_only");
+        }
+
+        // 2. A 完全空白、B 有原生天正墙 -> 启用天正轨并报出 b_only
+        {
+            DiffOptions dop;
+            dop.InputPathA = emptyDwg;
+            dop.InputPathB = wall2800;
+#ifdef MINICAD_TEST_FONTS_DIR
+            dop.FontsDir   = MINICAD_TEST_FONTS_DIR;
+#endif
+            DiffReport rep;
+            std::string code, msg;
+            bool usageErr = false;
+            Check(RunDiffCommand(dop, rep, &code, &msg, &usageErr)
+                      && rep.TchAvailable && rep.TchWallCount == 1
+                      && rep.TchChanges.size() == 1 && rep.TchChanges[0].ChangeType == "b_only",
+                  "CAD-18: 空图对比原生天正图纸正常启用天正轨并报出 b_only");
+        }
+
+        // 3. 墙体高度变化 2800 -> 3200
+        {
+            DiffOptions dop;
+            dop.InputPathA = wall2800;
+            dop.InputPathB = wall3200;
+#ifdef MINICAD_TEST_FONTS_DIR
+            dop.FontsDir   = MINICAD_TEST_FONTS_DIR;
+#endif
+            DiffReport rep;
+            std::string code, msg;
+            bool usageErr = false;
+            Check(RunDiffCommand(dop, rep, &code, &msg, &usageErr)
+                      && rep.TchAvailable && rep.TchWallCount == 1
+                      && rep.TchChanges[0].ChangeType == "modified"
+                      && rep.TchChanges[0].Summary.find("墙高 2800->3200mm") != std::string::npos,
+                  "CAD-18: 天正墙体高度变更 2800->3200mm 被精确检出");
+        }
+
+        // 4. 墙体高度缺失 vs 有值（区分缺失，不误按 0mm）以及双侧均缺失不误报
+        {
+            auto makeWallSnap = [](bool hasHeight, double height) {
+                MiniCAD::CadSemanticSnapshot s;
+                s.TchDecodedCount = 1;
+                MiniCAD::CadSemanticSnapshot::TchWallRecord w;
+                w.Handle         = 0x200;
+                w.DxfName        = "TCH_WALL";
+                w.Layer          = "WALL";
+                w.Space          = "model";
+                w.LayoutName     = "Model";
+                w.StartX = 0.0; w.StartY = 0.0; w.EndX = 4000.0; w.EndY = 0.0;
+                w.LeftWidth = 120.0; w.RightWidth = 120.0; w.TotalThickness = 240.0;
+                w.HasHeight = hasHeight;
+                w.Height    = hasHeight ? height : 0.0;
+                w.Length    = 4000.0;
+                w.MaterialName = "钢筋混凝土";
+                w.MinX = 0.0; w.MinY = -120.0; w.MaxX = 4000.0; w.MaxY = 120.0;
+                s.TchWalls.push_back(w);
+                return s;
+            };
+
+            const auto snapMissing = makeWallSnap(false, 0.0);
+            const auto snap3200    = makeWallSnap(true, 3200.0);
+            const std::array<double, 4> crop{ -500.0, -500.0, 4500.0, 500.0 };
+
+            DiffReport repMissToVal;
+            RunTrack3TchDiff(snapMissing, "model", "Model", snap3200, "model", "Model",
+                             crop, 0.0, 0.0, 300.0, {}, repMissToVal);
+            Check(repMissToVal.TchAvailable && repMissToVal.TchWallCount == 1
+                      && repMissToVal.TchChanges[0].ChangeType == "modified"
+                      && repMissToVal.TchChanges[0].Summary.find("墙高 缺失->3200mm") != std::string::npos
+                      && repMissToVal.TchChanges[0].BeforeJson.find("\"height\":null") != std::string::npos,
+                  "CAD-18: 墙高缺失与真实数值变更明确区分（输出 缺失 与 height:null）");
+
+            DiffReport repBothMiss;
+            RunTrack3TchDiff(snapMissing, "model", "Model", snapMissing, "model", "Model",
+                             crop, 0.0, 0.0, 300.0, {}, repBothMiss);
+            Check(repBothMiss.TchAvailable && repBothMiss.TchWallCount == 0 && repBothMiss.TchChanges.empty(),
+                  "CAD-18: 双侧墙高均缺失时不产生误报差异");
+        }
+    }
+
+    // ── CAD-19：标注 <> 占位符前后缀替换（DimensionEntity + TCH_DIMENSION2）───────
+    void TestDimensionPlaceholderOverride(const std::string& workDir)
+    {
+        MiniCAD::Scene scene;
+        MiniCAD::DimStyle ds;
+        ds.Precision = 0;
+
+        auto addDim = [&](double x0, double y0, double x1, double y1, const std::string& ovr) {
+            auto d = MiniCAD::DimensionEntity::MakeAligned(
+                scene.NextObjectID(),
+                MiniCAD::Math::Point3{ x0, y0, 0.0 },
+                MiniCAD::Math::Point3{ x1, y1, 0.0 },
+                MiniCAD::Math::Point3{ x0, y0 + 200.0, 0.0 },
+                ds);
+            d->SetTextOverride(ovr);
+            scene.AddEntity(std::move(d));
+        };
+
+        addDim(0.0,    0.0, 3600.0,    0.0, "约<>");
+        addDim(0.0, 1000.0, 1200.0, 1000.0, "<>（净宽）");
+        addDim(0.0, 2000.0, 2800.0, 2000.0, "{\\H0.8x;净高<>mm}");
+        addDim(0.0, 3000.0, 1500.0, 3000.0, "固定文字");
+        addDim(0.0, 4000.0, 2400.0, 4000.0, "");
+
+        // 同时构造一条带 <> 覆盖的天正尺寸标注记录
+        MiniCAD::CadSemanticSnapshot snap;
+        snap.Format = "DWG";
+        {
+            MiniCAD::CadSemanticSnapshot::TchDimensionRecord td;
+            td.Handle        = 0x777;
+            td.DxfName       = "TCH_DIMENSION2";
+            td.Layer         = "DIM";
+            td.Space         = "model";
+            td.LayoutName    = "Model";
+            td.X             = 500.0;
+            td.Y             = 5000.0;
+            td.TotalSpan     = 4500.0;
+            td.Spans         = { 4500.0 };
+            td.TextOverrides[0] = "约<>";
+            td.MinX = 0.0; td.MinY = 4900.0; td.MaxX = 4500.0; td.MaxY = 5100.0;
+            snap.TchDimensions.push_back(std::move(td));
+        }
+
+        const std::string dbPath = workDir + "/dim_placeholder.sqlite";
+        ExportDbResult res;
+        std::string err;
+        Check(ExportSceneToSqlite(scene, snap, workDir + "/dim_src.dwg", 100, 1000, dbPath, true, res, &err),
+              "CAD-19: 含 <> 占位符标注导出 SQLite 成功");
+
+        sqlite3* db = nullptr;
+        Check(sqlite3_open_v2(dbPath.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK,
+              "CAD-19: 打开标注 SQLite");
+        if (db)
+        {
+            Check(SqlInt(db, "SELECT COUNT(*) FROM texts WHERE content='约3600';") == 1,
+                  "CAD-19: '约<>' 替换为 '约3600'");
+            Check(SqlInt(db, "SELECT COUNT(*) FROM texts WHERE content='1200（净宽）';") == 1,
+                  "CAD-19: '<>（净宽）' 替换为 '1200（净宽）'");
+            Check(SqlInt(db, "SELECT COUNT(*) FROM texts WHERE content='净高2800mm';") == 1,
+                  "CAD-19: 带 MText 格式码的 '{\\H0.8x;净高<>mm}' 替换为 '净高2800mm'");
+            Check(SqlInt(db, "SELECT COUNT(*) FROM texts WHERE content='固定文字';") == 1,
+                  "CAD-19: 无 <> 占位符的纯覆盖文字保留原文");
+            Check(SqlInt(db, "SELECT COUNT(*) FROM texts WHERE content='2400';") == 1,
+                  "CAD-19: 空覆盖回退真实测量值 '2400'");
+            Check(SqlInt(db, "SELECT COUNT(*) FROM texts WHERE content='约4500';") == 1,
+                  "CAD-19: TCH_DIMENSION2 分段覆盖 '约<>' 替换为 '约4500'");
+            Check(SqlInt(db, "SELECT COUNT(*) FROM texts WHERE content LIKE '%<>%';") == 0,
+                  "CAD-19: texts 表中不再残留未展开的 '<>' 字面量");
+            sqlite3_close(db);
+        }
+    }
+
+    // ── CAD-20：WriteDiffSqlite 失败严格回滚与临时文件清理 ───────────────────────
+    void TestWriteDiffSqliteRollbackAndCleanup(const std::string& workDir)
+    {
+        const fs::path subDir = MiniCAD::Utf8ToPath(workDir) / "diff_sqlite_rollback";
+        std::error_code ec;
+        fs::create_directories(subDir, ec);
+        const std::string targetPath = PathToUtf8(subDir / "target.sqlite");
+        const std::string sentinel   = "SENTINEL_EXISTING_VALID_DB_BYTES";
+        {
+            std::ofstream f(MiniCAD::Utf8ToPath(targetPath), std::ios::binary | std::ios::trunc);
+            f.write(sentinel.data(), static_cast<std::streamsize>(sentinel.size()));
+        }
+
+        auto readAll = [](const std::string& p) -> std::string {
+            std::ifstream f(MiniCAD::Utf8ToPath(p), std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        };
+        auto countExtraFiles = [&]() -> int {
+            int cnt = 0;
+            for (const auto& entry : fs::directory_iterator(subDir, ec))
+            {
+                if (entry.path().filename() != "target.sqlite") ++cnt;
+            }
+            return cnt;
+        };
+
+        // 1. 主键冲突（两个 Region 使用相同 Id = 1）
+        {
+            DiffReport badRep;
+            DiffRegionItem r1; r1.Id = 1; r1.BboxDrawing = { 0, 0, 100, 100 }; r1.BboxPx = { 0, 0, 10, 10 }; r1.DominantSide = "both";
+            DiffRegionItem r2; r2.Id = 1; r2.BboxDrawing = { 200, 0, 300, 100 }; r2.BboxPx = { 20, 0, 30, 10 }; r2.DominantSide = "both";
+            badRep.Regions = { r1, r2 };
+            std::string err;
+            const bool ok = WriteDiffSqlite(targetPath, badRep, &err);
+            Check(!ok && !err.empty(), "CAD-20: WriteDiffSqlite 捕获主键冲突并返回错误");
+            Check(readAll(targetPath) == sentinel, "CAD-20: 主键失败不破坏已有目标库");
+            Check(countExtraFiles() == 0, "CAD-20: 主键失败自动清理全部临时文件与日志");
+        }
+
+        // 2. R-tree 约束冲突（minx > maxx）
+        {
+            DiffReport badRtree;
+            DiffRegionItem r1; r1.Id = 1; r1.BboxDrawing = { 500, 0, 100, 100 }; r1.BboxPx = { 0, 0, 10, 10 }; r1.DominantSide = "a_only";
+            badRtree.Regions = { r1 };
+            std::string err;
+            const bool ok = WriteDiffSqlite(targetPath, badRtree, &err);
+            Check(!ok && !err.empty(), "CAD-20: WriteDiffSqlite 捕获 R-tree 逆序范围约束失败");
+            Check(readAll(targetPath) == sentinel, "CAD-20: R-tree 失败不破坏已有目标库");
+            Check(countExtraFiles() == 0, "CAD-20: R-tree 失败自动清理全部临时文件");
+        }
+    }
+
+    // ── CAD-21：--reuse-if-fresh 选项变化与外部参照依赖指纹失效 ──────────────────
+    void TestExportCacheInvalidationOptionsAndXrefs(const std::string& workDir)
+    {
+        // 1. --no-block-entities 选项变化必须触发缓存失效
+        {
+            const std::string dwgPath = workDir + "/cache_opt_src.dwg";
+            const std::string dbPath  = workDir + "/cache_opt.sqlite";
+            Check(BuildGeneralSampleDwg(dwgPath), "CAD-21: 生成带块定义的样图");
+
+            ExportDbOptions opts;
+            opts.InputPath       = dwgPath;
+            opts.OutputDbPath    = dbPath;
+            opts.ReuseIfFresh    = true;
+            opts.NoBlockEntities = true;
+
+            ExportDbResult r1, r2, r3, r4;
+            std::string err;
+            Check(RunExportDbCommand(opts, r1, &err) && !r1.Reused && r1.Counts.BlockEntities == 0,
+                  "CAD-21: 首次 --no-block-entities 导出成功且 block_entities==0");
+            Check(RunExportDbCommand(opts, r2, &err) && r2.Reused,
+                  "CAD-21: 同选项二次执行命中缓存");
+
+            opts.NoBlockEntities = false;
+            Check(RunExportDbCommand(opts, r3, &err) && !r3.Reused && r3.Counts.BlockEntities > 0,
+                  "CAD-21: 去掉 --no-block-entities 时自动失效并重导出块内实体");
+            Check(RunExportDbCommand(opts, r4, &err) && r4.Reused,
+                  "CAD-21: 含块内实体导出后再次执行命中缓存");
+        }
+
+        // 2. 外部参照修改 / 删除 / 恢复均触发缓存失效
+        {
+            const fs::path xrefDir = MiniCAD::Utf8ToPath(workDir) / "xref_cache_test";
+            std::error_code ec;
+            fs::create_directories(xrefDir, ec);
+            const std::string childPath = PathToUtf8(xrefDir / "sub_xref.dwg");
+            const std::string hostPath  = PathToUtf8(xrefDir / "host.dwg");
+            const std::string dbPath    = PathToUtf8(xrefDir / "host.sqlite");
+
+            auto writeChild = [&](int lineCount) -> bool {
+                MiniCAD::Scene s;
+                for (int i = 0; i < lineCount; ++i)
+                {
+                    s.AddEntity(std::make_unique<MiniCAD::LineEntity>(
+                        s.NextObjectID(),
+                        MiniCAD::Math::Point3{ 0.0, i * 100.0, 0.0 },
+                        MiniCAD::Math::Point3{ 1000.0, i * 100.0, 0.0 }));
+                }
+                const auto bytes = MiniCAD::ExportCad(s, MiniCAD::CadFileKind::Dwg, MiniCAD::CadSaveVersion::R2018);
+                return !bytes.empty() && WriteBytesToUtf8Path(childPath, bytes);
+            };
+            auto writeHost = [&]() -> bool {
+                MiniCAD::Scene s;
+                MiniCAD::BlockTable& tbl = s.GetBlockTable();
+                const MiniCAD::BlockID bid = tbl.Create("子参照", { 0, 0, 0 });
+                MiniCAD::BlockEntity* blk  = tbl.Find(bid);
+                blk->SetFlags(MiniCAD::BlockEntity::XRef);
+                blk->SetXRefPath("sub_xref.dwg");
+                auto ins = std::make_unique<MiniCAD::InsertEntity>(
+                    s.NextObjectID(), bid, "子参照", MiniCAD::Math::Point3{ 100, 200, 0 });
+                ins->SetBlock(blk);
+                s.AddEntity(std::move(ins));
+                const auto bytes = MiniCAD::ExportCad(s, MiniCAD::CadFileKind::Dwg, MiniCAD::CadSaveVersion::R2018);
+                return !bytes.empty() && WriteBytesToUtf8Path(hostPath, bytes);
+            };
+
+            Check(writeChild(1) && writeHost(), "CAD-21: 生成带外部参照的宿主与子图 DWG");
+
+            ExportDbOptions opts;
+            opts.InputPath    = hostPath;
+            opts.OutputDbPath = dbPath;
+            opts.ReuseIfFresh = true;
+
+            ExportDbResult r1, r2, r3, r4, r5, r6;
+            std::string err;
+            Check(RunExportDbCommand(opts, r1, &err) && !r1.Reused, "CAD-21: 宿主首次导出成功");
+            Check(RunExportDbCommand(opts, r2, &err) && r2.Reused, "CAD-21: 宿主与外部参照均未变时命中缓存");
+
+            Check(writeChild(4), "CAD-21: 修改外部参照子图内容与大小");
+            Check(RunExportDbCommand(opts, r3, &err) && !r3.Reused,
+                  "CAD-21: 仅外部参照变化（宿主未变）时缓存强制失效重建");
+
+            fs::remove(MiniCAD::Utf8ToPath(childPath), ec);
+            Check(RunExportDbCommand(opts, r4, &err) && !r4.Reused,
+                  "CAD-21: 已解析外部参照被删除时缓存失效重建");
+            Check(RunExportDbCommand(opts, r5, &err) && r5.Reused,
+                  "CAD-21: 外部参照持续缺失且未变化时稳定复用");
+
+            Check(writeChild(2), "CAD-21: 恢复缺失的外部参照文件");
+            Check(RunExportDbCommand(opts, r6, &err) && !r6.Reused,
+                  "CAD-21: 缺失外部参照重新出现磁盘时缓存失效重建");
+        }
+    }
+
+    // ── CAD-22：输出路径与输入/多输出冲突拦截（绝不覆盖原 DWG） ─────────────────
+    void TestOutputPathConflictGuard(const std::string& workDir)
+    {
+        const std::string dwgA = workDir + "/guard_a.dwg";
+        const std::string dwgB = workDir + "/guard_b.dwg";
+        Check(BuildGeneralSampleDwg(dwgA, 0.0, 0.0, false)
+                  && BuildGeneralSampleDwg(dwgB, 0.0, 0.0, true),
+              "CAD-22: 生成路径冲突测试原图");
+
+        auto readBytes = [](const std::string& p) -> std::string {
+            std::ifstream f(MiniCAD::Utf8ToPath(p), std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        };
+        const std::string origA = readBytes(dwgA);
+        const std::string origB = readBytes(dwgB);
+
+        // 1. export-db 输出与输入同文件（直接路径 + 大小写/相对路径别名）
+        {
+            ExportDbOptions eo;
+            eo.InputPath    = dwgA;
+            eo.OutputDbPath = dwgA;
+            ExportDbResult er;
+            std::string err, code;
+            bool usageErr = false;
+            Check(!RunExportDbCommand(eo, er, &err, &code, &usageErr)
+                      && code == "OUTPUT_PATH_CONFLICT" && usageErr,
+                  "CAD-22: export-db 拒绝输出路径等于输入 DWG");
+            Check(readBytes(dwgA) == origA, "CAD-22: export-db 冲突拦截后原 DWG 字节完好");
+
+#ifdef _WIN32
+            eo.OutputDbPath = workDir + "/./GUARD_A.DWG";
+            code.clear(); usageErr = false;
+            Check(!RunExportDbCommand(eo, er, &err, &code, &usageErr)
+                      && code == "OUTPUT_PATH_CONFLICT" && usageErr,
+                  "CAD-22: export-db 识别 Windows 大小写/相对路径别名冲突");
+            Check(readBytes(dwgA) == origA, "CAD-22: Windows 别名冲突拦截后原 DWG 完好");
+#endif
+        }
+
+        // 2. render 输出指向输入或 --compare 图纸
+        {
+            RenderOptions ro;
+            ro.InputPath     = dwgA;
+            ro.ComparePath   = dwgB;
+            ro.OutputPngPath = dwgB;
+#ifdef MINICAD_TEST_FONTS_DIR
+            ro.FontsDir      = MINICAD_TEST_FONTS_DIR;
+#endif
+            RenderResult rr;
+            std::string code, msg;
+            bool usageErr = false;
+            Check(!RunRenderCommand(ro, rr, &code, &msg, &usageErr)
+                      && code == "OUTPUT_PATH_CONFLICT" && usageErr,
+                  "CAD-22: render --compare 拒绝输出路径覆盖 --compare 原 DWG");
+            Check(readBytes(dwgB) == origB, "CAD-22: render 冲突拦截后原 DWG 完好");
+        }
+
+        // 3. diff 输出指向输入，或默认派生 JSON 与 --out-db 冲突
+        {
+            DiffOptions dop;
+            dop.InputPathA = dwgA;
+            dop.InputPathB = dwgB;
+            dop.OutPngPath = dwgA;
+#ifdef MINICAD_TEST_FONTS_DIR
+            dop.FontsDir   = MINICAD_TEST_FONTS_DIR;
+#endif
+            DiffReport rep;
+            std::string code, msg;
+            bool usageErr = false;
+            Check(!RunDiffCommand(dop, rep, &code, &msg, &usageErr)
+                      && code == "OUTPUT_PATH_CONFLICT" && usageErr,
+                  "CAD-22: diff 拒绝 --out-png 覆盖输入原图");
+            Check(readBytes(dwgA) == origA, "CAD-22: diff 冲突拦截后原 DWG 完好");
+
+            // 多输出冲突：--out-png auto_out.png 自动派生 auto_out.json，与 --out-db 同文件
+            DiffOptions dop2;
+            dop2.InputPathA = dwgA;
+            dop2.InputPathB = dwgB;
+            dop2.OutPngPath = workDir + "/auto_out.png";
+#ifdef _WIN32
+            dop2.OutDbPath  = workDir + "/AUTO_OUT.JSON";
+#else
+            dop2.OutDbPath  = workDir + "/auto_out.json";
+#endif
+#ifdef MINICAD_TEST_FONTS_DIR
+            dop2.FontsDir   = MINICAD_TEST_FONTS_DIR;
+#endif
+            code.clear(); usageErr = false;
+            Check(!RunDiffCommand(dop2, rep, &code, &msg, &usageErr)
+                      && code == "OUTPUT_PATH_CONFLICT" && usageErr,
+                  "CAD-22: diff 拦截默认派生 JSON 与 --out-db 的多输出同路径冲突");
+        }
+    }
+
+    // ── CAD-23：带孔/带岛 Hatch 净面积（奇偶包含规则） ───────────────────────────
+    void TestHatchNetAreaExport(const std::string& workDir)
+    {
+        auto makeRect = [](double x0, double y0, double x1, double y1) -> MiniCAD::Polyline {
+            MiniCAD::Polyline pl;
+            pl.Points = {
+                { x0, y0, 0.0 }, { x1, y0, 0.0 }, { x1, y1, 0.0 }, { x0, y1, 0.0 }, { x0, y0, 0.0 }
+            };
+            return pl;
+        };
+
+        MiniCAD::Scene scene;
+        // Hatch 1：外环 10x10=100，减去 5x2=10 洞口 => 净面积 90
+        {
+            std::vector<MiniCAD::Polyline> loops;
+            loops.push_back(makeRect(0.0, 0.0, 10.0, 10.0));
+            loops.push_back(makeRect(2.0, 2.0, 7.0, 4.0));
+            scene.AddEntity(std::make_unique<MiniCAD::HatchEntity>(
+                scene.NextObjectID(), std::move(loops), MiniCAD::HatchPattern::MakeSolid()));
+        }
+        // Hatch 2：外环 10x10=100，减 8x8=64 洞口，加回洞内 2x2=4 岛 => 净面积 40
+        {
+            std::vector<MiniCAD::Polyline> loops;
+            loops.push_back(makeRect(20.0, 0.0, 30.0, 10.0));
+            loops.push_back(makeRect(21.0, 1.0, 29.0, 9.0));
+            loops.push_back(makeRect(24.0, 4.0, 26.0, 6.0));
+            scene.AddEntity(std::make_unique<MiniCAD::HatchEntity>(
+                scene.NextObjectID(), std::move(loops), MiniCAD::HatchPattern::MakeSolid()));
+        }
+
+        MiniCAD::CadSemanticSnapshot snap;
+        snap.Format = "DWG";
+        const std::string dbPath = workDir + "/hatch_net_area.sqlite";
+        ExportDbResult res;
+        std::string err;
+        Check(ExportSceneToSqlite(scene, snap, workDir + "/hatch_src.dwg", 100, 1000, dbPath, true, res, &err),
+              "CAD-23: 带孔/带岛 Hatch 导出 SQLite 成功");
+
+        sqlite3* db = nullptr;
+        Check(sqlite3_open_v2(dbPath.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK,
+              "CAD-23: 打开 Hatch SQLite");
+        if (db)
+        {
+            const double area1 = SqlDouble(db, "SELECT area FROM entities WHERE entity_type='HATCH' ORDER BY id LIMIT 1 OFFSET 0;");
+            const double area2 = SqlDouble(db, "SELECT area FROM entities WHERE entity_type='HATCH' ORDER BY id LIMIT 1 OFFSET 1;");
+            Check(Near(area1, 90.0, 1e-3), "CAD-23: 外环 100 减洞口 10 = 净面积 90");
+            Check(Near(area2, 40.0, 1e-3), "CAD-23: 外环 100 减洞口 64 加洞内岛 4 = 净面积 40");
+            sqlite3_close(db);
+        }
+    }
+
+    // ── CAD-26：Win64 中文 / UNC 宽字符参数安全转 UTF-8 ──────────────────────────
+    void TestWin64WideArgToUtf8()
+    {
+#ifdef _WIN32
+        std::string out;
+        unsigned long winErr = 0;
+
+        Check(WideArgToUtf8(L"", out, &winErr) && out.empty() && winErr == 0,
+              "CAD-26: WideArgToUtf8 空字符串正确返回");
+        Check(WideArgToUtf8(L"export-db", out, &winErr) && out == "export-db",
+              "CAD-26: WideArgToUtf8 ASCII 参数无尾部 NUL 误差");
+        Check(WideArgToUtf8(L"\\\\daga-nas5\\\u9879\u76ee\\\u5efa\u7b51\\A-01\u5e73\u9762\u56fe.dwg", out, &winErr)
+                  && out == "\\\\daga-nas5\\项目\\建筑\\A-01平面图.dwg",
+              "CAD-26: WideArgToUtf8 精确转换中文与 canonical UNC 路径");
+
+        // 孤立代理项应被 WC_ERR_INVALID_CHARS 拒绝
+        const std::wstring invalidUtf16(1, static_cast<wchar_t>(0xD800));
+        winErr = 0;
+        Check(!WideArgToUtf8(invalidUtf16, out, &winErr) && winErr != 0,
+              "CAD-26: WideArgToUtf8 拒绝非法孤立代理项并回报 Win32 错误码");
+#endif
+    }
+
+    // ── CAD-34：无效 --fonts-dir 显式报错与 export-db 选项清理 ───────────────────
+    void TestStrictFontsDirValidation(const std::string& workDir)
+    {
+        ParsedCommand cmd;
+        std::string code, msg;
+        Check(!ParseCliArgs({ "export-db", "a.dwg", "o.sqlite", "--fonts-dir", "fonts" }, cmd, code, msg)
+                  && code == "UNKNOWN_OPTION",
+              "CAD-34: export-db 不再静默吞掉无效的 --fonts-dir 参数");
+
+        const std::string dwgA = workDir + "/fonts_test_a.dwg";
+        Check(BuildGeneralSampleDwg(dwgA), "CAD-34: 生成字体校验测试图");
+
+        const std::string badFonts = workDir + "/nonexistent_fonts_dir_xyz";
+
+        // render 无效 --fonts-dir
+        {
+            RenderOptions ro;
+            ro.InputPath        = dwgA;
+            ro.OutputPngPath    = workDir + "/fonts_fail.png";
+            ro.FontsDir         = badFonts;
+            ro.FontsDirExplicit = true;
+            RenderResult rr;
+            bool usageErr = false;
+            Check(!RunRenderCommand(ro, rr, &code, &msg, &usageErr)
+                      && code == "INVALID_FONTS_DIR" && usageErr,
+                  "CAD-34: render 显式传入不存在 --fonts-dir 时立即报 INVALID_FONTS_DIR");
+        }
+
+        // render 显式空 --fonts-dir ""
+        {
+            RenderOptions ro;
+            ro.InputPath        = dwgA;
+            ro.OutputPngPath    = workDir + "/fonts_empty_fail.png";
+            ro.FontsDir         = "";
+            ro.FontsDirExplicit = true;
+            RenderResult rr;
+            bool usageErr = false;
+            Check(!RunRenderCommand(ro, rr, &code, &msg, &usageErr)
+                      && code == "INVALID_FONTS_DIR" && usageErr,
+                  "CAD-34: render 显式传入空 --fonts-dir 时立即报 INVALID_FONTS_DIR");
+        }
+
+        // diff 无效 --fonts-dir
+        {
+            DiffOptions dop;
+            dop.InputPathA       = dwgA;
+            dop.InputPathB       = dwgA;
+            dop.FontsDir         = badFonts;
+            dop.FontsDirExplicit = true;
+            DiffReport rep;
+            bool usageErr = false;
+            Check(!RunDiffCommand(dop, rep, &code, &msg, &usageErr)
+                      && code == "INVALID_FONTS_DIR" && usageErr,
+                  "CAD-34: diff 显式传入不存在 --fonts-dir 时立即报 INVALID_FONTS_DIR");
+        }
+    }
+
+    int RunAllTests(const std::vector<std::string>& args)
+    {
+        LOG_SET_LEVEL(MiniCAD::LogLevel::Error);
+
+        // 可选导出真实天正合成样图到指定目录，供 Release SaDwgTool.exe CLI 端到端实测
+        if (args.size() >= 2 && args[0] == "--emit-tch-fixtures")
+        {
+            const std::string& outDir = args[1];
+            const bool okA = BuildTianzhengSampleDwg(outDir + "/tch_before.dwg", 0.0, 0.0, false);
+            const bool okB = BuildTianzhengSampleDwg(outDir + "/tch_after.dwg", -1500.0, 800.0, true);
+            std::printf("emit tch fixtures: %s\n", (okA && okB) ? "OK" : "FAIL");
+            return (okA && okB) ? 0 : 1;
+        }
+
+        // CAD-25：使用 u8string() 避免中文用户目录下 fs::path::string() 退化为系统代码页
+        const fs::path tmpRoot = fs::temp_directory_path()
+            / ("sadwgtool_tests_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::error_code ec;
+        fs::create_directories(tmpRoot, ec);
+        const std::string workDir = PathToUtf8(tmpRoot);
+
+        TestCliArgs();
+        TestExportDbAndReuse(workDir);
+        TestTianzhengExportAndDiff(workDir);
+        TestRenderAndLayerAutoAlign(workDir);
+        TestPaperSpaceDiffDefaults(workDir);
+        TestWipeoutAndLongDashDrawOrder(workDir);
+        TestUnionDefaultBboxAndEmptySide(workDir);
+        TestPaperLayoutCoverageDisclosure(workDir);
+        TestZeroToleranceAndEffectiveReporting(workDir);
+        TestTchEmptySideAndWallHeightDiff(workDir);
+        TestDimensionPlaceholderOverride(workDir);
+        TestWriteDiffSqliteRollbackAndCleanup(workDir);
+        TestExportCacheInvalidationOptionsAndXrefs(workDir);
+        TestOutputPathConflictGuard(workDir);
+        TestHatchNetAreaExport(workDir);
+        TestWin64WideArgToUtf8();
+        TestStrictFontsDirValidation(workDir);
+
+        fs::remove_all(tmpRoot, ec);
+
+        std::printf("\nSaDwgToolTests 完成：%d 项失败\n", g_failed);
+        return g_failed == 0 ? 0 : 1;
+    }
 }
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t** argv)
+{
+    std::vector<std::string> args;
+    args.reserve(argc > 1 ? static_cast<size_t>(argc - 1) : 0);
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string utf8;
+        if (!WideArgToUtf8(argv[i], utf8))
+        {
+            std::fprintf(stderr, "无效命令行宽字符参数\n");
+            return 2;
+        }
+        args.push_back(std::move(utf8));
+    }
+    return RunAllTests(args);
+}
+#else
+int main(int argc, char** argv)
+{
+    std::vector<std::string> args;
+    args.reserve(argc > 1 ? static_cast<size_t>(argc - 1) : 0);
+    for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
+    return RunAllTests(args);
+}
+#endif

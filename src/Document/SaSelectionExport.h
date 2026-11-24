@@ -68,36 +68,118 @@ namespace MiniCAD::SaSelectionExport
         return std::string(buf);
     }
 
-    // 完整 RFC 8259 JSON 字符串转义，保证任意 UTF-8 与控制字符输出严格合法 JSON。
+    namespace Detail
+    {
+        // 严格 RFC 3629 UTF-8 解码（含过长编码、UTF-16 代理项与 > U+10FFFF 码点校验），
+        // 非法字节序列按 WHATWG 最大子段规则推进并返回 valid=false，由调用方替换为 U+FFFD。
+        inline std::size_t DecodeUtf8Step(std::string_view s, std::size_t pos, bool& valid)
+        {
+            valid = false;
+            const std::size_t n = s.size();
+            if (pos >= n)
+                return 0;
+            const unsigned char c0 = static_cast<unsigned char>(s[pos]);
+            if (c0 < 0x80u)
+            {
+                valid = true;
+                return 1;
+            }
+            auto isCont = [](unsigned char c) { return (c & 0xC0u) == 0x80u; };
+            if (c0 >= 0xC2u && c0 <= 0xDFu)
+            {
+                if (pos + 1 < n && isCont(static_cast<unsigned char>(s[pos + 1])))
+                {
+                    valid = true;
+                    return 2;
+                }
+                return 1;
+            }
+            if (c0 >= 0xE0u && c0 <= 0xEFu)
+            {
+                if (pos + 1 >= n)
+                    return 1;
+                const unsigned char c1 = static_cast<unsigned char>(s[pos + 1]);
+                const bool c1Ok = (c0 == 0xE0u) ? (c1 >= 0xA0u && c1 <= 0xBFu)
+                                : (c0 == 0xEDu) ? (c1 >= 0x80u && c1 <= 0x9Fu)
+                                                : isCont(c1);
+                if (!c1Ok)
+                    return 1;
+                if (pos + 2 >= n || !isCont(static_cast<unsigned char>(s[pos + 2])))
+                    return 2;
+                valid = true;
+                return 3;
+            }
+            if (c0 >= 0xF0u && c0 <= 0xF4u)
+            {
+                if (pos + 1 >= n)
+                    return 1;
+                const unsigned char c1 = static_cast<unsigned char>(s[pos + 1]);
+                const bool c1Ok = (c0 == 0xF0u) ? (c1 >= 0x90u && c1 <= 0xBFu)
+                                : (c0 == 0xF4u) ? (c1 >= 0x80u && c1 <= 0x8Fu)
+                                                : isCont(c1);
+                if (!c1Ok)
+                    return 1;
+                if (pos + 2 >= n || !isCont(static_cast<unsigned char>(s[pos + 2])))
+                    return 2;
+                if (pos + 3 >= n || !isCont(static_cast<unsigned char>(s[pos + 3])))
+                    return 3;
+                valid = true;
+                return 4;
+            }
+            return 1;
+        }
+    }
+
+    // 完整 RFC 8259 JSON 字符串转义：在入口统一校验 UTF-8 非法字节序列（含过长编码、代理项与越界码点）
+    // 并替换为 U+FFFD，保证任意输入都产出严格合法的 UTF-8 JSON 字符串。
     inline std::string JsonQuote(std::string_view s)
     {
         std::string out;
         out.reserve(s.size() + 8);
         out.push_back('"');
-        for (unsigned char c : s)
+        std::size_t i = 0;
+        const std::size_t n = s.size();
+        while (i < n)
         {
-            switch (c)
+            bool valid = false;
+            const std::size_t step = Detail::DecodeUtf8Step(s, i, valid);
+            if (!valid)
             {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b";  break;
-            case '\f': out += "\\f";  break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:
-                if (c < 0x20u)
-                {
-                    char buf[8];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
-                    out += buf;
-                }
-                else
-                {
-                    out.push_back(static_cast<char>(c));
-                }
-                break;
+                out.append("\xEF\xBF\xBD", 3);
+                i += (step > 0 ? step : 1);
+                continue;
             }
+            if (step == 1)
+            {
+                const unsigned char c = static_cast<unsigned char>(s[i]);
+                switch (c)
+                {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\b': out += "\\b";  break;
+                case '\f': out += "\\f";  break;
+                case '\n': out += "\\n";  break;
+                case '\r': out += "\\r";  break;
+                case '\t': out += "\\t";  break;
+                default:
+                    if (c < 0x20u)
+                    {
+                        char buf[8];
+                        std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
+                        out += buf;
+                    }
+                    else
+                    {
+                        out.push_back(static_cast<char>(c));
+                    }
+                    break;
+                }
+            }
+            else
+            {
+                out.append(s.data() + i, step);
+            }
+            i += step;
         }
         out.push_back('"');
         return out;
@@ -125,7 +207,7 @@ namespace MiniCAD::SaSelectionExport
     }
 
     // UTF-8 安全截断：按 Unicode 码点计数至多保留 maxChars 个完整字符，绝不从多字节序列中间截断，
-    // 并跳过源字符串中的孤立非法 UTF-8 字节，确保输出可被 JSON 解析器安全解码。
+    // 非法 UTF-8 序列统一替换为 U+FFFD，确保输出可被严格 JSON/UTF-8 解码器安全读取。
     inline std::string TruncateUtf8(std::string_view s, std::size_t maxChars = kMaxTextChars)
     {
         if (maxChars == 0 || s.empty())
@@ -137,41 +219,17 @@ namespace MiniCAD::SaSelectionExport
         const std::size_t n = s.size();
         while (i < n && chars < maxChars)
         {
-            const unsigned char c0 = static_cast<unsigned char>(s[i]);
-            if (c0 < 0x80u)
+            bool valid = false;
+            const std::size_t step = Detail::DecodeUtf8Step(s, i, valid);
+            if (!valid)
             {
-                out.push_back(static_cast<char>(c0));
-                ++i;
+                out.append("\xEF\xBF\xBD", 3);
+                i += (step > 0 ? step : 1);
                 ++chars;
                 continue;
             }
-            std::size_t seqLen = 0;
-            if ((c0 & 0xE0u) == 0xC0u)      seqLen = 2;
-            else if ((c0 & 0xF0u) == 0xE0u) seqLen = 3;
-            else if ((c0 & 0xF8u) == 0xF0u) seqLen = 4;
-            else
-            {
-                ++i; // 孤立续字节或非法首字节，跳过
-                continue;
-            }
-            if (i + seqLen > n)
-                break; // 末尾残缺多字节序列，安全止步
-            bool valid = true;
-            for (std::size_t k = 1; k < seqLen; ++k)
-            {
-                if ((static_cast<unsigned char>(s[i + k]) & 0xC0u) != 0x80u)
-                {
-                    valid = false;
-                    break;
-                }
-            }
-            if (!valid)
-            {
-                ++i;
-                continue;
-            }
-            out.append(s.data() + i, seqLen);
-            i += seqLen;
+            out.append(s.data() + i, step);
+            i += step;
             ++chars;
         }
         return out;
@@ -450,28 +508,7 @@ namespace MiniCAD::SaSelectionExport
 
         inline std::optional<double> ComputeHatchAreaSafe(const HatchEntity& hatch)
         {
-            double total = 0.0;
-            std::size_t totalPts = 0;
-            for (const auto& loop : hatch.GetLoops())
-            {
-                std::vector<Math::Point3> pts = loop.Tessellate();
-                totalPts += pts.size();
-                if (totalPts > 200000)
-                    return std::nullopt;
-                if (pts.size() < 3)
-                    continue;
-                double a2 = 0.0;
-                for (std::size_t i = 0; i < pts.size(); ++i)
-                {
-                    const auto& p = pts[i];
-                    const auto& q = pts[(i + 1) % pts.size()];
-                    a2 += p.x * q.y - q.x * p.y;
-                }
-                total += std::abs(a2) * 0.5;
-            }
-            if (std::isfinite(total) && total > 0.0)
-                return total;
-            return std::nullopt;
+            return ComputeHatchNetArea(hatch, 200000);
         }
 
         inline GeomMetrics ExtractGeomMetrics(const Entity& e)
@@ -604,70 +641,57 @@ namespace MiniCAD::SaSelectionExport
 
     inline std::string EmptySelectionJson()
     {
-        return "{\"count\":0,\"truncated\":false,\"bounds\":null,\"typeCounts\":{},\"items\":[]}";
+        return "{\"count\":0,\"scannedCount\":0,\"truncated\":false,\"statsTruncated\":false,\"bounds\":null,\"typeCounts\":{},\"items\":[]}";
     }
 
     // 导出选中图元摘要 JSON。
     // activeDoc 非空时仅纳入当前活动布局可见实体（兼顾模型空间与各图纸空间布局）；为空时纳入场景中全部命中实体。
+    // maxScan 限制统计与明细的扫描上限（默认 kMaxScan），同时输出准确总选中数 count、实际扫描数 scannedCount
+    // 与 statsTruncated（scannedCount < count），truncated 表示 items.size() < count。
     inline std::string ExportSelectionJson(const Scene& scene,
                                            const std::unordered_set<Object::ObjectID>& selectionIds,
                                            const CadSource* cadSource = nullptr,
                                            int maxItems = 20,
-                                           const Document* activeDoc = nullptr)
+                                           const Document* activeDoc = nullptr,
+                                           std::size_t maxScan = kMaxScan)
     {
         const int limit = std::clamp(maxItems, kMinItems, kMaxItems);
         if (selectionIds.empty())
             return EmptySelectionJson();
 
-        // 收集有效实体，最多扫描 kMaxScan 个 ID 防止极端大图全选卡顿。
+        // 收集全部在场景中存在且属于当前活动布局的有效实体指针，以获得准确总选中数 count；
+        // 当超过扫描上限时仅按 ObjectID 升序稳定抽取前 scanLimit 个计算类型统计、包围盒与明细。
         std::vector<const Entity*> entities;
-        entities.reserve(std::min<std::size_t>(selectionIds.size(), kMaxScan));
-        std::size_t scanned = 0;
-        const bool hitScanCap = selectionIds.size() > kMaxScan;
-
-        if (!hitScanCap)
+        entities.reserve(selectionIds.size());
+        for (Object::ObjectID id : selectionIds)
         {
-            std::vector<Object::ObjectID> sortedIds;
-            sortedIds.reserve(selectionIds.size());
-            for (Object::ObjectID id : selectionIds)
-                sortedIds.push_back(id);
-            std::sort(sortedIds.begin(), sortedIds.end());
-
-            for (Object::ObjectID id : sortedIds)
-            {
-                const Object* o = scene.GetEntity(id);
-                if (!o || !o->IsKindOf<Entity>())
-                    continue;
-                const auto* e = static_cast<const Entity*>(o);
-                if (activeDoc && !activeDoc->IsVisibleInActiveLayout(e->GetAttr()))
-                    continue;
-                entities.push_back(e);
-            }
-        }
-        else
-        {
-            for (Object::ObjectID id : selectionIds)
-            {
-                if (scanned >= kMaxScan)
-                    break;
-                ++scanned;
-                const Object* o = scene.GetEntity(id);
-                if (!o || !o->IsKindOf<Entity>())
-                    continue;
-                const auto* e = static_cast<const Entity*>(o);
-                if (activeDoc && !activeDoc->IsVisibleInActiveLayout(e->GetAttr()))
-                    continue;
-                entities.push_back(e);
-            }
-            std::sort(entities.begin(), entities.end(),
-                      [](const Entity* a, const Entity* b) { return a->GetID() < b->GetID(); });
+            const Object* o = scene.GetEntity(id);
+            if (!o || !o->IsKindOf<Entity>())
+                continue;
+            const auto* e = static_cast<const Entity*>(o);
+            if (activeDoc && !activeDoc->IsVisibleInActiveLayout(e->GetAttr()))
+                continue;
+            entities.push_back(e);
         }
 
         if (entities.empty())
             return EmptySelectionJson();
 
         const std::size_t totalCount = entities.size();
-        const bool truncated = (totalCount > static_cast<std::size_t>(limit)) || hitScanCap;
+        const std::size_t scanLimit  = maxScan > 0 ? maxScan : kMaxScan;
+        const std::size_t scannedCount = std::min<std::size_t>(totalCount, scanLimit);
+        const bool statsTruncated = (scannedCount < totalCount);
+
+        auto byId = [](const Entity* a, const Entity* b) { return a->GetID() < b->GetID(); };
+        if (statsTruncated)
+        {
+            std::nth_element(entities.begin(),
+                             entities.begin() + static_cast<std::ptrdiff_t>(scannedCount),
+                             entities.end(),
+                             byId);
+            entities.resize(scannedCount);
+        }
+        std::sort(entities.begin(), entities.end(), byId);
 
         std::map<std::string, std::size_t> typeCounts;
         AABB unionBounds = AABB::Empty();
@@ -688,14 +712,19 @@ namespace MiniCAD::SaSelectionExport
             }
         }
 
-        const std::size_t emitCount = std::min<std::size_t>(totalCount, static_cast<std::size_t>(limit));
+        const std::size_t emitCount = std::min<std::size_t>(scannedCount, static_cast<std::size_t>(limit));
+        const bool truncated = (emitCount < totalCount);
         std::string out;
         out.reserve(256 + emitCount * 220);
 
         out += "{\"count\":";
         out += std::to_string(totalCount);
+        out += ",\"scannedCount\":";
+        out += std::to_string(scannedCount);
         out += ",\"truncated\":";
         out += truncated ? "true" : "false";
+        out += ",\"statsTruncated\":";
+        out += statsTruncated ? "true" : "false";
         out += ",\"bounds\":";
         if (hasUnionBounds && IsFiniteBox2D(unionBounds))
             Detail::AppendBoundsJson(out, unionBounds);

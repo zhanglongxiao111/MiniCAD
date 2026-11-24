@@ -302,9 +302,12 @@ namespace MiniGUI
             m_commands.RemoveListener(m_listener);
     }
 
-    int Ribbon::AddTab(std::string title)
+    int Ribbon::AddTab(std::string title, std::string id)
     {
-        m_tabs.push_back({ std::move(title), {} });
+        Tab tab;
+        tab.title = std::move(title);
+        tab.id    = id.empty() ? tab.title : std::move(id);
+        m_tabs.push_back(std::move(tab));
         InvalidateLayout();
         return GetTabCount() - 1;
     }
@@ -553,9 +556,24 @@ namespace MiniGUI
         return -1;
     }
 
+    int Ribbon::FindTabById(std::string_view id) const
+    {
+        if (id.empty())
+            return -1;
+        for (int i = 0; i < GetTabCount(); ++i)
+            if (m_tabs[static_cast<size_t>(i)].id == id)
+                return i;
+        return -1;
+    }
+
     const std::string& Ribbon::GetTabTitle(int index) const
     {
         return index >= 0 && index < GetTabCount() ? m_tabs[static_cast<size_t>(index)].title : kEmpty;
+    }
+
+    const std::string& Ribbon::GetTabId(int index) const
+    {
+        return index >= 0 && index < GetTabCount() ? m_tabs[static_cast<size_t>(index)].id : kEmpty;
     }
 
     void Ribbon::RefreshState()
@@ -953,7 +971,11 @@ namespace MiniGUI
                     const bool changed = tab != m_selected;
                     SelectTab(tab);
                     if (changed && m_onTabSelected)
-                        m_onTabSelected(tab);
+                    {
+                        // 先拷贝回调再调用，避免回调内重绑或重建时销毁正在执行的 std::function
+                        auto cb = m_onTabSelected;
+                        cb(tab);
+                    }
                 }
                 e.handled = true;
             }

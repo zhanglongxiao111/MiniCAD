@@ -118,6 +118,8 @@ namespace MiniCAD
 	{
 		if (!obj.IsKindOf<Entity>())
 			return false;
+		if (m_protectedBeforeId != 0 && obj.GetID() < m_protectedBeforeId)
+			return true;
 		const Layer* layer = m_layerManager.GetLayer(static_cast<const Entity&>(obj).GetAttr().LayerId);
 		return layer && layer->IsLocked();
 	}

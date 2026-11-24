@@ -905,6 +905,7 @@ namespace MiniCAD
         }
 
         // 嵌入模式：功能区重新生成后重新对齐「浏览 / 批注」选项卡并挂回调
+        m_boundEmbedRibbon = nullptr;
         EmbedSyncRibbonTab();
         // 功能区也是重新生成的：命令搜索框执行或关闭后把焦点还给绘图区
         if (Ribbon* ribbon = m_layout->GetRibbon())

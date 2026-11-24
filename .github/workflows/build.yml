@@ -232,10 +232,10 @@ jobs:
           path: dist/*.apk
           retention-days: 7
 
-  # ── 发布：推送 v* 标签时创建 GitHub Release ────────────────────────────────
+  # ── 发布：推送常规 v* 标签时创建 GitHub Release（v*-sa.* 标签由 build-embed.yml 唯一写入，避免双写冲突） ──
   release:
     name: Release
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' && !(startsWith(github.ref_name, 'v') && contains(github.ref_name, '-sa.'))
     needs: [windows, web, linux, android]
     runs-on: ubuntu-latest
     permissions:

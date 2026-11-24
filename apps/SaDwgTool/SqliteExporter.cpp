@@ -1,5 +1,7 @@
 #include "SqliteExporter.h"
 #include "JsonWriter.h"
+#include "PathGuard.h"
+#include "SqliteGuard.h"
 #include "Core/PathUtils.h"
 #include "Core/MTextFormat.h"
 #include "Core/Entity/ArcEntity.hpp"
@@ -44,6 +46,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -106,13 +109,26 @@ namespace MiniCAD::SaTool
             return std::string(buf);
         }
 
-        bool GetFileStats(const std::string& utf8Path, uint64_t& sizeBytes, int64_t& mtimeMs, std::string* error)
+        std::string PathToUtf8(const std::filesystem::path& p)
         {
+            const std::u8string u8 = p.u8string();
+            return std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
+        }
+
+        bool GetFileStats(const std::string& utf8Path, uint64_t& sizeBytes, int64_t& mtimeMs,
+                          std::string* error, bool* mtimeOk = nullptr)
+        {
+            if (mtimeOk) *mtimeOk = false;
             const std::filesystem::path p = Utf8ToPath(utf8Path);
             std::error_code ec;
             if (!std::filesystem::exists(p, ec) || ec)
             {
                 if (error) *error = "源文件不存在或无法访问：" + utf8Path;
+                return false;
+            }
+            if (!std::filesystem::is_regular_file(p, ec) || ec)
+            {
+                if (error) *error = "源路径不是有效文件：" + utf8Path;
                 return false;
             }
             sizeBytes = std::filesystem::file_size(p, ec);
@@ -129,7 +145,401 @@ namespace MiniCAD::SaTool
             }
             const auto sysTime = std::chrono::clock_cast<std::chrono::system_clock>(ftime);
             mtimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(sysTime.time_since_epoch()).count();
+            if (mtimeOk) *mtimeOk = true;
             return true;
+        }
+
+        // ── 外部参照依赖解析与缓存指纹（CAD-21，与 CadExchange::ResolveXrefPath 同口径）──
+
+        std::vector<std::string> SplitXrefSegments(const std::string& normalizedSlash)
+        {
+            std::vector<std::string> segs;
+            size_t i = 0;
+            while (i <= normalizedSlash.size())
+            {
+                size_t j = normalizedSlash.find('/', i);
+                if (j == std::string::npos)
+                    j = normalizedSlash.size();
+                std::string seg = normalizedSlash.substr(i, j - i);
+                if (!seg.empty() && seg != "." && seg != ".." && !(segs.empty() && seg.back() == ':'))
+                    segs.push_back(std::move(seg));
+                i = j + 1;
+            }
+            return segs;
+        }
+
+        std::filesystem::path ResolveXrefPathOnDisk(const std::filesystem::path& hostDir,
+                                                    const std::string& xrefPath)
+        {
+            namespace fs = std::filesystem;
+            if (xrefPath.empty())
+                return {};
+            std::string normalized = xrefPath;
+            for (char& ch : normalized)
+                if (ch == '\\') ch = '/';
+            const std::vector<std::string> segs = SplitXrefSegments(normalized);
+            if (segs.empty())
+                return {};
+
+            std::error_code ec;
+            auto probe = [&](const fs::path& c) -> fs::path {
+                ec.clear();
+                if (fs::is_regular_file(c, ec) && !ec)
+                    return c.lexically_normal();
+                if (!c.has_extension())
+                {
+                    fs::path d = fs::path(c).concat(".dwg");
+                    ec.clear();
+                    if (fs::is_regular_file(d, ec) && !ec)
+                        return d.lexically_normal();
+                }
+                return {};
+            };
+
+            const fs::path saved = Utf8ToPath(normalized);
+            if (saved.is_absolute())
+            {
+                if (fs::path r = probe(saved); !r.empty())
+                    return r;
+            }
+            else if (!hostDir.empty())
+            {
+                if (fs::path r = probe(hostDir / saved); !r.empty())
+                    return r;
+            }
+
+            if (hostDir.empty())
+                return {};
+
+            auto tail = [&](size_t k) -> fs::path {
+                fs::path t;
+                for (size_t i = segs.size() - k; i < segs.size(); ++i)
+                    t /= Utf8ToPath(segs[i]);
+                return t;
+            };
+            for (size_t k = segs.size(); k >= 1; --k)
+            {
+                const fs::path t = tail(k);
+                for (fs::path dir = hostDir; !dir.empty(); )
+                {
+                    if (fs::path r = probe(dir / t); !r.empty())
+                        return r;
+                    const fs::path up = dir.parent_path();
+                    if (k == 1 || up == dir)
+                        break;
+                    dir = up;
+                }
+            }
+            return {};
+        }
+
+        std::string PercentEncodeField(const std::string& s)
+        {
+            static constexpr char kHex[] = "0123456789ABCDEF";
+            std::string out;
+            out.reserve(s.size());
+            for (unsigned char c : s)
+            {
+                if (c == '%' || c == '\t' || c == '\n' || c == '\r')
+                {
+                    out.push_back('%');
+                    out.push_back(kHex[(c >> 4) & 0xFu]);
+                    out.push_back(kHex[c & 0xFu]);
+                }
+                else
+                {
+                    out.push_back(static_cast<char>(c));
+                }
+            }
+            return out;
+        }
+
+        bool PercentDecodeField(const std::string& s, std::string& out)
+        {
+            out.clear();
+            out.reserve(s.size());
+            auto hexVal = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                return -1;
+            };
+            for (size_t i = 0; i < s.size(); ++i)
+            {
+                if (s[i] == '%')
+                {
+                    if (i + 2 >= s.size()) return false;
+                    const int hi = hexVal(s[i + 1]);
+                    const int lo = hexVal(s[i + 2]);
+                    if (hi < 0 || lo < 0) return false;
+                    out.push_back(static_cast<char>((hi << 4) | lo));
+                    i += 2;
+                }
+                else
+                {
+                    out.push_back(s[i]);
+                }
+            }
+            return true;
+        }
+
+        struct XrefDepRecord
+        {
+            std::string BlockName;
+            std::string Status;        // "resolved" | "missing" | "unverifiable"
+            std::string ParentDir;
+            std::string RawPath;
+            std::string ResolvedPath;
+            uint64_t    SizeBytes = 0;
+            int64_t     MtimeMs   = 0;
+        };
+
+        std::vector<XrefDepRecord> CollectXrefDependencies(const Scene& scene, const std::string& sourcePath)
+        {
+            namespace fs = std::filesystem;
+            struct RawXrefBlk
+            {
+                std::string Name;
+                std::string XRefPath;
+                uint16_t    Flags      = 0;
+                bool        Unresolved = false;
+                size_t      PipeDepth  = 0;
+            };
+            std::vector<RawXrefBlk> blks;
+            scene.GetBlockTable().ForEach([&](BlockID, const BlockEntity& blk) {
+                if (!blk.IsXRef() || blk.IsXRefUnloaded())
+                    return;
+                const std::string& name = blk.GetName();
+                size_t pipes = 0;
+                for (char c : name)
+                    if (c == '|') ++pipes;
+                // 嵌套层中的叠加型（Overlay）外参不会被宿主加载，跳过
+                if (pipes > 0 && (blk.GetFlags() & BlockEntity::XRefOverlay))
+                    return;
+                blks.push_back({ name, blk.GetXRefPath(), blk.GetFlags(), blk.IsUnresolvedXRef(), pipes });
+            });
+
+            std::sort(blks.begin(), blks.end(), [](const RawXrefBlk& a, const RawXrefBlk& b) {
+                if (a.PipeDepth != b.PipeDepth) return a.PipeDepth < b.PipeDepth;
+                return a.Name < b.Name;
+            });
+
+            const fs::path hostDir = sourcePath.empty() ? fs::path() : Utf8ToPath(sourcePath).parent_path();
+            std::unordered_map<std::string, fs::path> resolvedDirByBlock;
+            std::vector<XrefDepRecord> deps;
+            deps.reserve(blks.size());
+
+            for (const auto& b : blks)
+            {
+                fs::path parentDir = hostDir;
+                if (b.PipeDepth > 0)
+                {
+                    const size_t lastPipe = b.Name.rfind('|');
+                    const std::string parentName = b.Name.substr(0, lastPipe);
+                    auto it = resolvedDirByBlock.find(parentName);
+                    if (it != resolvedDirByBlock.end())
+                        parentDir = it->second;
+                    else
+                        parentDir.clear();
+                }
+
+                XrefDepRecord rec;
+                rec.BlockName = b.Name;
+                rec.ParentDir = parentDir.empty() ? std::string() : PathToUtf8(parentDir);
+                rec.RawPath   = b.XRefPath;
+
+                if (b.XRefPath.empty() || parentDir.empty())
+                {
+                    rec.Status = "unverifiable";
+                    deps.push_back(std::move(rec));
+                    continue;
+                }
+
+                const fs::path found = ResolveXrefPathOnDisk(parentDir, b.XRefPath);
+                if (!found.empty())
+                {
+                    std::error_code ec;
+                    const fs::path canon = fs::weakly_canonical(found, ec);
+                    const fs::path bestP = (!ec && !canon.empty()) ? canon : found;
+                    const std::string utf8Found = PathToUtf8(bestP);
+                    uint64_t sz = 0;
+                    int64_t mt = 0;
+                    bool mtOk = false;
+                    if (GetFileStats(utf8Found, sz, mt, nullptr, &mtOk) && mtOk)
+                    {
+                        rec.Status       = "resolved";
+                        rec.ResolvedPath = utf8Found;
+                        rec.SizeBytes    = sz;
+                        rec.MtimeMs      = mt;
+                        resolvedDirByBlock[b.Name] = bestP.parent_path();
+                    }
+                    else
+                    {
+                        rec.Status = "unverifiable";
+                    }
+                }
+                else
+                {
+                    // 若加载期块内已有图元却在磁盘上无法定位源文件，视为不可确认（下次强制重导）
+                    rec.Status = b.Unresolved ? "missing" : "unverifiable";
+                }
+                deps.push_back(std::move(rec));
+            }
+            return deps;
+        }
+
+        std::string SerializeXrefDepsV1(const std::vector<XrefDepRecord>& deps)
+        {
+            std::string out = "v1:" + std::to_string(deps.size());
+            for (const auto& d : deps)
+            {
+                out.push_back('\n');
+                out += PercentEncodeField(d.Status);       out.push_back('\t');
+                out += PercentEncodeField(d.BlockName);    out.push_back('\t');
+                out += PercentEncodeField(d.ParentDir);    out.push_back('\t');
+                out += PercentEncodeField(d.RawPath);      out.push_back('\t');
+                out += PercentEncodeField(d.ResolvedPath); out.push_back('\t');
+                out += std::to_string(d.SizeBytes);        out.push_back('\t');
+                out += std::to_string(d.MtimeMs);
+            }
+            return out;
+        }
+
+        std::string FormatXrefDepsJson(const std::vector<XrefDepRecord>& deps)
+        {
+            JsonWriter jw(false);
+            jw.BeginArray();
+            for (const auto& d : deps)
+            {
+                jw.BeginObject();
+                jw.KeyString("block", d.BlockName);
+                jw.KeyString("status", d.Status);
+                jw.KeyOptString("raw_path", d.RawPath);
+                jw.KeyOptString("resolved_path", d.ResolvedPath);
+                if (d.Status == "resolved")
+                {
+                    jw.KeyUInt("size_bytes", d.SizeBytes);
+                    jw.KeyInt("mtime_ms", d.MtimeMs);
+                }
+                jw.EndObject();
+            }
+            jw.EndArray();
+            return jw.Take();
+        }
+
+        bool ParseAndVerifyXrefDepsV1(const std::string& encoded)
+        {
+            if (encoded.rfind("v1:", 0) != 0)
+                return false;
+
+            std::vector<std::string> lines;
+            size_t pos = 0;
+            while (pos <= encoded.size())
+            {
+                const size_t nl = encoded.find('\n', pos);
+                if (nl == std::string::npos)
+                {
+                    lines.push_back(encoded.substr(pos));
+                    break;
+                }
+                lines.push_back(encoded.substr(pos, nl - pos));
+                pos = nl + 1;
+            }
+            if (lines.empty())
+                return false;
+
+            char* endPtr = nullptr;
+            const unsigned long expectedCount = std::strtoul(lines[0].c_str() + 3, &endPtr, 10);
+            if (!endPtr || *endPtr != '\0' || lines.size() != static_cast<size_t>(expectedCount) + 1)
+                return false;
+
+            for (size_t i = 1; i < lines.size(); ++i)
+            {
+                std::vector<std::string> cols;
+                size_t p = 0;
+                while (p <= lines[i].size())
+                {
+                    const size_t tab = lines[i].find('\t', p);
+                    if (tab == std::string::npos)
+                    {
+                        cols.push_back(lines[i].substr(p));
+                        break;
+                    }
+                    cols.push_back(lines[i].substr(p, tab - p));
+                    p = tab + 1;
+                }
+                if (cols.size() != 7)
+                    return false;
+
+                std::string status, blockName, parentDir, rawPath, resolvedPath;
+                if (!PercentDecodeField(cols[0], status)
+                    || !PercentDecodeField(cols[1], blockName)
+                    || !PercentDecodeField(cols[2], parentDir)
+                    || !PercentDecodeField(cols[3], rawPath)
+                    || !PercentDecodeField(cols[4], resolvedPath))
+                {
+                    return false;
+                }
+                (void)blockName;
+
+                if (status == "unverifiable")
+                    return false;
+
+                const std::filesystem::path parentFs = parentDir.empty() ? std::filesystem::path() : Utf8ToPath(parentDir);
+                const std::filesystem::path nowFound = ResolveXrefPathOnDisk(parentFs, rawPath);
+
+                if (status == "missing")
+                {
+                    // 当初缺失的外参如今已补齐 -> 缓存失效
+                    if (!nowFound.empty())
+                        return false;
+                    continue;
+                }
+
+                if (status == "resolved")
+                {
+                    if (nowFound.empty() || resolvedPath.empty())
+                        return false;
+                    std::error_code ec;
+                    const std::filesystem::path canon = std::filesystem::weakly_canonical(nowFound, ec);
+                    const std::string nowUtf8 = PathToUtf8((!ec && !canon.empty()) ? canon : nowFound);
+                    if (!PathsReferToSameFile(nowUtf8, resolvedPath))
+                        return false;
+
+                    char* szEnd = nullptr;
+                    const uint64_t expectedSize = std::strtoull(cols[5].c_str(), &szEnd, 10);
+                    char* mtEnd = nullptr;
+                    const int64_t expectedMtime = std::strtoll(cols[6].c_str(), &mtEnd, 10);
+                    if (!szEnd || *szEnd != '\0' || !mtEnd || *mtEnd != '\0')
+                        return false;
+
+                    uint64_t curSize = 0;
+                    int64_t  curMtime = 0;
+                    bool curMtimeOk = false;
+                    if (!GetFileStats(nowUtf8, curSize, curMtime, nullptr, &curMtimeOk) || !curMtimeOk)
+                        return false;
+                    if (curSize != expectedSize || curMtime != expectedMtime)
+                        return false;
+                    continue;
+                }
+
+                return false;
+            }
+            return true;
+        }
+
+        std::string MakeUniqueExportTempPath(const std::string& outDbPath)
+        {
+            static std::atomic<uint64_t> s_seq{ 0 };
+#ifdef _WIN32
+            const unsigned long pid = static_cast<unsigned long>(GetCurrentProcessId());
+#else
+            const unsigned long pid = static_cast<unsigned long>(getpid());
+#endif
+            const uint64_t seq = ++s_seq;
+            return outDbPath + "." + std::to_string(pid) + "."
+                 + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())
+                 + "." + std::to_string(seq) + ".tmp";
         }
 
         std::string TrimUtf8(std::string s)
@@ -260,27 +670,6 @@ namespace MiniCAD::SaTool
             return totalLen;
         }
 
-        double ComputeHatchArea(const HatchEntity& hatch)
-        {
-            double total = 0.0;
-            for (const auto& loop : hatch.GetLoops())
-            {
-                std::vector<Math::Point3> pts;
-                for (const auto& edge : loop.Edges)
-                    edge.Tessellate(pts, false);
-                if (pts.size() < 3) continue;
-                double a2 = 0.0;
-                for (size_t i = 0; i < pts.size(); ++i)
-                {
-                    const auto& p = pts[i];
-                    const auto& q = pts[(i + 1) % pts.size()];
-                    a2 += p.x * q.y - q.x * p.y;
-                }
-                total += std::abs(a2) * 0.5;
-            }
-            return total;
-        }
-
         struct GeomSummary
         {
             std::optional<double> Length;
@@ -397,7 +786,8 @@ namespace MiniCAD::SaTool
             {
                 const auto& h = static_cast<const HatchEntity&>(e);
                 g.IsClosed = 1;
-                g.Area     = ComputeHatchArea(h);
+                // CAD-23：复用 HatchEntity.hpp 公共奇偶包含净面积算法（外环加、洞口减、洞内岛加回）
+                g.Area     = ComputeHatchNetArea(h, 0);
                 jw.BeginObject();
                 jw.KeyString("pattern", h.GetPattern().Name);
                 jw.KeyBool("solid", h.GetPattern().Solid);
@@ -462,9 +852,15 @@ namespace MiniCAD::SaTool
 
         std::string FormatDimensionText(const DimensionEntity& d)
         {
+            // CAD-19：先识别覆盖文本中是否含 <> 占位符（如 "约<>"、"<>（净宽）" 或含 MText 格式码），
+            // 含占位符时用真实测量值替换全部 <> 并保留前后缀；不含占位符的覆盖文本才直接返回。
             const std::string& ov = d.GetTextOverride();
-            if (!ov.empty() && ov != "<>")
-                return TrimUtf8(StripMTextInlineCodes(ov));
+            const std::string strippedOv = ov.empty() ? std::string() : StripMTextInlineCodes(ov);
+            const bool hasPlaceholder = strippedOv.find("<>") != std::string::npos;
+
+            if (!ov.empty() && !hasPlaceholder)
+                return TrimUtf8(strippedOv);
+
             char buf[64];
             const double val = d.Measurement();
             if (d.GetType() == DimType::Angular)
@@ -473,74 +869,20 @@ namespace MiniCAD::SaTool
                 std::snprintf(buf, sizeof(buf), "%.0f", std::round(val));
             else
                 std::snprintf(buf, sizeof(buf), "%.2f", val);
-            std::string num(buf);
-            if (ov.find("<>") != std::string::npos)
+            const std::string num(buf);
+
+            if (hasPlaceholder)
             {
-                std::string s = StripMTextInlineCodes(ov);
-                const size_t pos = s.find("<>");
-                if (pos != std::string::npos) s.replace(pos, 2, num);
+                std::string s = strippedOv;
+                size_t pos = 0;
+                while ((pos = s.find("<>", pos)) != std::string::npos)
+                {
+                    s.replace(pos, 2, num);
+                    pos += num.size();
+                }
                 return TrimUtf8(s);
             }
             return num;
-        }
-
-        bool ExecSql(sqlite3* db, const char* sql, std::string* error)
-        {
-            char* errMsg = nullptr;
-            const int rc = sqlite3_exec(db, sql, nullptr, nullptr, &errMsg);
-            if (rc != SQLITE_OK)
-            {
-                if (error) *error = std::string("SQLite 执行失败：") + (errMsg ? errMsg : sqlite3_errmsg(db));
-                if (errMsg) sqlite3_free(errMsg);
-                return false;
-            }
-            return true;
-        }
-
-        bool PrepareStmt(sqlite3* db, const char* sql, sqlite3_stmt*& stmt, std::string* error)
-        {
-            if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
-            {
-                if (error) *error = std::string("SQLite prepare 失败：") + sqlite3_errmsg(db);
-                return false;
-            }
-            return true;
-        }
-
-        bool StepReset(sqlite3* db, sqlite3_stmt* stmt, std::string* error)
-        {
-            const int rc = sqlite3_step(stmt);
-            sqlite3_reset(stmt);
-            sqlite3_clear_bindings(stmt);
-            if (rc != SQLITE_DONE)
-            {
-                if (error) *error = std::string("SQLite step 失败：") + sqlite3_errmsg(db);
-                return false;
-            }
-            return true;
-        }
-
-        void BindTextOrNull(sqlite3_stmt* st, int idx, const std::string& s)
-        {
-            if (s.empty()) sqlite3_bind_null(st, idx);
-            else sqlite3_bind_text(st, idx, s.c_str(), static_cast<int>(s.size()), SQLITE_TRANSIENT);
-        }
-
-        void BindTextNonNull(sqlite3_stmt* st, int idx, const std::string& s)
-        {
-            sqlite3_bind_text(st, idx, s.c_str(), static_cast<int>(s.size()), SQLITE_TRANSIENT);
-        }
-
-        void BindOptDouble(sqlite3_stmt* st, int idx, const std::optional<double>& v)
-        {
-            if (v.has_value() && std::isfinite(*v)) sqlite3_bind_double(st, idx, *v);
-            else sqlite3_bind_null(st, idx);
-        }
-
-        void BindOptInt(sqlite3_stmt* st, int idx, const std::optional<int>& v)
-        {
-            if (v.has_value()) sqlite3_bind_int(st, idx, *v);
-            else sqlite3_bind_null(st, idx);
         }
 
         constexpr const char* kSchemaDdl = R"SQL(
@@ -1000,32 +1342,38 @@ CREATE INDEX idx_tch_axes_label ON tch_axes(label);
 )SQL";
 
         bool TryReuseExistingDb(const std::string& dbPath, const std::string& sourcePath,
-                                uint64_t sourceSizeBytes, int64_t sourceMtimeMs,
+                                uint64_t sourceSizeBytes, int64_t sourceMtimeMs, bool sourceMtimeOk,
+                                bool includeBlockEntities,
                                 ExportDbResult& result)
         {
+            // 若无法确认宿主图修改时间，则不复用缓存（CAD-21）
+            if (!sourceMtimeOk)
+                return false;
+
             const std::filesystem::path p = Utf8ToPath(dbPath);
             std::error_code ec;
             if (!std::filesystem::exists(p, ec) || ec)
                 return false;
 
-            sqlite3* db = nullptr;
-            if (sqlite3_open_v2(dbPath.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK || !db)
-            {
-                if (db) sqlite3_close(db);
+            ScopedSqliteDb dbGuard;
+            if (!dbGuard.Open(dbPath, SQLITE_OPEN_READONLY, nullptr))
                 return false;
-            }
+            sqlite3* db = dbGuard.Get();
 
             std::map<std::string, std::string> meta;
-            sqlite3_stmt* st = nullptr;
-            if (sqlite3_prepare_v2(db, "SELECT key, value FROM meta;", -1, &st, nullptr) == SQLITE_OK)
             {
-                while (sqlite3_step(st) == SQLITE_ROW)
+                ScopedSqliteStmt st;
+                if (!st.Prepare(db, "SELECT key, value FROM meta;", nullptr))
+                    return false;
+                int rc = SQLITE_OK;
+                while ((rc = sqlite3_step(st.Get())) == SQLITE_ROW)
                 {
-                    const auto* k = reinterpret_cast<const char*>(sqlite3_column_text(st, 0));
-                    const auto* v = reinterpret_cast<const char*>(sqlite3_column_text(st, 1));
+                    const auto* k = reinterpret_cast<const char*>(sqlite3_column_text(st.Get(), 0));
+                    const auto* v = reinterpret_cast<const char*>(sqlite3_column_text(st.Get(), 1));
                     if (k && v) meta[k] = v;
                 }
-                sqlite3_finalize(st);
+                if (rc != SQLITE_DONE)
+                    return false;
             }
 
             auto getStr = [&](const char* k) -> std::string {
@@ -1033,30 +1381,35 @@ CREATE INDEX idx_tch_axes_label ON tch_axes(label);
                 return it != meta.end() ? it->second : std::string();
             };
 
+            const std::string storedSourcePath = getStr("source_path");
+            const bool sourcePathMatch =
+                NormalizePathForCompare(storedSourcePath) == NormalizePathForCompare(sourcePath)
+                || PathsReferToSameFile(storedSourcePath, sourcePath);
+
+            // CAD-21：校验 schema、导出选项（include_block_entities）、宿主文件指纹以及全部外参依赖指纹
             const bool match =
                 getStr("schema_version") == "1.0" &&
+                getStr("include_block_entities") == (includeBlockEntities ? "1" : "0") &&
                 getStr("source_size_bytes") == std::to_string(sourceSizeBytes) &&
                 getStr("source_mtime_ms") == std::to_string(sourceMtimeMs) &&
-                NormalizePathForCompare(getStr("source_path")) == NormalizePathForCompare(sourcePath);
+                sourcePathMatch &&
+                ParseAndVerifyXrefDepsV1(getStr("xref_deps_v1"));
 
             if (!match)
-            {
-                sqlite3_close(db);
                 return false;
-            }
 
-            auto countTable = [&](const char* tbl) -> int {
-                sqlite3_stmt* cs = nullptr;
-                int cnt = 0;
+            auto countTable = [&](const char* tbl, int& outCount) -> bool {
+                ScopedSqliteStmt cs;
                 const std::string q = std::string("SELECT COUNT(*) FROM ") + tbl + ";";
-                if (sqlite3_prepare_v2(db, q.c_str(), -1, &cs, nullptr) == SQLITE_OK)
-                {
-                    if (sqlite3_step(cs) == SQLITE_ROW) cnt = sqlite3_column_int(cs, 0);
-                    sqlite3_finalize(cs);
-                }
-                return cnt;
+                if (!cs.Prepare(db, q.c_str(), nullptr))
+                    return false;
+                if (sqlite3_step(cs.Get()) != SQLITE_ROW)
+                    return false;
+                outCount = sqlite3_column_int(cs.Get(), 0);
+                return true;
             };
 
+            result = {};
             result.Reused            = true;
             result.SchemaVersion     = "1.0";
             result.SourcePath        = sourcePath;
@@ -1077,33 +1430,35 @@ CREATE INDEX idx_tch_axes_label ON tch_axes(label);
                     std::strtod(getStr("model_maxy").c_str(), nullptr),
                 };
             }
-            result.Counts.Layers          = countTable("layers");
-            result.Counts.Layouts         = countTable("layouts");
-            result.Counts.Viewports       = countTable("viewports");
-            result.Counts.Blocks          = countTable("blocks");
-            result.Counts.BlockEntities   = countTable("block_entities");
-            result.Counts.Inserts         = countTable("inserts");
-            result.Counts.InsertAttribs   = countTable("insert_attribs");
-            result.Counts.Texts           = countTable("texts");
-            result.Counts.Entities        = countTable("entities");
-            result.Counts.TchWalls        = countTable("tch_walls");
-            result.Counts.TchOpenings     = countTable("tch_openings");
-            result.Counts.TchColumns      = countTable("tch_columns");
-            result.Counts.TchSpaces       = countTable("tch_spaces");
-            result.Counts.TchStairs       = countTable("tch_stairs");
-            result.Counts.TchDimensions   = countTable("tch_dimensions");
-            result.Counts.TchAxes         = countTable("tch_axes");
-            result.Counts.TchSheets       = countTable("tch_sheets");
-            result.Counts.TchFailed       = std::atoi(getStr("tch_failed_count").c_str());
+            if (!countTable("layers", result.Counts.Layers)
+                || !countTable("layouts", result.Counts.Layouts)
+                || !countTable("viewports", result.Counts.Viewports)
+                || !countTable("blocks", result.Counts.Blocks)
+                || !countTable("block_entities", result.Counts.BlockEntities)
+                || !countTable("inserts", result.Counts.Inserts)
+                || !countTable("insert_attribs", result.Counts.InsertAttribs)
+                || !countTable("texts", result.Counts.Texts)
+                || !countTable("entities", result.Counts.Entities)
+                || !countTable("tch_walls", result.Counts.TchWalls)
+                || !countTable("tch_openings", result.Counts.TchOpenings)
+                || !countTable("tch_columns", result.Counts.TchColumns)
+                || !countTable("tch_spaces", result.Counts.TchSpaces)
+                || !countTable("tch_stairs", result.Counts.TchStairs)
+                || !countTable("tch_dimensions", result.Counts.TchDimensions)
+                || !countTable("tch_axes", result.Counts.TchAxes)
+                || !countTable("tch_sheets", result.Counts.TchSheets))
             {
-                sqlite3_stmt* cs = nullptr;
-                if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM diagnostics WHERE kind='unresolved_xref';", -1, &cs, nullptr) == SQLITE_OK)
-                {
-                    if (sqlite3_step(cs) == SQLITE_ROW) result.Counts.UnresolvedXrefs = sqlite3_column_int(cs, 0);
-                    sqlite3_finalize(cs);
-                }
+                return false;
             }
-            sqlite3_close(db);
+            result.Counts.TchFailed = std::atoi(getStr("tch_failed_count").c_str());
+            {
+                ScopedSqliteStmt cs;
+                if (!cs.Prepare(db, "SELECT COUNT(*) FROM diagnostics WHERE kind='unresolved_xref';", nullptr))
+                    return false;
+                if (sqlite3_step(cs.Get()) != SQLITE_ROW)
+                    return false;
+                result.Counts.UnresolvedXrefs = sqlite3_column_int(cs.Get(), 0);
+            }
             return true;
         }
     }
@@ -1386,863 +1741,849 @@ CREATE INDEX idx_tch_axes_label ON tch_axes(label);
         result.InsunitsCode      = snap.InsunitsCode;
         result.InsunitsName      = snap.InsunitsName;
 
+        // CAD-22：直接调用 ExportSceneToSqlite 时同样防止覆盖源文件
+        if (!sourcePath.empty())
+        {
+            if (!ValidateIoPathConflicts({ { "输入图纸", sourcePath } }, { { "输出 SQLite", outDbPath } }, nullptr, error))
+                return false;
+        }
+
         // 创建父目录并准备临时文件
         const std::filesystem::path destP = Utf8ToPath(outDbPath);
         std::error_code ec;
         if (destP.has_parent_path())
             std::filesystem::create_directories(destP.parent_path(), ec);
 
-#ifdef _WIN32
-        const unsigned long pid = static_cast<unsigned long>(GetCurrentProcessId());
-#else
-        const unsigned long pid = static_cast<unsigned long>(getpid());
-#endif
-        const std::string tmpPath = outDbPath + "." + std::to_string(pid) + ".tmp";
+        const std::string tmpPath = MakeUniqueExportTempPath(outDbPath);
         std::filesystem::remove(Utf8ToPath(tmpPath), ec);
 
-        sqlite3* db = nullptr;
-        if (sqlite3_open_v2(tmpPath.c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK || !db)
-        {
-            if (error) *error = std::string("无法创建临时 SQLite 文件：") + (db ? sqlite3_errmsg(db) : tmpPath);
-            if (db) sqlite3_close(db);
+        // RAII 声明顺序：tempGuard -> dbGuard -> tx -> stmt，异常或失败自动回滚、关连接并删除临时库（CAD-20）
+        ScopedTempFile tempGuard(tmpPath);
+        ScopedSqliteDb dbGuard;
+        if (!dbGuard.Open(tmpPath, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, error))
             return false;
-        }
+        sqlite3* db = dbGuard.Get();
 
-        auto cleanupFail = [&]() -> bool {
-            if (db) { sqlite3_close(db); db = nullptr; }
-            std::error_code rmEc;
-            std::filesystem::remove(Utf8ToPath(tmpPath), rmEc);
+        if (!ExecSqliteChecked(db,
+                               "PRAGMA journal_mode = OFF;"
+                               "PRAGMA synchronous = OFF;"
+                               "PRAGMA temp_store = MEMORY;"
+                               "PRAGMA cache_size = -65536;",
+                               error))
             return false;
-        };
 
-        if (!ExecSql(db,
-                     "PRAGMA journal_mode = OFF;"
-                     "PRAGMA synchronous = OFF;"
-                     "PRAGMA temp_store = MEMORY;"
-                     "PRAGMA cache_size = -65536;"
-                     "BEGIN IMMEDIATE;",
-                     error))
-            return cleanupFail();
-
-        if (!ExecSql(db, kSchemaDdl, error))
-            return cleanupFail();
-
-        // 预统计图层实体数、布局实体/视口数、块被引用次数
-        struct LayerStat { int total = 0, model = 0, paper = 0, block = 0; };
-        std::unordered_map<std::string, LayerStat> layerStats;
-        std::unordered_map<uint64_t, int> layoutEntityCounts;
-        std::unordered_map<uint64_t, int> layoutViewportCounts;
-        std::unordered_map<std::string, int> blockInsertCounts;
-
-        AABB modelBounds = AABB::Empty();
-        int modelEntityCount = 0;
-        int paperEntityCount = 0;
-
-        // 1. 写入 entities + entities_rtree（建立 ObjectID -> entities.id 映射）
-        std::unordered_map<uint64_t, int64_t> objectToEntityId;
         {
-            sqlite3_stmt* stEnt = nullptr;
-            sqlite3_stmt* stRtr = nullptr;
-            const char* sqlEnt =
-                "INSERT INTO entities("
-                "handle,entity_type,dxf_name,layer,space,layout_name,layout_key,block_path,"
-                "color_aci,color_rgb,linetype,lineweight_mm,visible,"
-                "minx,miny,maxx,maxy,length,area,is_closed,const_width,vertex_count,bulge_count,geom_json"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-            const char* sqlRtr = "INSERT INTO entities_rtree(id,minx,maxx,miny,maxy) VALUES(?,?,?,?,?);";
-            if (!PrepareStmt(db, sqlEnt, stEnt, error) || !PrepareStmt(db, sqlRtr, stRtr, error))
+            ScopedSqliteTransaction tx(db);
+            if (!tx.Begin("BEGIN IMMEDIATE;", error))
+                return false;
+
+            if (!ExecSqliteChecked(db, kSchemaDdl, error))
+                return false;
+
+            // 预统计图层实体数、布局实体/视口数、块被引用次数
+            struct LayerStat { int total = 0, model = 0, paper = 0, block = 0; };
+            std::unordered_map<std::string, LayerStat> layerStats;
+            std::unordered_map<uint64_t, int> layoutEntityCounts;
+            std::unordered_map<uint64_t, int> layoutViewportCounts;
+            std::unordered_map<std::string, int> blockInsertCounts;
+
+            AABB modelBounds = AABB::Empty();
+            int modelEntityCount = 0;
+            int paperEntityCount = 0;
+
+            // 1. 写入 entities + entities_rtree（建立 ObjectID -> entities.id 映射）
+            std::unordered_map<uint64_t, int64_t> objectToEntityId;
             {
-                if (stEnt) sqlite3_finalize(stEnt);
-                if (stRtr) sqlite3_finalize(stRtr);
-                return cleanupFail();
-            }
+                ScopedSqliteStmt stEnt;
+                ScopedSqliteStmt stRtr;
+                const char* sqlEnt =
+                    "INSERT INTO entities("
+                    "handle,entity_type,dxf_name,layer,space,layout_name,layout_key,block_path,"
+                    "color_aci,color_rgb,linetype,lineweight_mm,visible,"
+                    "minx,miny,maxx,maxy,length,area,is_closed,const_width,vertex_count,bulge_count,geom_json"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
+                const char* sqlRtr = "INSERT INTO entities_rtree(id,minx,maxx,miny,maxy) VALUES(?,?,?,?,?);";
+                if (!stEnt.Prepare(db, sqlEnt, error) || !stRtr.Prepare(db, sqlRtr, error))
+                    return false;
 
-            bool ok = true;
-            scene.ForEachObject([&](const Object& o) {
-                if (!ok || !o.IsKindOf<Entity>()) return;
-                const auto& e = static_cast<const Entity&>(o);
-                const EntityAttr& attr = e.GetAttr();
-                const std::string layer = LayerNameById(scene, attr.LayerId);
-                const bool isPaper = attr.InPaperSpace;
-                const std::string space = isPaper ? "paper" : "model";
-                const std::string layoutName = LayoutNameForEntity(scene, e);
-                const uint64_t layoutKey = isPaper ? attr.LayoutKey : 0;
+                bool ok = true;
+                scene.ForEachObject([&](const Object& o) {
+                    if (!ok || !o.IsKindOf<Entity>()) return;
+                    const auto& e = static_cast<const Entity&>(o);
+                    const EntityAttr& attr = e.GetAttr();
+                    const std::string layer = LayerNameById(scene, attr.LayerId);
+                    const bool isPaper = attr.InPaperSpace;
+                    const std::string space = isPaper ? "paper" : "model";
+                    const std::string layoutName = LayoutNameForEntity(scene, e);
+                    const uint64_t layoutKey = isPaper ? attr.LayoutKey : 0;
 
-                auto& ls = layerStats[layer];
-                ++ls.total;
-                if (isPaper) { ++ls.paper; ++paperEntityCount; }
-                else         { ++ls.model; ++modelEntityCount; }
-                ++layoutEntityCounts[layoutKey];
-                if (e.IsKindOf<ViewportEntity>())
-                    ++layoutViewportCounts[layoutKey];
+                    auto& ls = layerStats[layer];
+                    ++ls.total;
+                    if (isPaper) { ++ls.paper; ++paperEntityCount; }
+                    else         { ++ls.model; ++modelEntityCount; }
+                    ++layoutEntityCounts[layoutKey];
+                    if (e.IsKindOf<ViewportEntity>())
+                        ++layoutViewportCounts[layoutKey];
 
-                uint64_t handle = 0;
-                std::string dxfName;
-                bool isTch = false;
-                if (auto it = snap.EntityOrigins.find(e.GetID()); it != snap.EntityOrigins.end())
-                {
-                    handle  = it->second.Handle;
-                    dxfName = it->second.DxfName;
-                    isTch   = it->second.IsTchSynthesized;
-                }
-
-                // 铁律：TCH 对象记真实天正类名，不记 *U_TCH_* 匿名块 INSERT
-                const std::string entityType = (isTch && !dxfName.empty()) ? dxfName : std::string(SceneEntityTypeName(e));
-                if (dxfName.empty()) dxfName = entityType;
-
-                const AABB box = e.IsBoundless() ? AABB::Empty() : e.GetBoundingBox();
-                const bool validBox = !e.IsBoundless() && IsFiniteBox(box);
-                if (validBox && !isPaper)
-                {
-                    modelBounds.Expand(box.Min);
-                    modelBounds.Expand(box.Max);
-                }
-
-                const GeomSummary geom = isTch ? GeomSummary{} : ExtractGeomSummary(e);
-
-                BindTextOrNull(stEnt, 1, FormatHandleHex(handle));
-                BindTextNonNull(stEnt, 2, entityType);
-                BindTextOrNull(stEnt, 3, dxfName);
-                BindTextNonNull(stEnt, 4, layer);
-                BindTextNonNull(stEnt, 5, space);
-                BindTextNonNull(stEnt, 6, layoutName);
-                sqlite3_bind_int64(stEnt, 7, static_cast<sqlite3_int64>(layoutKey));
-                BindTextNonNull(stEnt, 8, "");
-
-                if (attr.Color.Method == ColorMethod::ByAci)
-                    sqlite3_bind_int(stEnt, 9, static_cast<int>(attr.Color.Aci));
-                else
-                    sqlite3_bind_null(stEnt, 9);
-
-                if (attr.Color.Method == ColorMethod::ByRgb || attr.Color.Method == ColorMethod::ByAci)
-                    BindTextNonNull(stEnt, 10, FormatColorRgbHex(attr.Color.Rgba.r, attr.Color.Rgba.g, attr.Color.Rgba.b));
-                else
-                    sqlite3_bind_null(stEnt, 10);
-
-                BindTextNonNull(stEnt, 11, LineTypeNameById(scene, attr.LineType));
-                const double lwMm = LineweightToMillimeters(attr.Lineweight);
-                if (lwMm > 0.0) sqlite3_bind_double(stEnt, 12, lwMm);
-                else            sqlite3_bind_null(stEnt, 12);
-                sqlite3_bind_int(stEnt, 13, attr.Visible ? 1 : 0);
-
-                if (validBox)
-                {
-                    sqlite3_bind_double(stEnt, 14, box.Min.x);
-                    sqlite3_bind_double(stEnt, 15, box.Min.y);
-                    sqlite3_bind_double(stEnt, 16, box.Max.x);
-                    sqlite3_bind_double(stEnt, 17, box.Max.y);
-                }
-                else
-                {
-                    sqlite3_bind_null(stEnt, 14);
-                    sqlite3_bind_null(stEnt, 15);
-                    sqlite3_bind_null(stEnt, 16);
-                    sqlite3_bind_null(stEnt, 17);
-                }
-                BindOptDouble(stEnt, 18, geom.Length);
-                BindOptDouble(stEnt, 19, geom.Area);
-                BindOptInt(stEnt, 20, geom.IsClosed);
-                BindOptDouble(stEnt, 21, geom.ConstWidth);
-                BindOptInt(stEnt, 22, geom.VertexCount);
-                BindOptInt(stEnt, 23, geom.BulgeCount);
-                BindTextOrNull(stEnt, 24, geom.GeomJson);
-
-                if (!StepReset(db, stEnt, error)) { ok = false; return; }
-                const int64_t rowId = sqlite3_last_insert_rowid(db);
-                objectToEntityId[e.GetID()] = rowId;
-                ++result.Counts.Entities;
-
-                if (validBox)
-                {
-                    // R-tree 列序：(id, minx, maxx, miny, maxy)
-                    sqlite3_bind_int64(stRtr, 1, rowId);
-                    sqlite3_bind_double(stRtr, 2, box.Min.x);
-                    sqlite3_bind_double(stRtr, 3, box.Max.x);
-                    sqlite3_bind_double(stRtr, 4, box.Min.y);
-                    sqlite3_bind_double(stRtr, 5, box.Max.y);
-                    if (!StepReset(db, stRtr, error)) { ok = false; return; }
-                }
-            });
-
-            sqlite3_finalize(stEnt);
-            sqlite3_finalize(stRtr);
-            if (!ok) return cleanupFail();
-        }
-
-        // 2. 写入 inserts + insert_attribs（递归展开普通块引用，排除 *U_TCH_* 内部包裹块）
-        {
-            sqlite3_stmt* stIns = nullptr;
-            sqlite3_stmt* stAtt = nullptr;
-            const char* sqlIns =
-                "INSERT INTO inserts("
-                "entity_id,parent_insert_id,depth,handle,block_name,block_path,"
-                "layer,space,layout_name,x,y,z,scale_x,scale_y,scale_z,rotation_deg,"
-                "col_count,row_count,col_spacing,row_spacing,has_xclip,xclip_inverted,xclip_boundary_json,"
-                "attrib_count,minx,miny,maxx,maxy"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-            const char* sqlAtt =
-                "INSERT INTO insert_attribs("
-                "insert_id,insert_handle,block_name,tag,value,layer,space,layout_name,"
-                "x,y,height,rotation_deg,is_invisible"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?);";
-            if (!PrepareStmt(db, sqlIns, stIns, error) || !PrepareStmt(db, sqlAtt, stAtt, error))
-            {
-                if (stIns) sqlite3_finalize(stIns);
-                if (stAtt) sqlite3_finalize(stAtt);
-                return cleanupFail();
-            }
-
-            bool ok = true;
-            std::function<void(const InsertEntity&, const Math::Mat4&, int64_t, int64_t, int,
-                               const std::string&, const std::string&, const std::string&, const std::string&)> walkInsert;
-            walkInsert = [&](const InsertEntity& ins, const Math::Mat4& parentMat, int64_t topEntId,
-                             int64_t parentInsId, int depth, const std::string& parentPath,
-                             const std::string& space, const std::string& layout, const std::string& handleHex) {
-                if (!ok || depth > 12) return;
-                if (IsTchInternalBlockName(ins.GetBlockName())) return;
-
-                ++blockInsertCounts[ins.GetBlockName()];
-                const std::string path = parentPath.empty() ? ins.GetBlockName() : parentPath + "/" + ins.GetBlockName();
-                const Math::Point3 wPos = parentMat.TransformPoint(ins.GetPosition());
-                const Math::Point3 p0 = parentMat.TransformPoint({ 0, 0, 0 });
-                const Math::Point3 px = parentMat.TransformPoint({ 1, 0, 0 });
-                const Math::Point3 py = parentMat.TransformPoint({ 0, 1, 0 });
-                const double psx = std::hypot(px.x - p0.x, px.y - p0.y);
-                const double psy = std::hypot(py.x - p0.x, py.y - p0.y);
-                const double prot = std::atan2(px.y - p0.y, px.x - p0.x);
-
-                if (topEntId > 0) sqlite3_bind_int64(stIns, 1, topEntId);
-                else              sqlite3_bind_null(stIns, 1);
-                if (parentInsId > 0) sqlite3_bind_int64(stIns, 2, parentInsId);
-                else                 sqlite3_bind_null(stIns, 2);
-                sqlite3_bind_int(stIns, 3, depth);
-                BindTextOrNull(stIns, 4, handleHex);
-                BindTextNonNull(stIns, 5, ins.GetBlockName());
-                BindTextNonNull(stIns, 6, path);
-                BindTextNonNull(stIns, 7, LayerNameById(scene, ins.GetLayerID()));
-                BindTextNonNull(stIns, 8, space);
-                BindTextNonNull(stIns, 9, layout);
-                sqlite3_bind_double(stIns, 10, wPos.x);
-                sqlite3_bind_double(stIns, 11, wPos.y);
-                sqlite3_bind_double(stIns, 12, wPos.z);
-                sqlite3_bind_double(stIns, 13, ins.GetScale().x * psx);
-                sqlite3_bind_double(stIns, 14, ins.GetScale().y * psy);
-                sqlite3_bind_double(stIns, 15, ins.GetScale().z);
-                sqlite3_bind_double(stIns, 16, (ins.GetRotation() + prot) * kRadToDeg);
-                sqlite3_bind_int(stIns, 17, ins.GetColumnCount());
-                sqlite3_bind_int(stIns, 18, ins.GetRowCount());
-                sqlite3_bind_double(stIns, 19, ins.GetColumnSpacing());
-                sqlite3_bind_double(stIns, 20, ins.GetRowSpacing());
-                sqlite3_bind_int(stIns, 21, ins.HasClipBoundary() ? 1 : 0);
-                sqlite3_bind_int(stIns, 22, 0);
-
-                if (ins.HasClipBoundary())
-                {
-                    const Math::Mat4 cm = ins.CellMatrix(0, 0) * parentMat;
-                    JsonWriter cw;
-                    cw.BeginArray();
-                    for (const auto& cp : ins.GetClipBoundary())
+                    uint64_t handle = 0;
+                    std::string dxfName;
+                    bool isTch = false;
+                    if (auto it = snap.EntityOrigins.find(e.GetID()); it != snap.EntityOrigins.end())
                     {
-                        const Math::Point3 wp = cm.TransformPoint(cp);
-                        cw.BeginArray(); cw.Double(wp.x, 3); cw.Double(wp.y, 3); cw.EndArray();
+                        handle  = it->second.Handle;
+                        dxfName = it->second.DxfName;
+                        isTch   = it->second.IsTchSynthesized;
                     }
-                    cw.EndArray();
-                    BindTextNonNull(stIns, 23, cw.Str());
-                }
-                else
-                {
-                    sqlite3_bind_null(stIns, 23);
-                }
 
-                sqlite3_bind_int(stIns, 24, static_cast<int>(ins.GetAttribs().size()));
-                const AABB localB = ins.GetBoundingBox();
-                if (IsFiniteBox(localB))
-                {
-                    AABB wb = AABB::Empty();
-                    const Math::Point3 cs[4] = {
-                        { localB.Min.x, localB.Min.y, 0 }, { localB.Max.x, localB.Min.y, 0 },
-                        { localB.Min.x, localB.Max.y, 0 }, { localB.Max.x, localB.Max.y, 0 },
-                    };
-                    for (const auto& c : cs) wb.Expand(parentMat.TransformPoint(c));
-                    sqlite3_bind_double(stIns, 25, wb.Min.x);
-                    sqlite3_bind_double(stIns, 26, wb.Min.y);
-                    sqlite3_bind_double(stIns, 27, wb.Max.x);
-                    sqlite3_bind_double(stIns, 28, wb.Max.y);
-                }
-                else
-                {
-                    sqlite3_bind_null(stIns, 25); sqlite3_bind_null(stIns, 26);
-                    sqlite3_bind_null(stIns, 27); sqlite3_bind_null(stIns, 28);
-                }
+                    // 铁律：TCH 对象记真实天正类名，不记 *U_TCH_* 匿名块 INSERT
+                    const std::string entityType = (isTch && !dxfName.empty()) ? dxfName : std::string(SceneEntityTypeName(e));
+                    if (dxfName.empty()) dxfName = entityType;
 
-                if (!StepReset(db, stIns, error)) { ok = false; return; }
-                const int64_t thisInsId = sqlite3_last_insert_rowid(db);
-                ++result.Counts.Inserts;
-
-                for (const auto& a : ins.GetAttribs())
-                {
-                    if (!a) continue;
-                    const Math::Point3 aw = parentMat.TransformPoint(a->GetPosition());
-                    sqlite3_bind_int64(stAtt, 1, thisInsId);
-                    BindTextOrNull(stAtt, 2, handleHex);
-                    BindTextNonNull(stAtt, 3, ins.GetBlockName());
-                    BindTextNonNull(stAtt, 4, a->GetTag());
-                    BindTextNonNull(stAtt, 5, a->GetText());
-                    BindTextNonNull(stAtt, 6, LayerNameById(scene, a->GetLayerID()));
-                    BindTextNonNull(stAtt, 7, space);
-                    BindTextNonNull(stAtt, 8, layout);
-                    sqlite3_bind_double(stAtt, 9, aw.x);
-                    sqlite3_bind_double(stAtt, 10, aw.y);
-                    sqlite3_bind_double(stAtt, 11, a->GetHeight() * psy);
-                    sqlite3_bind_double(stAtt, 12, (a->GetRotation() + prot) * kRadToDeg);
-                    sqlite3_bind_int(stAtt, 13, a->IsInvisible() ? 1 : 0);
-                    if (!StepReset(db, stAtt, error)) { ok = false; return; }
-                    ++result.Counts.InsertAttribs;
-                }
-
-                // 递归嵌套 INSERT（仅沿单元格 (0,0) 追踪，防阵列嵌套爆炸）
-                if (const BlockEntity* blk = ins.GetBlock())
-                {
-                    const Math::Mat4 cm = ins.CellMatrix(0, 0) * parentMat;
-                    for (const auto& child : blk->GetEntities())
-                        if (child && child->IsKindOf<InsertEntity>())
-                            walkInsert(static_cast<const InsertEntity&>(*child), cm, 0, thisInsId, depth + 1, path, space, layout, {});
-                }
-            };
-
-            scene.ForEachObject([&](const Object& o) {
-                if (!ok || !o.IsKindOf<InsertEntity>()) return;
-                const auto& ins = static_cast<const InsertEntity&>(o);
-                if (auto it = snap.EntityOrigins.find(ins.GetID()); it != snap.EntityOrigins.end() && it->second.IsTchSynthesized)
-                    return;
-                const std::string space  = ins.GetAttr().InPaperSpace ? "paper" : "model";
-                const std::string layout = LayoutNameForEntity(scene, ins);
-                int64_t entId = 0;
-                if (auto it = objectToEntityId.find(ins.GetID()); it != objectToEntityId.end())
-                    entId = it->second;
-                std::string handleHex;
-                if (auto it = snap.EntityOrigins.find(ins.GetID()); it != snap.EntityOrigins.end())
-                    handleHex = FormatHandleHex(it->second.Handle);
-                walkInsert(ins, Math::Mat4::Identity(), entId, 0, 0, "", space, layout, handleHex);
-            });
-
-            sqlite3_finalize(stIns);
-            sqlite3_finalize(stAtt);
-            if (!ok) return cleanupFail();
-        }
-
-        // 3. 写入 blocks + block_entities
-        {
-            sqlite3_stmt* stBlk = nullptr;
-            sqlite3_stmt* stBe  = nullptr;
-            const char* sqlBlk =
-                "INSERT INTO blocks("
-                "name,base_x,base_y,base_z,flags,is_anonymous,is_xref,xref_path,xref_resolved,"
-                "description,entity_count,insert_count,minx,miny,maxx,maxy,layers_json,entity_types_json"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-            const char* sqlBe =
-                "INSERT INTO block_entities("
-                "block_name,entity_type,layer,minx,miny,maxx,maxy,length,geom_json"
-                ") VALUES(?,?,?,?,?,?,?,?,?);";
-            if (!PrepareStmt(db, sqlBlk, stBlk, error) || !PrepareStmt(db, sqlBe, stBe, error))
-            {
-                if (stBlk) sqlite3_finalize(stBlk);
-                if (stBe)  sqlite3_finalize(stBe);
-                return cleanupFail();
-            }
-
-            bool ok = true;
-            scene.GetBlockTable().ForEach([&](BlockID, const BlockEntity& blk) {
-                if (!ok) return;
-                if (IsTchInternalBlockName(blk.GetName())) return;
-
-                std::map<std::string, int> blkLayers;
-                std::map<std::string, int> blkTypes;
-                const bool namedNonAnon = !blk.IsAnonymous();
-                for (const auto& child : blk.GetEntities())
-                {
-                    if (!child) continue;
-                    const std::string lyr = LayerNameById(scene, child->GetLayerID());
-                    const std::string typ = SceneEntityTypeName(*child);
-                    ++blkLayers[lyr];
-                    ++blkTypes[typ];
-                    if (namedNonAnon)
+                    const AABB box = e.IsBoundless() ? AABB::Empty() : e.GetBoundingBox();
+                    const bool validBox = !e.IsBoundless() && IsFiniteBox(box);
+                    if (validBox && !isPaper)
                     {
-                        ++layerStats[lyr].block;
-                        if (includeBlockEntities)
+                        modelBounds.Expand(box.Min);
+                        modelBounds.Expand(box.Max);
+                    }
+
+                    const GeomSummary geom = isTch ? GeomSummary{} : ExtractGeomSummary(e);
+
+                    const bool aciOk = (attr.Color.Method == ColorMethod::ByAci)
+                        ? stEnt.BindInt(9, static_cast<int>(attr.Color.Aci), error)
+                        : stEnt.BindNull(9, error);
+                    const bool rgbOk = (attr.Color.Method == ColorMethod::ByRgb || attr.Color.Method == ColorMethod::ByAci)
+                        ? stEnt.BindText(10, FormatColorRgbHex(attr.Color.Rgba.r, attr.Color.Rgba.g, attr.Color.Rgba.b), error)
+                        : stEnt.BindNull(10, error);
+                    const double lwMm = LineweightToMillimeters(attr.Lineweight);
+                    const bool lwOk = (lwMm > 0.0) ? stEnt.BindDouble(12, lwMm, error) : stEnt.BindNull(12, error);
+                    const bool boxOk = validBox
+                        ? (stEnt.BindDouble(14, box.Min.x, error) && stEnt.BindDouble(15, box.Min.y, error)
+                           && stEnt.BindDouble(16, box.Max.x, error) && stEnt.BindDouble(17, box.Max.y, error))
+                        : (stEnt.BindNull(14, error) && stEnt.BindNull(15, error)
+                           && stEnt.BindNull(16, error) && stEnt.BindNull(17, error));
+
+                    if (!stEnt.BindOptText(1, FormatHandleHex(handle), error)
+                        || !stEnt.BindText(2, entityType, error)
+                        || !stEnt.BindOptText(3, dxfName, error)
+                        || !stEnt.BindText(4, layer, error)
+                        || !stEnt.BindText(5, space, error)
+                        || !stEnt.BindText(6, layoutName, error)
+                        || !stEnt.BindInt64(7, static_cast<int64_t>(layoutKey), error)
+                        || !stEnt.BindText(8, "", error)
+                        || !aciOk
+                        || !rgbOk
+                        || !stEnt.BindText(11, LineTypeNameById(scene, attr.LineType), error)
+                        || !lwOk
+                        || !stEnt.BindInt(13, attr.Visible ? 1 : 0, error)
+                        || !boxOk
+                        || !stEnt.BindOptDouble(18, geom.Length, error)
+                        || !stEnt.BindOptDouble(19, geom.Area, error)
+                        || !stEnt.BindOptInt(20, geom.IsClosed, error)
+                        || !stEnt.BindOptDouble(21, geom.ConstWidth, error)
+                        || !stEnt.BindOptInt(22, geom.VertexCount, error)
+                        || !stEnt.BindOptInt(23, geom.BulgeCount, error)
+                        || !stEnt.BindOptText(24, geom.GeomJson, error)
+                        || !stEnt.StepDone(error))
+                    {
+                        ok = false;
+                        return;
+                    }
+
+                    const int64_t rowId = sqlite3_last_insert_rowid(db);
+                    objectToEntityId[e.GetID()] = rowId;
+                    ++result.Counts.Entities;
+
+                    if (validBox)
+                    {
+                        // R-tree 列序：(id, minx, maxx, miny, maxy)
+                        if (!stRtr.BindInt64(1, rowId, error)
+                            || !stRtr.BindDouble(2, box.Min.x, error)
+                            || !stRtr.BindDouble(3, box.Max.x, error)
+                            || !stRtr.BindDouble(4, box.Min.y, error)
+                            || !stRtr.BindDouble(5, box.Max.y, error)
+                            || !stRtr.StepDone(error))
                         {
-                            const AABB b = child->IsBoundless() ? AABB::Empty() : child->GetBoundingBox();
-                            const bool validB = !child->IsBoundless() && IsFiniteBox(b);
-                            const GeomSummary gs = ExtractGeomSummary(*child);
-                            BindTextNonNull(stBe, 1, blk.GetName());
-                            BindTextNonNull(stBe, 2, typ);
-                            BindTextNonNull(stBe, 3, lyr);
-                            if (validB)
-                            {
-                                sqlite3_bind_double(stBe, 4, b.Min.x);
-                                sqlite3_bind_double(stBe, 5, b.Min.y);
-                                sqlite3_bind_double(stBe, 6, b.Max.x);
-                                sqlite3_bind_double(stBe, 7, b.Max.y);
-                            }
-                            else
-                            {
-                                sqlite3_bind_null(stBe, 4); sqlite3_bind_null(stBe, 5);
-                                sqlite3_bind_null(stBe, 6); sqlite3_bind_null(stBe, 7);
-                            }
-                            BindOptDouble(stBe, 8, gs.Length);
-                            BindTextOrNull(stBe, 9, gs.GeomJson);
-                            if (!StepReset(db, stBe, error)) { ok = false; return; }
-                            ++result.Counts.BlockEntities;
+                            ok = false;
+                            return;
                         }
                     }
-                }
-
-                JsonWriter lw, tw;
-                lw.BeginObject();
-                for (const auto& [k, v] : blkLayers) lw.KeyInt(k, v);
-                lw.EndObject();
-                tw.BeginObject();
-                for (const auto& [k, v] : blkTypes) tw.KeyInt(k, v);
-                tw.EndObject();
-
-                const AABB bb = blk.GetBoundingBox();
-                const bool validBb = IsFiniteBox(bb);
-                BindTextNonNull(stBlk, 1, blk.GetName());
-                sqlite3_bind_double(stBlk, 2, blk.GetBasePoint().x);
-                sqlite3_bind_double(stBlk, 3, blk.GetBasePoint().y);
-                sqlite3_bind_double(stBlk, 4, blk.GetBasePoint().z);
-                sqlite3_bind_int(stBlk, 5, static_cast<int>(blk.GetFlags()));
-                sqlite3_bind_int(stBlk, 6, blk.IsAnonymous() ? 1 : 0);
-                sqlite3_bind_int(stBlk, 7, blk.IsXRef() ? 1 : 0);
-                BindTextOrNull(stBlk, 8, blk.GetXRefPath());
-                sqlite3_bind_int(stBlk, 9, (blk.IsXRef() && !blk.IsUnresolvedXRef()) ? 1 : 0);
-                BindTextOrNull(stBlk, 10, blk.GetDescription());
-                sqlite3_bind_int(stBlk, 11, static_cast<int>(blk.EntityCount()));
-                sqlite3_bind_int(stBlk, 12, blockInsertCounts[blk.GetName()]);
-                if (validBb)
-                {
-                    sqlite3_bind_double(stBlk, 13, bb.Min.x);
-                    sqlite3_bind_double(stBlk, 14, bb.Min.y);
-                    sqlite3_bind_double(stBlk, 15, bb.Max.x);
-                    sqlite3_bind_double(stBlk, 16, bb.Max.y);
-                }
-                else
-                {
-                    sqlite3_bind_null(stBlk, 13); sqlite3_bind_null(stBlk, 14);
-                    sqlite3_bind_null(stBlk, 15); sqlite3_bind_null(stBlk, 16);
-                }
-                BindTextNonNull(stBlk, 17, lw.Str());
-                BindTextNonNull(stBlk, 18, tw.Str());
-                if (!StepReset(db, stBlk, error)) { ok = false; return; }
-                ++result.Counts.Blocks;
-            });
-
-            sqlite3_finalize(stBlk);
-            sqlite3_finalize(stBe);
-            if (!ok) return cleanupFail();
-        }
-
-        // 4. 写入 layers（保留原始 is_on / is_frozen 分离语义）
-        {
-            sqlite3_stmt* st = nullptr;
-            const char* sql =
-                "INSERT INTO layers("
-                "name,color_aci,color_rgb,is_on,is_frozen,is_locked,is_visible,is_plottable,"
-                "linetype,lineweight_mm,entity_count,model_entity_count,paper_entity_count,block_entity_count"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-            if (!PrepareStmt(db, sql, st, error)) return cleanupFail();
-
-            const LayerManager& lm = scene.GetLayerManager();
-            for (LayerID id : lm.GetAllLayerIDs())
-            {
-                const Layer* l = lm.GetLayer(id);
-                if (!l) continue;
-                const auto rfIt = snap.LayerFlagsById.find(id);
-                const bool hasRaw = (rfIt != snap.LayerFlagsById.end());
-
-                BindTextNonNull(st, 1, l->GetName());
-                if (hasRaw && !rfIt->second.HasTrueColor && rfIt->second.ColorAci > 0)
-                    sqlite3_bind_int(st, 2, rfIt->second.ColorAci);
-                else
-                    sqlite3_bind_null(st, 2);
-
-                const auto& col = l->GetColor();
-                BindTextNonNull(st, 3, FormatColorRgbHex(col.r, col.g, col.b));
-
-                const bool isOn       = hasRaw ? rfIt->second.IsOn : l->IsVisible();
-                const bool isFrozen   = hasRaw ? rfIt->second.IsFrozen : false;
-                const bool isLocked   = hasRaw ? rfIt->second.IsLocked : l->IsLocked();
-                const bool isVisible  = isOn && !isFrozen;
-                const bool isPlot     = hasRaw ? rfIt->second.IsPlottable : true;
-                sqlite3_bind_int(st, 4, isOn ? 1 : 0);
-                sqlite3_bind_int(st, 5, isFrozen ? 1 : 0);
-                sqlite3_bind_int(st, 6, isLocked ? 1 : 0);
-                sqlite3_bind_int(st, 7, isVisible ? 1 : 0);
-                sqlite3_bind_int(st, 8, isPlot ? 1 : 0);
-                BindTextNonNull(st, 9, LineTypeNameById(scene, l->GetLineType()));
-                const double lwMm = LineweightToMillimeters(l->GetLineweight());
-                if (lwMm > 0.0) sqlite3_bind_double(st, 10, lwMm);
-                else            sqlite3_bind_null(st, 10);
-
-                const LayerStat ls = layerStats[l->GetName()];
-                sqlite3_bind_int(st, 11, ls.total);
-                sqlite3_bind_int(st, 12, ls.model);
-                sqlite3_bind_int(st, 13, ls.paper);
-                sqlite3_bind_int(st, 14, ls.block);
-                if (!StepReset(db, st, error)) { sqlite3_finalize(st); return cleanupFail(); }
-                ++result.Counts.Layers;
+                });
+                if (!ok) return false;
             }
-            sqlite3_finalize(st);
-        }
 
-        // 5. 写入 layouts
-        {
-            sqlite3_stmt* st = nullptr;
-            const char* sql =
-                "INSERT INTO layouts("
-                "name,is_model,tab_order,owner_key,minx,miny,maxx,maxy,"
-                "view_center_x,view_center_y,view_height,entity_count,viewport_count"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?);";
-            if (!PrepareStmt(db, sql, st, error)) return cleanupFail();
-
-            for (const DrawingLayout& lay : scene.Layouts())
+            // 2. 写入 inserts + insert_attribs（递归展开普通块引用，排除 *U_TCH_* 内部包裹块）
             {
-                const std::string name = lay.Model ? "Model" : lay.Name;
-                const uint64_t key = lay.Model ? 0 : lay.OwnerKey;
-                BindTextNonNull(st, 1, name);
-                sqlite3_bind_int(st, 2, lay.Model ? 1 : 0);
-                sqlite3_bind_int(st, 3, lay.Order);
-                sqlite3_bind_int64(st, 4, static_cast<sqlite3_int64>(key));
-                if (lay.Model)
-                {
-                    if (IsFiniteBox(modelBounds))
+                ScopedSqliteStmt stIns;
+                ScopedSqliteStmt stAtt;
+                const char* sqlIns =
+                    "INSERT INTO inserts("
+                    "entity_id,parent_insert_id,depth,handle,block_name,block_path,"
+                    "layer,space,layout_name,x,y,z,scale_x,scale_y,scale_z,rotation_deg,"
+                    "col_count,row_count,col_spacing,row_spacing,has_xclip,xclip_inverted,xclip_boundary_json,"
+                    "attrib_count,minx,miny,maxx,maxy"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
+                const char* sqlAtt =
+                    "INSERT INTO insert_attribs("
+                    "insert_id,insert_handle,block_name,tag,value,layer,space,layout_name,"
+                    "x,y,height,rotation_deg,is_invisible"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?);";
+                if (!stIns.Prepare(db, sqlIns, error) || !stAtt.Prepare(db, sqlAtt, error))
+                    return false;
+
+                bool ok = true;
+                std::function<void(const InsertEntity&, const Math::Mat4&, int64_t, int64_t, int,
+                                   const std::string&, const std::string&, const std::string&, const std::string&)> walkInsert;
+                walkInsert = [&](const InsertEntity& ins, const Math::Mat4& parentMat, int64_t topEntId,
+                                 int64_t parentInsId, int depth, const std::string& parentPath,
+                                 const std::string& space, const std::string& layout, const std::string& handleHex) {
+                    if (!ok || depth > 12) return;
+                    if (IsTchInternalBlockName(ins.GetBlockName())) return;
+
+                    ++blockInsertCounts[ins.GetBlockName()];
+                    const std::string path = parentPath.empty() ? ins.GetBlockName() : parentPath + "/" + ins.GetBlockName();
+                    const Math::Point3 wPos = parentMat.TransformPoint(ins.GetPosition());
+                    const Math::Point3 p0 = parentMat.TransformPoint({ 0, 0, 0 });
+                    const Math::Point3 px = parentMat.TransformPoint({ 1, 0, 0 });
+                    const Math::Point3 py = parentMat.TransformPoint({ 0, 1, 0 });
+                    const double psx = std::hypot(px.x - p0.x, px.y - p0.y);
+                    const double psy = std::hypot(py.x - p0.x, py.y - p0.y);
+                    const double prot = std::atan2(px.y - p0.y, px.x - p0.x);
+
+                    std::string clipJson;
+                    if (ins.HasClipBoundary())
                     {
-                        sqlite3_bind_double(st, 5, modelBounds.Min.x);
-                        sqlite3_bind_double(st, 6, modelBounds.Min.y);
-                        sqlite3_bind_double(st, 7, modelBounds.Max.x);
-                        sqlite3_bind_double(st, 8, modelBounds.Max.y);
+                        const Math::Mat4 cm = ins.CellMatrix(0, 0) * parentMat;
+                        JsonWriter cw;
+                        cw.BeginArray();
+                        for (const auto& cp : ins.GetClipBoundary())
+                        {
+                            const Math::Point3 wp = cm.TransformPoint(cp);
+                            cw.BeginArray(); cw.Double(wp.x, 3); cw.Double(wp.y, 3); cw.EndArray();
+                        }
+                        cw.EndArray();
+                        clipJson = cw.Take();
+                    }
+
+                    const AABB localB = ins.GetBoundingBox();
+                    const bool hasBox = IsFiniteBox(localB);
+                    AABB wb = AABB::Empty();
+                    if (hasBox)
+                    {
+                        const Math::Point3 cs[4] = {
+                            { localB.Min.x, localB.Min.y, 0 }, { localB.Max.x, localB.Min.y, 0 },
+                            { localB.Min.x, localB.Max.y, 0 }, { localB.Max.x, localB.Max.y, 0 },
+                        };
+                        for (const auto& c : cs) wb.Expand(parentMat.TransformPoint(c));
+                    }
+
+                    const bool topOk = topEntId > 0 ? stIns.BindInt64(1, topEntId, error) : stIns.BindNull(1, error);
+                    const bool parOk = parentInsId > 0 ? stIns.BindInt64(2, parentInsId, error) : stIns.BindNull(2, error);
+                    const bool clipOk = ins.HasClipBoundary() ? stIns.BindText(23, clipJson, error) : stIns.BindNull(23, error);
+                    const bool wbOk = hasBox
+                        ? (stIns.BindDouble(25, wb.Min.x, error) && stIns.BindDouble(26, wb.Min.y, error)
+                           && stIns.BindDouble(27, wb.Max.x, error) && stIns.BindDouble(28, wb.Max.y, error))
+                        : (stIns.BindNull(25, error) && stIns.BindNull(26, error)
+                           && stIns.BindNull(27, error) && stIns.BindNull(28, error));
+
+                    if (!topOk || !parOk
+                        || !stIns.BindInt(3, depth, error)
+                        || !stIns.BindOptText(4, handleHex, error)
+                        || !stIns.BindText(5, ins.GetBlockName(), error)
+                        || !stIns.BindText(6, path, error)
+                        || !stIns.BindText(7, LayerNameById(scene, ins.GetLayerID()), error)
+                        || !stIns.BindText(8, space, error)
+                        || !stIns.BindText(9, layout, error)
+                        || !stIns.BindDouble(10, wPos.x, error)
+                        || !stIns.BindDouble(11, wPos.y, error)
+                        || !stIns.BindDouble(12, wPos.z, error)
+                        || !stIns.BindDouble(13, ins.GetScale().x * psx, error)
+                        || !stIns.BindDouble(14, ins.GetScale().y * psy, error)
+                        || !stIns.BindDouble(15, ins.GetScale().z, error)
+                        || !stIns.BindDouble(16, (ins.GetRotation() + prot) * kRadToDeg, error)
+                        || !stIns.BindInt(17, ins.GetColumnCount(), error)
+                        || !stIns.BindInt(18, ins.GetRowCount(), error)
+                        || !stIns.BindDouble(19, ins.GetColumnSpacing(), error)
+                        || !stIns.BindDouble(20, ins.GetRowSpacing(), error)
+                        || !stIns.BindInt(21, ins.HasClipBoundary() ? 1 : 0, error)
+                        || !stIns.BindInt(22, 0, error)
+                        || !clipOk
+                        || !stIns.BindInt(24, static_cast<int>(ins.GetAttribs().size()), error)
+                        || !wbOk
+                        || !stIns.StepDone(error))
+                    {
+                        ok = false;
+                        return;
+                    }
+
+                    const int64_t thisInsId = sqlite3_last_insert_rowid(db);
+                    ++result.Counts.Inserts;
+
+                    for (const auto& a : ins.GetAttribs())
+                    {
+                        if (!a) continue;
+                        const Math::Point3 aw = parentMat.TransformPoint(a->GetPosition());
+                        if (!stAtt.BindInt64(1, thisInsId, error)
+                            || !stAtt.BindOptText(2, handleHex, error)
+                            || !stAtt.BindText(3, ins.GetBlockName(), error)
+                            || !stAtt.BindText(4, a->GetTag(), error)
+                            || !stAtt.BindText(5, a->GetText(), error)
+                            || !stAtt.BindText(6, LayerNameById(scene, a->GetLayerID()), error)
+                            || !stAtt.BindText(7, space, error)
+                            || !stAtt.BindText(8, layout, error)
+                            || !stAtt.BindDouble(9, aw.x, error)
+                            || !stAtt.BindDouble(10, aw.y, error)
+                            || !stAtt.BindDouble(11, a->GetHeight() * psy, error)
+                            || !stAtt.BindDouble(12, (a->GetRotation() + prot) * kRadToDeg, error)
+                            || !stAtt.BindInt(13, a->IsInvisible() ? 1 : 0, error)
+                            || !stAtt.StepDone(error))
+                        {
+                            ok = false;
+                            return;
+                        }
+                        ++result.Counts.InsertAttribs;
+                    }
+
+                    // 递归嵌套 INSERT（仅沿单元格 (0,0) 追踪，防阵列嵌套爆炸）
+                    if (const BlockEntity* blk = ins.GetBlock())
+                    {
+                        const Math::Mat4 cm = ins.CellMatrix(0, 0) * parentMat;
+                        for (const auto& child : blk->GetEntities())
+                            if (child && child->IsKindOf<InsertEntity>())
+                                walkInsert(static_cast<const InsertEntity&>(*child), cm, 0, thisInsId, depth + 1, path, space, layout, {});
+                    }
+                };
+
+                scene.ForEachObject([&](const Object& o) {
+                    if (!ok || !o.IsKindOf<InsertEntity>()) return;
+                    const auto& ins = static_cast<const InsertEntity&>(o);
+                    if (auto it = snap.EntityOrigins.find(ins.GetID()); it != snap.EntityOrigins.end() && it->second.IsTchSynthesized)
+                        return;
+                    const std::string space  = ins.GetAttr().InPaperSpace ? "paper" : "model";
+                    const std::string layout = LayoutNameForEntity(scene, ins);
+                    int64_t entId = 0;
+                    if (auto it = objectToEntityId.find(ins.GetID()); it != objectToEntityId.end())
+                        entId = it->second;
+                    std::string handleHex;
+                    if (auto it = snap.EntityOrigins.find(ins.GetID()); it != snap.EntityOrigins.end())
+                        handleHex = FormatHandleHex(it->second.Handle);
+                    walkInsert(ins, Math::Mat4::Identity(), entId, 0, 0, "", space, layout, handleHex);
+                });
+                if (!ok) return false;
+            }
+
+            // 3. 写入 blocks + block_entities
+            {
+                ScopedSqliteStmt stBlk;
+                ScopedSqliteStmt stBe;
+                const char* sqlBlk =
+                    "INSERT INTO blocks("
+                    "name,base_x,base_y,base_z,flags,is_anonymous,is_xref,xref_path,xref_resolved,"
+                    "description,entity_count,insert_count,minx,miny,maxx,maxy,layers_json,entity_types_json"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
+                const char* sqlBe =
+                    "INSERT INTO block_entities("
+                    "block_name,entity_type,layer,minx,miny,maxx,maxy,length,geom_json"
+                    ") VALUES(?,?,?,?,?,?,?,?,?);";
+                if (!stBlk.Prepare(db, sqlBlk, error) || !stBe.Prepare(db, sqlBe, error))
+                    return false;
+
+                bool ok = true;
+                scene.GetBlockTable().ForEach([&](BlockID, const BlockEntity& blk) {
+                    if (!ok) return;
+                    if (IsTchInternalBlockName(blk.GetName())) return;
+
+                    std::map<std::string, int> blkLayers;
+                    std::map<std::string, int> blkTypes;
+                    const bool namedNonAnon = !blk.IsAnonymous();
+                    for (const auto& child : blk.GetEntities())
+                    {
+                        if (!child) continue;
+                        const std::string lyr = LayerNameById(scene, child->GetLayerID());
+                        const std::string typ = SceneEntityTypeName(*child);
+                        ++blkLayers[lyr];
+                        ++blkTypes[typ];
+                        if (namedNonAnon)
+                        {
+                            ++layerStats[lyr].block;
+                            if (includeBlockEntities)
+                            {
+                                const AABB b = child->IsBoundless() ? AABB::Empty() : child->GetBoundingBox();
+                                const bool validB = !child->IsBoundless() && IsFiniteBox(b);
+                                const GeomSummary gs = ExtractGeomSummary(*child);
+                                const bool bOk = validB
+                                    ? (stBe.BindDouble(4, b.Min.x, error) && stBe.BindDouble(5, b.Min.y, error)
+                                       && stBe.BindDouble(6, b.Max.x, error) && stBe.BindDouble(7, b.Max.y, error))
+                                    : (stBe.BindNull(4, error) && stBe.BindNull(5, error)
+                                       && stBe.BindNull(6, error) && stBe.BindNull(7, error));
+                                if (!stBe.BindText(1, blk.GetName(), error)
+                                    || !stBe.BindText(2, typ, error)
+                                    || !stBe.BindText(3, lyr, error)
+                                    || !bOk
+                                    || !stBe.BindOptDouble(8, gs.Length, error)
+                                    || !stBe.BindOptText(9, gs.GeomJson, error)
+                                    || !stBe.StepDone(error))
+                                {
+                                    ok = false;
+                                    return;
+                                }
+                                ++result.Counts.BlockEntities;
+                            }
+                        }
+                    }
+
+                    JsonWriter lw, tw;
+                    lw.BeginObject();
+                    for (const auto& [k, v] : blkLayers) lw.KeyInt(k, v);
+                    lw.EndObject();
+                    tw.BeginObject();
+                    for (const auto& [k, v] : blkTypes) tw.KeyInt(k, v);
+                    tw.EndObject();
+
+                    const AABB bb = blk.GetBoundingBox();
+                    const bool validBb = IsFiniteBox(bb);
+                    const bool bbOk = validBb
+                        ? (stBlk.BindDouble(13, bb.Min.x, error) && stBlk.BindDouble(14, bb.Min.y, error)
+                           && stBlk.BindDouble(15, bb.Max.x, error) && stBlk.BindDouble(16, bb.Max.y, error))
+                        : (stBlk.BindNull(13, error) && stBlk.BindNull(14, error)
+                           && stBlk.BindNull(15, error) && stBlk.BindNull(16, error));
+                    if (!stBlk.BindText(1, blk.GetName(), error)
+                        || !stBlk.BindDouble(2, blk.GetBasePoint().x, error)
+                        || !stBlk.BindDouble(3, blk.GetBasePoint().y, error)
+                        || !stBlk.BindDouble(4, blk.GetBasePoint().z, error)
+                        || !stBlk.BindInt(5, static_cast<int>(blk.GetFlags()), error)
+                        || !stBlk.BindInt(6, blk.IsAnonymous() ? 1 : 0, error)
+                        || !stBlk.BindInt(7, blk.IsXRef() ? 1 : 0, error)
+                        || !stBlk.BindOptText(8, blk.GetXRefPath(), error)
+                        || !stBlk.BindInt(9, (blk.IsXRef() && !blk.IsUnresolvedXRef()) ? 1 : 0, error)
+                        || !stBlk.BindOptText(10, blk.GetDescription(), error)
+                        || !stBlk.BindInt(11, static_cast<int>(blk.EntityCount()), error)
+                        || !stBlk.BindInt(12, blockInsertCounts[blk.GetName()], error)
+                        || !bbOk
+                        || !stBlk.BindText(17, lw.Str(), error)
+                        || !stBlk.BindText(18, tw.Str(), error)
+                        || !stBlk.StepDone(error))
+                    {
+                        ok = false;
+                        return;
+                    }
+                    ++result.Counts.Blocks;
+                });
+                if (!ok) return false;
+            }
+
+            // 4. 写入 layers（保留原始 is_on / is_frozen 分离语义）
+            {
+                ScopedSqliteStmt st;
+                const char* sql =
+                    "INSERT INTO layers("
+                    "name,color_aci,color_rgb,is_on,is_frozen,is_locked,is_visible,is_plottable,"
+                    "linetype,lineweight_mm,entity_count,model_entity_count,paper_entity_count,block_entity_count"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
+                if (!st.Prepare(db, sql, error)) return false;
+
+                const LayerManager& lm = scene.GetLayerManager();
+                for (LayerID id : lm.GetAllLayerIDs())
+                {
+                    const Layer* l = lm.GetLayer(id);
+                    if (!l) continue;
+                    const auto rfIt = snap.LayerFlagsById.find(id);
+                    const bool hasRaw = (rfIt != snap.LayerFlagsById.end());
+
+                    const bool aciOk = (hasRaw && !rfIt->second.HasTrueColor && rfIt->second.ColorAci > 0)
+                        ? st.BindInt(2, rfIt->second.ColorAci, error)
+                        : st.BindNull(2, error);
+                    const auto& col = l->GetColor();
+                    const bool isOn       = hasRaw ? rfIt->second.IsOn : l->IsVisible();
+                    const bool isFrozen   = hasRaw ? rfIt->second.IsFrozen : false;
+                    const bool isLocked   = hasRaw ? rfIt->second.IsLocked : l->IsLocked();
+                    const bool isVisible  = isOn && !isFrozen;
+                    const bool isPlot     = hasRaw ? rfIt->second.IsPlottable : true;
+                    const double lwMm     = LineweightToMillimeters(l->GetLineweight());
+                    const bool lwOk       = (lwMm > 0.0) ? st.BindDouble(10, lwMm, error) : st.BindNull(10, error);
+                    const LayerStat ls    = layerStats[l->GetName()];
+
+                    if (!st.BindText(1, l->GetName(), error)
+                        || !aciOk
+                        || !st.BindText(3, FormatColorRgbHex(col.r, col.g, col.b), error)
+                        || !st.BindInt(4, isOn ? 1 : 0, error)
+                        || !st.BindInt(5, isFrozen ? 1 : 0, error)
+                        || !st.BindInt(6, isLocked ? 1 : 0, error)
+                        || !st.BindInt(7, isVisible ? 1 : 0, error)
+                        || !st.BindInt(8, isPlot ? 1 : 0, error)
+                        || !st.BindText(9, LineTypeNameById(scene, l->GetLineType()), error)
+                        || !lwOk
+                        || !st.BindInt(11, ls.total, error)
+                        || !st.BindInt(12, ls.model, error)
+                        || !st.BindInt(13, ls.paper, error)
+                        || !st.BindInt(14, ls.block, error)
+                        || !st.StepDone(error))
+                    {
+                        return false;
+                    }
+                    ++result.Counts.Layers;
+                }
+            }
+
+            // 5. 写入 layouts
+            {
+                ScopedSqliteStmt st;
+                const char* sql =
+                    "INSERT INTO layouts("
+                    "name,is_model,tab_order,owner_key,minx,miny,maxx,maxy,"
+                    "view_center_x,view_center_y,view_height,entity_count,viewport_count"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?);";
+                if (!st.Prepare(db, sql, error)) return false;
+
+                for (const DrawingLayout& lay : scene.Layouts())
+                {
+                    const std::string name = lay.Model ? "Model" : lay.Name;
+                    const uint64_t key = lay.Model ? 0 : lay.OwnerKey;
+
+                    bool boundsOk = true;
+                    if (lay.Model)
+                    {
+                        boundsOk = IsFiniteBox(modelBounds)
+                            ? (st.BindDouble(5, modelBounds.Min.x, error) && st.BindDouble(6, modelBounds.Min.y, error)
+                               && st.BindDouble(7, modelBounds.Max.x, error) && st.BindDouble(8, modelBounds.Max.y, error))
+                            : (st.BindNull(5, error) && st.BindNull(6, error)
+                               && st.BindNull(7, error) && st.BindNull(8, error));
                     }
                     else
                     {
-                        sqlite3_bind_null(st, 5); sqlite3_bind_null(st, 6);
-                        sqlite3_bind_null(st, 7); sqlite3_bind_null(st, 8);
+                        boundsOk = st.BindDouble(5, lay.MinX, error) && st.BindDouble(6, lay.MinY, error)
+                                && st.BindDouble(7, lay.MaxX, error) && st.BindDouble(8, lay.MaxY, error);
                     }
-                }
-                else
-                {
-                    sqlite3_bind_double(st, 5, lay.MinX);
-                    sqlite3_bind_double(st, 6, lay.MinY);
-                    sqlite3_bind_double(st, 7, lay.MaxX);
-                    sqlite3_bind_double(st, 8, lay.MaxY);
-                }
-                if (lay.ViewHeight > 0.0)
-                {
-                    sqlite3_bind_double(st, 9, lay.ViewCenterX);
-                    sqlite3_bind_double(st, 10, lay.ViewCenterY);
-                    sqlite3_bind_double(st, 11, lay.ViewHeight);
-                }
-                else
-                {
-                    sqlite3_bind_null(st, 9); sqlite3_bind_null(st, 10); sqlite3_bind_null(st, 11);
-                }
-                sqlite3_bind_int(st, 12, layoutEntityCounts[key]);
-                sqlite3_bind_int(st, 13, layoutViewportCounts[key]);
-                if (!StepReset(db, st, error)) { sqlite3_finalize(st); return cleanupFail(); }
-                ++result.Counts.Layouts;
-            }
-            sqlite3_finalize(st);
-        }
+                    const bool viewOk = (lay.ViewHeight > 0.0)
+                        ? (st.BindDouble(9, lay.ViewCenterX, error) && st.BindDouble(10, lay.ViewCenterY, error)
+                           && st.BindDouble(11, lay.ViewHeight, error))
+                        : (st.BindNull(9, error) && st.BindNull(10, error) && st.BindNull(11, error));
 
-        // 6. 写入 viewports
-        {
-            sqlite3_stmt* st = nullptr;
-            const char* sql =
-                "INSERT INTO viewports("
-                "handle,layout_name,layout_key,viewport_no,layer,shows_model,"
-                "paper_cx,paper_cy,paper_w,paper_h,paper_minx,paper_miny,paper_maxx,paper_maxy,"
-                "model_cx,model_cy,model_view_height,twist_deg,model_to_paper_scale,"
-                "model_minx,model_miny,model_maxx,model_maxy,frozen_layers_json"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-            if (!PrepareStmt(db, sql, st, error)) return cleanupFail();
-
-            bool ok = true;
-            scene.ForEachObject([&](const Object& o) {
-                if (!ok || !o.IsKindOf<ViewportEntity>()) return;
-                const auto& vp = static_cast<const ViewportEntity&>(o);
-                std::string handleHex;
-                if (auto it = snap.EntityOrigins.find(vp.GetID()); it != snap.EntityOrigins.end())
-                    handleHex = FormatHandleHex(it->second.Handle);
-
-                const AABB pbox = vp.GetBoundingBox();
-                const AABB mbox = vp.ModelVisibleBox();
-                JsonWriter fw;
-                fw.BeginArray();
-                for (LayerID lid : vp.GetFrozenLayers())
-                    fw.String(LayerNameById(scene, lid));
-                fw.EndArray();
-
-                BindTextOrNull(st, 1, handleHex);
-                BindTextNonNull(st, 2, LayoutNameForEntity(scene, vp));
-                sqlite3_bind_int64(st, 3, static_cast<sqlite3_int64>(vp.GetAttr().LayoutKey));
-                sqlite3_bind_int(st, 4, vp.GetViewportId());
-                BindTextNonNull(st, 5, LayerNameById(scene, vp.GetLayerID()));
-                sqlite3_bind_int(st, 6, vp.ShowsModel() ? 1 : 0);
-                sqlite3_bind_double(st, 7, vp.GetCenter().x);
-                sqlite3_bind_double(st, 8, vp.GetCenter().y);
-                sqlite3_bind_double(st, 9, vp.GetWidth());
-                sqlite3_bind_double(st, 10, vp.GetHeight());
-                sqlite3_bind_double(st, 11, pbox.Min.x);
-                sqlite3_bind_double(st, 12, pbox.Min.y);
-                sqlite3_bind_double(st, 13, pbox.Max.x);
-                sqlite3_bind_double(st, 14, pbox.Max.y);
-                sqlite3_bind_double(st, 15, vp.GetViewCenter().x);
-                sqlite3_bind_double(st, 16, vp.GetViewCenter().y);
-                sqlite3_bind_double(st, 17, vp.GetViewHeight());
-                sqlite3_bind_double(st, 18, vp.GetTwist() * kRadToDeg);
-                sqlite3_bind_double(st, 19, vp.ModelToPaperScale());
-                if (IsFiniteBox(mbox))
-                {
-                    sqlite3_bind_double(st, 20, mbox.Min.x);
-                    sqlite3_bind_double(st, 21, mbox.Min.y);
-                    sqlite3_bind_double(st, 22, mbox.Max.x);
-                    sqlite3_bind_double(st, 23, mbox.Max.y);
-                }
-                else
-                {
-                    sqlite3_bind_null(st, 20); sqlite3_bind_null(st, 21);
-                    sqlite3_bind_null(st, 22); sqlite3_bind_null(st, 23);
-                }
-                BindTextNonNull(st, 24, fw.Str());
-                if (!StepReset(db, st, error)) { ok = false; return; }
-                ++result.Counts.Viewports;
-            });
-            sqlite3_finalize(st);
-            if (!ok) return cleanupFail();
-        }
-
-        // 7. 写入 texts + texts_rtree
-        {
-            std::vector<ExtractedText> texts;
-            CollectAllSceneTexts(scene, snap, texts, &objectToEntityId);
-
-            sqlite3_stmt* stTxt = nullptr;
-            sqlite3_stmt* stRtr = nullptr;
-            const char* sqlTxt =
-                "INSERT INTO texts("
-                "entity_id,owner_handle,source_kind,content,raw_content,tag,"
-                "layer,space,layout_name,block_path,x,y,height,rotation_deg,"
-                "minx,miny,maxx,maxy"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-            const char* sqlRtr = "INSERT INTO texts_rtree(id,minx,maxx,miny,maxy) VALUES(?,?,?,?,?);";
-            if (!PrepareStmt(db, sqlTxt, stTxt, error) || !PrepareStmt(db, sqlRtr, stRtr, error))
-            {
-                if (stTxt) sqlite3_finalize(stTxt);
-                if (stRtr) sqlite3_finalize(stRtr);
-                return cleanupFail();
-            }
-
-            for (const auto& t : texts)
-            {
-                if (t.EntityId > 0) sqlite3_bind_int64(stTxt, 1, t.EntityId);
-                else                sqlite3_bind_null(stTxt, 1);
-                BindTextOrNull(stTxt, 2, t.OwnerHandle);
-                BindTextNonNull(stTxt, 3, t.SourceKind);
-                BindTextNonNull(stTxt, 4, t.Content);
-                BindTextOrNull(stTxt, 5, t.RawContent);
-                BindTextOrNull(stTxt, 6, t.Tag);
-                BindTextNonNull(stTxt, 7, t.Layer);
-                BindTextNonNull(stTxt, 8, t.Space);
-                BindTextNonNull(stTxt, 9, t.LayoutName);
-                BindTextNonNull(stTxt, 10, t.BlockPath);
-                sqlite3_bind_double(stTxt, 11, t.X);
-                sqlite3_bind_double(stTxt, 12, t.Y);
-                sqlite3_bind_double(stTxt, 13, t.Height);
-                sqlite3_bind_double(stTxt, 14, t.RotationDeg);
-                sqlite3_bind_double(stTxt, 15, t.MinX);
-                sqlite3_bind_double(stTxt, 16, t.MinY);
-                sqlite3_bind_double(stTxt, 17, t.MaxX);
-                sqlite3_bind_double(stTxt, 18, t.MaxY);
-
-                if (!StepReset(db, stTxt, error))
-                {
-                    sqlite3_finalize(stTxt); sqlite3_finalize(stRtr);
-                    return cleanupFail();
-                }
-                const int64_t rowId = sqlite3_last_insert_rowid(db);
-                ++result.Counts.Texts;
-
-                if (std::isfinite(t.MinX) && std::isfinite(t.MaxX) && std::isfinite(t.MinY) && std::isfinite(t.MaxY) &&
-                    t.MinX <= t.MaxX && t.MinY <= t.MaxY)
-                {
-                    sqlite3_bind_int64(stRtr, 1, rowId);
-                    sqlite3_bind_double(stRtr, 2, t.MinX);
-                    sqlite3_bind_double(stRtr, 3, t.MaxX);
-                    sqlite3_bind_double(stRtr, 4, t.MinY);
-                    sqlite3_bind_double(stRtr, 5, t.MaxY);
-                    if (!StepReset(db, stRtr, error))
+                    if (!st.BindText(1, name, error)
+                        || !st.BindInt(2, lay.Model ? 1 : 0, error)
+                        || !st.BindInt(3, lay.Order, error)
+                        || !st.BindInt64(4, static_cast<int64_t>(key), error)
+                        || !boundsOk
+                        || !viewOk
+                        || !st.BindInt(12, layoutEntityCounts[key], error)
+                        || !st.BindInt(13, layoutViewportCounts[key], error)
+                        || !st.StepDone(error))
                     {
-                        sqlite3_finalize(stTxt); sqlite3_finalize(stRtr);
-                        return cleanupFail();
+                        return false;
+                    }
+                    ++result.Counts.Layouts;
+                }
+            }
+
+            // 6. 写入 viewports
+            {
+                ScopedSqliteStmt st;
+                const char* sql =
+                    "INSERT INTO viewports("
+                    "handle,layout_name,layout_key,viewport_no,layer,shows_model,"
+                    "paper_cx,paper_cy,paper_w,paper_h,paper_minx,paper_miny,paper_maxx,paper_maxy,"
+                    "model_cx,model_cy,model_view_height,twist_deg,model_to_paper_scale,"
+                    "model_minx,model_miny,model_maxx,model_maxy,frozen_layers_json"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
+                if (!st.Prepare(db, sql, error)) return false;
+
+                bool ok = true;
+                scene.ForEachObject([&](const Object& o) {
+                    if (!ok || !o.IsKindOf<ViewportEntity>()) return;
+                    const auto& vp = static_cast<const ViewportEntity&>(o);
+                    std::string handleHex;
+                    if (auto it = snap.EntityOrigins.find(vp.GetID()); it != snap.EntityOrigins.end())
+                        handleHex = FormatHandleHex(it->second.Handle);
+
+                    const AABB pbox = vp.GetBoundingBox();
+                    const AABB mbox = vp.ModelVisibleBox();
+                    JsonWriter fw;
+                    fw.BeginArray();
+                    for (LayerID lid : vp.GetFrozenLayers())
+                        fw.String(LayerNameById(scene, lid));
+                    fw.EndArray();
+
+                    const bool mboxOk = IsFiniteBox(mbox)
+                        ? (st.BindDouble(20, mbox.Min.x, error) && st.BindDouble(21, mbox.Min.y, error)
+                           && st.BindDouble(22, mbox.Max.x, error) && st.BindDouble(23, mbox.Max.y, error))
+                        : (st.BindNull(20, error) && st.BindNull(21, error)
+                           && st.BindNull(22, error) && st.BindNull(23, error));
+
+                    if (!st.BindOptText(1, handleHex, error)
+                        || !st.BindText(2, LayoutNameForEntity(scene, vp), error)
+                        || !st.BindInt64(3, static_cast<int64_t>(vp.GetAttr().LayoutKey), error)
+                        || !st.BindInt(4, vp.GetViewportId(), error)
+                        || !st.BindText(5, LayerNameById(scene, vp.GetLayerID()), error)
+                        || !st.BindInt(6, vp.ShowsModel() ? 1 : 0, error)
+                        || !st.BindDouble(7, vp.GetCenter().x, error)
+                        || !st.BindDouble(8, vp.GetCenter().y, error)
+                        || !st.BindDouble(9, vp.GetWidth(), error)
+                        || !st.BindDouble(10, vp.GetHeight(), error)
+                        || !st.BindDouble(11, pbox.Min.x, error)
+                        || !st.BindDouble(12, pbox.Min.y, error)
+                        || !st.BindDouble(13, pbox.Max.x, error)
+                        || !st.BindDouble(14, pbox.Max.y, error)
+                        || !st.BindDouble(15, vp.GetViewCenter().x, error)
+                        || !st.BindDouble(16, vp.GetViewCenter().y, error)
+                        || !st.BindDouble(17, vp.GetViewHeight(), error)
+                        || !st.BindDouble(18, vp.GetTwist() * kRadToDeg, error)
+                        || !st.BindDouble(19, vp.ModelToPaperScale(), error)
+                        || !mboxOk
+                        || !st.BindText(24, fw.Str(), error)
+                        || !st.StepDone(error))
+                    {
+                        ok = false;
+                        return;
+                    }
+                    ++result.Counts.Viewports;
+                });
+                if (!ok) return false;
+            }
+
+            // 7. 写入 texts + texts_rtree
+            {
+                std::vector<ExtractedText> texts;
+                CollectAllSceneTexts(scene, snap, texts, &objectToEntityId);
+
+                ScopedSqliteStmt stTxt;
+                ScopedSqliteStmt stRtr;
+                const char* sqlTxt =
+                    "INSERT INTO texts("
+                    "entity_id,owner_handle,source_kind,content,raw_content,tag,"
+                    "layer,space,layout_name,block_path,x,y,height,rotation_deg,"
+                    "minx,miny,maxx,maxy"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
+                const char* sqlRtr = "INSERT INTO texts_rtree(id,minx,maxx,miny,maxy) VALUES(?,?,?,?,?);";
+                if (!stTxt.Prepare(db, sqlTxt, error) || !stRtr.Prepare(db, sqlRtr, error))
+                    return false;
+
+                for (const auto& t : texts)
+                {
+                    const bool entOk = (t.EntityId > 0) ? stTxt.BindInt64(1, t.EntityId, error) : stTxt.BindNull(1, error);
+                    if (!entOk
+                        || !stTxt.BindOptText(2, t.OwnerHandle, error)
+                        || !stTxt.BindText(3, t.SourceKind, error)
+                        || !stTxt.BindText(4, t.Content, error)
+                        || !stTxt.BindOptText(5, t.RawContent, error)
+                        || !stTxt.BindOptText(6, t.Tag, error)
+                        || !stTxt.BindText(7, t.Layer, error)
+                        || !stTxt.BindText(8, t.Space, error)
+                        || !stTxt.BindText(9, t.LayoutName, error)
+                        || !stTxt.BindText(10, t.BlockPath, error)
+                        || !stTxt.BindDouble(11, t.X, error)
+                        || !stTxt.BindDouble(12, t.Y, error)
+                        || !stTxt.BindDouble(13, t.Height, error)
+                        || !stTxt.BindDouble(14, t.RotationDeg, error)
+                        || !stTxt.BindDouble(15, t.MinX, error)
+                        || !stTxt.BindDouble(16, t.MinY, error)
+                        || !stTxt.BindDouble(17, t.MaxX, error)
+                        || !stTxt.BindDouble(18, t.MaxY, error)
+                        || !stTxt.StepDone(error))
+                    {
+                        return false;
+                    }
+                    const int64_t rowId = sqlite3_last_insert_rowid(db);
+                    ++result.Counts.Texts;
+
+                    if (std::isfinite(t.MinX) && std::isfinite(t.MaxX) && std::isfinite(t.MinY) && std::isfinite(t.MaxY) &&
+                        t.MinX <= t.MaxX && t.MinY <= t.MaxY)
+                    {
+                        if (!stRtr.BindInt64(1, rowId, error)
+                            || !stRtr.BindDouble(2, t.MinX, error)
+                            || !stRtr.BindDouble(3, t.MaxX, error)
+                            || !stRtr.BindDouble(4, t.MinY, error)
+                            || !stRtr.BindDouble(5, t.MaxY, error)
+                            || !stRtr.StepDone(error))
+                        {
+                            return false;
+                        }
                     }
                 }
             }
-            sqlite3_finalize(stTxt);
-            sqlite3_finalize(stRtr);
-        }
 
-        // 8. 写入天正 8 张原生语义表
-        TchExportCounts tchCounts{};
-        if (!WriteTchSemanticTables(db, snap, tchCounts, error))
-            return cleanupFail();
-        result.Counts.TchWalls      = tchCounts.Walls;
-        result.Counts.TchOpenings   = tchCounts.Openings;
-        result.Counts.TchColumns    = tchCounts.Columns;
-        result.Counts.TchSpaces     = tchCounts.Spaces;
-        result.Counts.TchStairs     = tchCounts.Stairs;
-        result.Counts.TchDimensions = tchCounts.Dimensions;
-        result.Counts.TchAxes       = tchCounts.Axes;
-        result.Counts.TchSheets     = tchCounts.Sheets;
-        result.Counts.TchFailed     = snap.TchFailedCount;
+            // 8. 写入天正 8 张原生语义表
+            TchExportCounts tchCounts{};
+            if (!WriteTchSemanticTables(db, snap, tchCounts, error))
+                return false;
+            result.Counts.TchWalls      = tchCounts.Walls;
+            result.Counts.TchOpenings   = tchCounts.Openings;
+            result.Counts.TchColumns    = tchCounts.Columns;
+            result.Counts.TchSpaces     = tchCounts.Spaces;
+            result.Counts.TchStairs     = tchCounts.Stairs;
+            result.Counts.TchDimensions = tchCounts.Dimensions;
+            result.Counts.TchAxes       = tchCounts.Axes;
+            result.Counts.TchSheets     = tchCounts.Sheets;
+            result.Counts.TchFailed     = snap.TchFailedCount;
 
-        // 9. 写入 diagnostics
-        JsonWriter undecodedJw, skippedJw, xrefJw;
-        undecodedJw.BeginArray();
-        skippedJw.BeginArray();
-        xrefJw.BeginArray();
-        {
-            sqlite3_stmt* st = nullptr;
-            const char* sql = "INSERT INTO diagnostics(kind,dxf_name,reason,count,sample_handle) VALUES(?,?,?,?,?);";
-            if (!PrepareStmt(db, sql, st, error)) return cleanupFail();
-            for (const auto& d : snap.Diagnostics)
+            // 9. 写入 diagnostics
+            JsonWriter undecodedJw, skippedJw, xrefJw;
+            undecodedJw.BeginArray();
+            skippedJw.BeginArray();
+            xrefJw.BeginArray();
             {
-                const std::string hHex = FormatHandleHex(d.SampleHandle);
-                BindTextNonNull(st, 1, d.Kind);
-                BindTextNonNull(st, 2, d.DxfName);
-                BindTextOrNull(st, 3, d.Reason);
-                sqlite3_bind_int(st, 4, d.Count);
-                BindTextOrNull(st, 5, hHex);
-                if (!StepReset(db, st, error)) { sqlite3_finalize(st); return cleanupFail(); }
+                ScopedSqliteStmt st;
+                const char* sql = "INSERT INTO diagnostics(kind,dxf_name,reason,count,sample_handle) VALUES(?,?,?,?,?);";
+                if (!st.Prepare(db, sql, error)) return false;
+                for (const auto& d : snap.Diagnostics)
+                {
+                    const std::string hHex = FormatHandleHex(d.SampleHandle);
+                    if (!st.BindText(1, d.Kind, error)
+                        || !st.BindText(2, d.DxfName, error)
+                        || !st.BindOptText(3, d.Reason, error)
+                        || !st.BindInt(4, d.Count, error)
+                        || !st.BindOptText(5, hHex, error)
+                        || !st.StepDone(error))
+                    {
+                        return false;
+                    }
 
-                if (d.Kind == "unresolved_xref")
-                {
-                    ++result.Counts.UnresolvedXrefs;
-                    xrefJw.BeginObject();
-                    xrefJw.KeyString("name", d.DxfName);
-                    xrefJw.KeyString("path", d.Reason);
-                    xrefJw.EndObject();
-                }
-                else if (d.Kind == "skipped_entity")
-                {
-                    skippedJw.BeginObject();
-                    skippedJw.KeyString("dxf_name", d.DxfName);
-                    skippedJw.KeyInt("count", d.Count);
-                    skippedJw.EndObject();
-                }
-                else
-                {
-                    undecodedJw.BeginObject();
-                    undecodedJw.KeyString("kind", d.Kind);
-                    undecodedJw.KeyString("dxf_name", d.DxfName);
-                    undecodedJw.KeyString("reason", d.Reason);
-                    undecodedJw.KeyInt("count", d.Count);
-                    undecodedJw.KeyOptString("sample_handle", hHex);
-                    undecodedJw.EndObject();
+                    if (d.Kind == "unresolved_xref")
+                    {
+                        ++result.Counts.UnresolvedXrefs;
+                        xrefJw.BeginObject();
+                        xrefJw.KeyString("name", d.DxfName);
+                        xrefJw.KeyString("path", d.Reason);
+                        xrefJw.EndObject();
+                    }
+                    else if (d.Kind == "skipped_entity")
+                    {
+                        skippedJw.BeginObject();
+                        skippedJw.KeyString("dxf_name", d.DxfName);
+                        skippedJw.KeyInt("count", d.Count);
+                        skippedJw.EndObject();
+                    }
+                    else
+                    {
+                        undecodedJw.BeginObject();
+                        undecodedJw.KeyString("kind", d.Kind);
+                        undecodedJw.KeyString("dxf_name", d.DxfName);
+                        undecodedJw.KeyString("reason", d.Reason);
+                        undecodedJw.KeyInt("count", d.Count);
+                        undecodedJw.KeyOptString("sample_handle", hHex);
+                        undecodedJw.EndObject();
+                    }
                 }
             }
-            sqlite3_finalize(st);
-        }
-        undecodedJw.EndArray();
-        skippedJw.EndArray();
-        xrefJw.EndArray();
+            undecodedJw.EndArray();
+            skippedJw.EndArray();
+            xrefJw.EndArray();
 
-        // 10. 写入 meta 键值表
-        const bool isNativeTch = snap.TchObjectCount > 0 ||
-                                 (tchCounts.Walls + tchCounts.Openings + tchCounts.Columns +
-                                  tchCounts.Spaces + tchCounts.Stairs + tchCounts.Dimensions +
-                                  tchCounts.Axes + tchCounts.Sheets) > 0;
-        result.IsNativeTianzheng = isNativeTch;
-        if (IsFiniteBox(modelBounds))
-        {
-            result.HasModelBbox = true;
-            result.ModelBbox    = { modelBounds.Min.x, modelBounds.Min.y, modelBounds.Max.x, modelBounds.Max.y };
-        }
+            // 10. 写入 meta 键值表（含 CAD-21 导出选项与外参依赖指纹）
+            const std::vector<XrefDepRecord> xrefDeps = CollectXrefDependencies(scene, sourcePath);
+            const std::string xrefDepsV1   = SerializeXrefDepsV1(xrefDeps);
+            const std::string xrefDepsJson = FormatXrefDepsJson(xrefDeps);
 
-        {
-            sqlite3_stmt* st = nullptr;
-            if (!PrepareStmt(db, "INSERT INTO meta(key,value) VALUES(?,?);", st, error)) return cleanupFail();
-            auto put = [&](const char* k, const std::string& v) -> bool {
-                BindTextNonNull(st, 1, k);
-                BindTextNonNull(st, 2, v);
-                return StepReset(db, st, error);
-            };
-            bool ok = true;
-            ok = ok && put("schema_version", "1.0");
-            ok = ok && put("tool_version", MINICAD_TOOL_VERSION);
-            ok = ok && put("source_path", sourcePath);
-            ok = ok && put("source_size_bytes", std::to_string(sourceSizeBytes));
-            ok = ok && put("source_mtime_ms", std::to_string(sourceMtimeMs));
-            ok = ok && put("exported_at_utc", CurrentUtcIso8601());
-            ok = ok && put("format", result.Format);
-            ok = ok && put("dwg_version", snap.DwgVersion);
-            ok = ok && put("insunits_code", std::to_string(snap.InsunitsCode));
-            ok = ok && put("insunits_name", snap.InsunitsName);
-            ok = ok && put("measurement", snap.Measurement);
-            ok = ok && put("ltscale", JsonDouble(snap.LtScale, 6));
-            ok = ok && put("psltscale", snap.PsLtScale ? "1" : "0");
-            if (result.HasModelBbox)
+            const bool isNativeTch = snap.TchObjectCount > 0 ||
+                                     (tchCounts.Walls + tchCounts.Openings + tchCounts.Columns +
+                                      tchCounts.Spaces + tchCounts.Stairs + tchCounts.Dimensions +
+                                      tchCounts.Axes + tchCounts.Sheets) > 0;
+            result.IsNativeTianzheng = isNativeTch;
+            if (IsFiniteBox(modelBounds))
             {
-                ok = ok && put("model_minx", JsonDouble(result.ModelBbox[0], 4));
-                ok = ok && put("model_miny", JsonDouble(result.ModelBbox[1], 4));
-                ok = ok && put("model_maxx", JsonDouble(result.ModelBbox[2], 4));
-                ok = ok && put("model_maxy", JsonDouble(result.ModelBbox[3], 4));
+                result.HasModelBbox = true;
+                result.ModelBbox    = { modelBounds.Min.x, modelBounds.Min.y, modelBounds.Max.x, modelBounds.Max.y };
             }
-            ok = ok && put("entity_count", std::to_string(result.Counts.Entities));
-            ok = ok && put("model_entity_count", std::to_string(modelEntityCount));
-            ok = ok && put("paper_entity_count", std::to_string(paperEntityCount));
-            ok = ok && put("text_count", std::to_string(result.Counts.Texts));
-            ok = ok && put("layer_count", std::to_string(result.Counts.Layers));
-            ok = ok && put("layout_count", std::to_string(result.Counts.Layouts));
-            ok = ok && put("viewport_count", std::to_string(result.Counts.Viewports));
-            ok = ok && put("block_count", std::to_string(result.Counts.Blocks));
-            ok = ok && put("insert_count", std::to_string(result.Counts.Inserts));
-            ok = ok && put("is_native_tianzheng", isNativeTch ? "1" : "0");
-            ok = ok && put("tch_object_count", std::to_string(snap.TchObjectCount));
-            ok = ok && put("tch_decoded_count", std::to_string(snap.TchDecodedCount));
-            ok = ok && put("tch_failed_count", std::to_string(snap.TchFailedCount));
-            ok = ok && put("tch_config_fill", snap.TchConfigFill ? "1" : "0");
-            ok = ok && put("tch_config_detail_scale", JsonDouble(snap.TchConfigDetailScale, 4));
-            ok = ok && put("undecoded_proxies_json", undecodedJw.Str());
-            ok = ok && put("skipped_entities_json", skippedJw.Str());
-            ok = ok && put("unresolved_xrefs_json", xrefJw.Str());
-            sqlite3_finalize(st);
-            if (!ok) return cleanupFail();
+
+            {
+                ScopedSqliteStmt st;
+                if (!st.Prepare(db, "INSERT INTO meta(key,value) VALUES(?,?);", error)) return false;
+                auto put = [&](const char* k, const std::string& v) -> bool {
+                    return st.BindTextStatic(1, k, error)
+                        && st.BindText(2, v, error)
+                        && st.StepDone(error);
+                };
+                bool ok = true;
+                ok = ok && put("schema_version", "1.0");
+                ok = ok && put("tool_version", MINICAD_TOOL_VERSION);
+                ok = ok && put("source_path", sourcePath);
+                ok = ok && put("source_size_bytes", std::to_string(sourceSizeBytes));
+                ok = ok && put("source_mtime_ms", std::to_string(sourceMtimeMs));
+                ok = ok && put("include_block_entities", includeBlockEntities ? "1" : "0");
+                ok = ok && put("xref_deps_v1", xrefDepsV1);
+                ok = ok && put("xref_deps_json", xrefDepsJson);
+                ok = ok && put("exported_at_utc", CurrentUtcIso8601());
+                ok = ok && put("format", result.Format);
+                ok = ok && put("dwg_version", snap.DwgVersion);
+                ok = ok && put("insunits_code", std::to_string(snap.InsunitsCode));
+                ok = ok && put("insunits_name", snap.InsunitsName);
+                ok = ok && put("measurement", snap.Measurement);
+                ok = ok && put("ltscale", JsonDouble(snap.LtScale, 6));
+                ok = ok && put("psltscale", snap.PsLtScale ? "1" : "0");
+                if (result.HasModelBbox)
+                {
+                    ok = ok && put("model_minx", JsonDouble(result.ModelBbox[0], 4));
+                    ok = ok && put("model_miny", JsonDouble(result.ModelBbox[1], 4));
+                    ok = ok && put("model_maxx", JsonDouble(result.ModelBbox[2], 4));
+                    ok = ok && put("model_maxy", JsonDouble(result.ModelBbox[3], 4));
+                }
+                ok = ok && put("entity_count", std::to_string(result.Counts.Entities));
+                ok = ok && put("model_entity_count", std::to_string(modelEntityCount));
+                ok = ok && put("paper_entity_count", std::to_string(paperEntityCount));
+                ok = ok && put("text_count", std::to_string(result.Counts.Texts));
+                ok = ok && put("layer_count", std::to_string(result.Counts.Layers));
+                ok = ok && put("layout_count", std::to_string(result.Counts.Layouts));
+                ok = ok && put("viewport_count", std::to_string(result.Counts.Viewports));
+                ok = ok && put("block_count", std::to_string(result.Counts.Blocks));
+                ok = ok && put("insert_count", std::to_string(result.Counts.Inserts));
+                ok = ok && put("is_native_tianzheng", isNativeTch ? "1" : "0");
+                ok = ok && put("tch_object_count", std::to_string(snap.TchObjectCount));
+                ok = ok && put("tch_decoded_count", std::to_string(snap.TchDecodedCount));
+                ok = ok && put("tch_failed_count", std::to_string(snap.TchFailedCount));
+                ok = ok && put("tch_config_fill", snap.TchConfigFill ? "1" : "0");
+                ok = ok && put("tch_config_detail_scale", JsonDouble(snap.TchConfigDetailScale, 4));
+                ok = ok && put("undecoded_proxies_json", undecodedJw.Str());
+                ok = ok && put("skipped_entities_json", skippedJw.Str());
+                ok = ok && put("unresolved_xrefs_json", xrefJw.Str());
+                if (!ok) return false;
+            }
+
+            if (!tx.Commit(error))
+                return false;
         }
 
-        if (!ExecSql(db, "COMMIT; PRAGMA journal_mode = DELETE; PRAGMA optimize;", error))
-            return cleanupFail();
+        if (!ExecSqliteChecked(db, "PRAGMA journal_mode = DELETE; PRAGMA optimize;", error))
+            return false;
 
-        sqlite3_close(db);
-        db = nullptr;
+        if (!dbGuard.Close(error))
+            return false;
 
         if (!AtomicReplaceFile(tmpPath, outDbPath, error))
-        {
-            std::filesystem::remove(Utf8ToPath(tmpPath), ec);
             return false;
-        }
+
+        tempGuard.Release();
         return true;
     }
 
-    bool RunExportDbCommand(const ExportDbOptions& opts, ExportDbResult& result, std::string* error)
+    bool RunExportDbCommand(const ExportDbOptions& opts, ExportDbResult& result,
+                            std::string* error, std::string* errorCode, bool* isUsageError)
     {
+        if (errorCode) errorCode->clear();
+        if (isUsageError) *isUsageError = false;
+
+        // CAD-22：首次写盘前检查输入/输出路径身份冲突，绝不覆盖源 DWG
+        if (!ValidateIoPathConflicts({ { "输入图纸", opts.InputPath } },
+                                     { { "输出 SQLite", opts.OutputDbPath } },
+                                     errorCode, error))
+        {
+            if (isUsageError) *isUsageError = true;
+            return false;
+        }
+
         const auto t0 = std::chrono::steady_clock::now();
         uint64_t sizeBytes = 0;
         int64_t  mtimeMs   = 0;
-        if (!GetFileStats(opts.InputPath, sizeBytes, mtimeMs, error))
+        bool     mtimeOk   = false;
+        if (!GetFileStats(opts.InputPath, sizeBytes, mtimeMs, error, &mtimeOk))
+        {
+            if (errorCode) *errorCode = "LOAD_FAILED";
             return false;
+        }
 
+        const bool includeBlockEntities = !opts.NoBlockEntities;
         if (opts.ReuseIfFresh && !opts.Force)
         {
-            if (TryReuseExistingDb(opts.OutputDbPath, opts.InputPath, sizeBytes, mtimeMs, result))
+            if (TryReuseExistingDb(opts.OutputDbPath, opts.InputPath,
+                                   sizeBytes, mtimeMs, mtimeOk, includeBlockEntities, result))
             {
                 result.ElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - t0).count();
@@ -2253,11 +2594,17 @@ CREATE INDEX idx_tch_axes_label ON tch_axes(label);
         Scene scene;
         CadSemanticSnapshot snap;
         if (!LoadCadFileWithSemantics(opts.InputPath, scene, snap, error))
+        {
+            if (errorCode) *errorCode = "LOAD_FAILED";
             return false;
+        }
 
         if (!ExportSceneToSqlite(scene, snap, opts.InputPath, sizeBytes, mtimeMs,
-                                 opts.OutputDbPath, !opts.NoBlockEntities, result, error))
+                                 opts.OutputDbPath, includeBlockEntities, result, error))
+        {
+            if (errorCode) *errorCode = "EXPORT_DB_FAILED";
             return false;
+        }
 
         result.ElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();

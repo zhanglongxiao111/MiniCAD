@@ -161,9 +161,9 @@ namespace MiniCAD
             const auto& attr = e.GetAttr();
             if (!attr.Visible) return false;
             if (const Layer* layer = m_ctx->scene.GetLayerManager().GetLayer(attr.LayerId))
-                if (!layer->IsVisible() || layer->IsLocked())
+                if (!layer->IsVisible())
                     return false;
-            return true;
+            return !m_ctx->scene.IsEntityLocked(e);
         }
 
         void DrawRect(const StretchWindow& w)

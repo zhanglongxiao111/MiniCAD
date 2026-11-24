@@ -35,11 +35,30 @@ namespace MiniCAD::SaTool
         TessellateStats           Stats;
     };
 
+    struct FontDirResolution
+    {
+        std::string ResolvedDir;          // 实际生效的 SHX/TTF 字体目录（空表示未找到内置目录）
+        bool        Explicit     = false; // 是否由调用方显式指定 --fonts-dir
+        bool        UsedFallback = false; // 自动探测未找到内置目录，仅回退系统字体
+    };
+
     // 按规范顺序自动定位字体目录（--fonts-dir > <exe>/fonts > <exe>/../assets/fonts > <exe>/../../assets/fonts）。
     std::string ResolveFontsDirectory(const std::string& explicitDir = {});
 
-    // 初始化无头 FontSystem（配置字体目录与系统字体回退目录）。
-    void InitHeadlessFontSystem(FontSystem& fontSystem, const std::string& explicitFontsDir = {});
+    // 严格解析与校验字体目录：
+    // - 当 explicitGiven 为 true 或 explicitDir 非空时，目录必须存在、为目录且可读取，否则返回 false（绝不静默回退）。
+    // - 未显式指定时按规范顺序自动探测，未命中时标记 UsedFallback = true。
+    bool ResolveFontsDirectoryStrict(const std::string& explicitDir,
+                                     bool explicitGiven,
+                                     FontDirResolution& out,
+                                     std::string* error = nullptr);
+
+    // 初始化无头 FontSystem（配置字体目录与系统字体回退目录）；显式 --fonts-dir 无效时返回 false。
+    bool InitHeadlessFontSystem(FontSystem& fontSystem,
+                                const std::string& explicitFontsDir = {},
+                                bool explicitGiven = false,
+                                FontDirResolution* resolutionOut = nullptr,
+                                std::string* error = nullptr);
 
     // 解析布局名：支持 "Model" / "模型" / 精确布局名 / "index:<N>"；失败返回 -1。
     int ResolveLayoutIndex(const Scene& scene, const std::string& layoutSpec, std::string* error = nullptr);
@@ -52,6 +71,16 @@ namespace MiniCAD::SaTool
     // 计算目标布局可见有界实体的包围盒；expandMargin=true 时向外扩张 2%。
     bool ComputeLayoutBbox(const Scene& scene, int layoutIdx, std::array<double, 4>& outBbox,
                            bool expandMargin = true);
+
+    // 计算双图对比默认整图窗口：对齐后 A 与变换到 A 坐标系的 B 的可见实体边界并集（允许单侧布局为空）。
+    bool ComputeCompareUnionBbox(const Scene& sceneA, int layoutIdxA,
+                                 const Scene& sceneB, int layoutIdxB,
+                                 double dxBToA, double dyBToA,
+                                 std::array<double, 4>& outBbox,
+                                 bool expandMargin = true);
+
+    // 统计纸张布局中显示模型空间的浮动视口数量（模型空间布局返回 0）。
+    int CountModelViewportsInLayout(const Scene& scene, int layoutIdx);
 
     // 判定实体是否为天正修改范围框（闭合多段线、线宽>=50、顶点数<=60、长边>=2000、非零凸度>=2）。
     bool IsModificationFrame(const Entity& entity);

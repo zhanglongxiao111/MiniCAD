@@ -7,6 +7,8 @@
 #include "Core/Entity/TextEntity.hpp"
 #include "Core/Entity/MTextEntity.hpp"
 #include "Core/Entity/AttribEntity.hpp"
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <string>
 
@@ -29,12 +31,16 @@ namespace MiniCAD::SaTextExport
             const auto* l = scene.GetLayerManager().GetLayer(e.GetAttr().LayerId);
             return l ? l->GetName() : "?";
         }
-        void Emit(const char* kind, const Entity& e, Math::Point3 p, const Math::Mat4& m, double h,
+        void Emit(const char* kind, const Entity& e, Math::Point3 p, const Math::Mat4& m, double h, double rot,
                   const std::string& text, const std::string& path, const std::string& tag = {})
         {
             const auto w = m.TransformPoint(p);
+            // 沿局部文字高度方向（旋转角 rot 逆时针 90°）变换到世界空间以换算真实世界字高
+            const Math::Vec3 upLocal{ -std::sin(rot) * h, std::cos(rot) * h, 0.0 };
+            const double worldH = m.TransformVector(upLocal).Length();
+            const double outH   = std::isfinite(worldH) ? worldH : 0.0;
             char num[96];
-            std::snprintf(num, sizeof num, "\t%.2f\t%.2f\t%.2f\t", w.x, w.y, h);
+            std::snprintf(num, sizeof num, "\t%.2f\t%.2f\t%.2f\t", w.x, w.y, outH);
             out += kind; out += num;
             out += Clean(LayerName(e)); out += '\t';
             out += Clean(path); out += '\t';
@@ -46,23 +52,36 @@ namespace MiniCAD::SaTextExport
             if (e.IsKindOf<TextEntity>())
             {
                 const auto& t = static_cast<const TextEntity&>(e);
-                Emit("TEXT", e, t.GetPosition(), m, t.GetHeight(), t.GetText(), path);
+                Emit("TEXT", e, t.GetPosition(), m, t.GetHeight(), t.GetRotation(), t.GetText(), path);
             }
             else if (e.IsKindOf<MTextEntity>())
             {
                 const auto& t = static_cast<const MTextEntity&>(e);
-                Emit("MTEXT", e, t.GetPosition(), m, t.GetHeight(), t.GetPlainText(), path);
+                Emit("MTEXT", e, t.GetPosition(), m, t.GetHeight(), t.GetRotation(), t.GetPlainText(), path);
             }
             else if (e.IsKindOf<InsertEntity>() && depth < 12)
             {
                 const auto& ins = static_cast<const InsertEntity&>(e);
-                const Math::Mat4 cm = ins.CellMatrix(0, 0) * m;
                 const std::string p = path.empty() ? ins.GetBlockName() : path + "/" + ins.GetBlockName();
                 if (const auto* b = ins.GetBlock())
-                    for (const auto& c : b->GetEntities())
-                        Walk(*c, cm, p, depth + 1);
+                {
+                    const int rows = std::max(1, ins.GetRowCount());
+                    const int cols = std::max(1, ins.GetColumnCount());
+                    for (int r = 0; r < rows; ++r)
+                    {
+                        for (int c = 0; c < cols; ++c)
+                        {
+                            const Math::Mat4 cm = ins.CellMatrix(c, r) * m;
+                            for (const auto& child : b->GetEntities())
+                                if (child)
+                                    Walk(*child, cm, p, depth + 1);
+                        }
+                    }
+                }
+                // ATTRIB 已位于所属插入的世界坐标系，不重复套本级 CellMatrix（仅套外层嵌套块矩阵 m）
                 for (const auto& a : ins.GetAttribs())
-                    Emit("ATTRIB", *a, a->GetPosition(), m, a->GetHeight(), a->GetText(), p, a->GetTag());
+                    if (a)
+                        Emit("ATTRIB", *a, a->GetPosition(), m, a->GetHeight(), a->GetRotation(), a->GetText(), p, a->GetTag());
             }
         }
     };

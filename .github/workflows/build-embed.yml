@@ -1,6 +1,7 @@
-# 嵌入版持续集成：编译 MiniCADWeb（WebAssembly）与无界面读字工具 SaDwgText（Node WASM）
+# 嵌入版持续集成：编译 MiniCADWeb（WebAssembly）、无界面读字工具 SaDwgText（Node WASM）
+# 与 Win64 原生无头工具 SaDwgTool（Release），并对打包产物做真实包内运行验证。
 # 与上游 .github/workflows/build.yml 分文件存放，追上游 main 时零冲突。
-name: Build Embed WASM
+name: Build Embed & SaDwgTool
 
 on:
   push:
@@ -52,6 +53,19 @@ jobs:
           (cd "dist/${bundle}" && sha256sum web/index.js web/index.wasm web/index.data web/fonts/*.otf node/SaDwgText.js node/SaDwgText.wasm > SHA256SUMS)
           (cd dist && zip -r "${bundle}.zip" "${bundle}")
 
+      - name: Verify packaged embed bundle (SHA256 + Node SaDwgText)
+        run: |
+          set -euo pipefail
+          bundle="MiniCAD-embed-${PACKAGE_VERSION}"
+          verify_dir="${RUNNER_TEMP}/verify-embed"
+          rm -rf "${verify_dir}"
+          mkdir -p "${verify_dir}/中文目录"
+          unzip -q "dist/${bundle}.zip" -d "${verify_dir}"
+          (cd "${verify_dir}/${bundle}" && sha256sum -c SHA256SUMS)
+          cp "tests/Data/Dwg/sample_AC1027.dwg" "${verify_dir}/中文目录/测试图纸.dwg"
+          node "${verify_dir}/${bundle}/node/SaDwgText.js" "${verify_dir}/中文目录/测试图纸.dwg" > "${verify_dir}/out.tsv"
+          test -s "${verify_dir}/out.tsv"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -59,10 +73,131 @@ jobs:
           path: dist/*.zip
           retention-days: 14
 
+  win64-tool:
+    name: Win64 SaDwgTool (Release)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check translations and lint
+        run: python -X utf8 tools/i18n_extract.py --check --lint
+
+      - name: Configure
+        run: cmake -S . -B out/tool-ci -DMINICAD_BUILD_DWG_TOOL=ON -DMINICAD_BUILD_TESTS=ON
+
+      - name: Build SaDwgTool and tests
+        run: cmake --build out/tool-ci --config Release --target SaDwgTool SaDwgToolTests --parallel
+
+      - name: Run SaDwgToolTests
+        run: ctest --test-dir out/tool-ci -C Release -R "^SaDwgToolTests$" --output-on-failure
+
+      - name: Package Win64 SaDwgTool bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "MiniCAD-SaDwgTool-$env:PACKAGE_VERSION-windows-x64"
+          $bundleDir = Join-Path "dist" $name
+          New-Item -ItemType Directory -Force $bundleDir | Out-Null
+          Copy-Item "out/tool-ci/SaDwgTool.exe" $bundleDir
+          Copy-Item -Recurse "assets/fonts" (Join-Path $bundleDir "fonts")
+          Copy-Item "LICENSE", "THIRD_PARTY_NOTICES.md", "README-EMBED.md" $bundleDir
+
+          $rootFull = (Resolve-Path $bundleDir).Path
+          $sumLines = Get-ChildItem -Path $bundleDir -Recurse -File |
+            Sort-Object FullName |
+            ForEach-Object {
+              $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              $rel = $_.FullName.Substring($rootFull.Length + 1).Replace('\', '/')
+              "$hash  $rel"
+            }
+          [System.IO.File]::WriteAllLines((Join-Path $bundleDir "SHA256SUMS"), $sumLines, [System.Text.UTF8Encoding]::new($false))
+          Compress-Archive -Path $bundleDir -DestinationPath "dist/$name.zip" -Force
+
+      - name: Verify packaged SaDwgTool.exe (including Chinese paths)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $OutputEncoding = [System.Text.Encoding]::UTF8
+
+          $name = "MiniCAD-SaDwgTool-$env:PACKAGE_VERSION-windows-x64"
+          $verifyRoot = Join-Path $env:RUNNER_TEMP "验证包-SaDwgTool"
+          if (Test-Path $verifyRoot) { Remove-Item -Recurse -Force $verifyRoot }
+          New-Item -ItemType Directory -Force $verifyRoot | Out-Null
+          Expand-Archive -Path "dist/$name.zip" -DestinationPath $verifyRoot -Force
+
+          $exe = Join-Path $verifyRoot "$name\SaDwgTool.exe"
+          if (-not (Test-Path $exe)) { throw "Packaged SaDwgTool.exe not found: $exe" }
+
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "SaDwgTool --version failed with $LASTEXITCODE" }
+          & $exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "SaDwgTool --help failed with $LASTEXITCODE" }
+
+          $fixtureDir = Join-Path $verifyRoot "中文图纸目录"
+          New-Item -ItemType Directory -Force $fixtureDir | Out-Null
+          & "out/tool-ci/SaDwgToolTests.exe" --emit-tch-fixtures $fixtureDir
+          if ($LASTEXITCODE -ne 0) { throw "Emit fixtures failed with $LASTEXITCODE" }
+
+          $dwgA = Join-Path $fixtureDir "tch_before.dwg"
+          $dwgB = Join-Path $fixtureDir "tch_after.dwg"
+          $dbOut = Join-Path $fixtureDir "导出库.sqlite"
+          $pngOut = Join-Path $fixtureDir "渲染预览.png"
+          $diffPng = Join-Path $fixtureDir "差异图.png"
+          $diffJson = Join-Path $fixtureDir "差异图.json"
+          $diffDb = Join-Path $fixtureDir "差异库.sqlite"
+
+          $expJson = (& $exe export-db $dwgA $dbOut) | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or -not $expJson.ok -or -not (Test-Path $dbOut)) {
+            throw "Packaged export-db failed"
+          }
+
+          $renJson = (& $exe render $dwgA $pngOut --max-px 600) | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or -not $renJson.ok -or -not (Test-Path $pngOut)) {
+            throw "Packaged render failed"
+          }
+
+          $difJson = (& $exe diff $dwgA $dwgB --auto-align --out-png $diffPng --out-db $diffDb) | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or -not $difJson.ok -or -not (Test-Path $diffPng) -or -not (Test-Path $diffJson) -or -not (Test-Path $diffDb)) {
+            throw "Packaged diff failed"
+          }
+
+          $hashBefore = (Get-FileHash -Path $dwgA -Algorithm SHA256).Hash
+          $prevEap = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          if ($null -ne (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue)) {
+            $PSNativeCommandUseErrorActionPreference = $false
+          }
+          & $exe export-db $dwgA $dwgA 2>&1 | Out-Null
+          $conflictCode = $LASTEXITCODE
+          & $exe render $dwgA (Join-Path $cnDir "bad_font.png") --fonts-dir (Join-Path $cnDir "不存在的字体目录") 2>&1 | Out-Null
+          $badFontCode = $LASTEXITCODE
+          $ErrorActionPreference = $prevEap
+          if ($conflictCode -ne 2) {
+            throw "Conflict guard should exit 2 when overwriting source DWG (got $conflictCode)"
+          }
+          if ($badFontCode -ne 2) {
+            throw "Invalid --fonts-dir should exit 2 (got $badFontCode)"
+          }
+          $hashAfter = (Get-FileHash -Path $dwgA -Algorithm SHA256).Hash
+          if ($hashBefore -ne $hashAfter) {
+            throw "Source DWG was modified despite conflict guard"
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiniCAD-SaDwgTool-Windows
+          path: dist/*.zip
+          retention-days: 14
+
   release:
     name: Publish Embed Release
     if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && contains(github.ref_name, '-sa.')
-    needs: [embed-wasm]
+    needs: [embed-wasm, win64-tool]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -70,14 +205,16 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: MiniCAD-Embed-WASM
           path: dist
+          merge-multiple: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: MiniCAD Embed ${{ github.ref_name }}
           body: |
-            MiniCAD 嵌入增强版 WebAssembly 与无界面文字提取（`SaDwgText`）构建产物。
+            MiniCAD 嵌入增强版构建产物：
+            - WebAssembly 嵌入包与无界面文字提取工具（`MiniCADWeb` / `SaDwgText`）
+            - Win64 原生无头解析、渲染与三轨比对工具（`SaDwgTool`）
             说明与导出接口清单见 `README-EMBED.md`。
           files: dist/*.zip

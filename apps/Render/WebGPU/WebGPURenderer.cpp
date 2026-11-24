@@ -16,10 +16,11 @@ namespace MiniCAD
         const char* kShader = R"(
             struct Uniforms
             {
-                viewProj : mat4x4<f32>,
-                light    : f32,         // 1 浅色背景，0 深色背景，-1 不换色（光栅图像）
-                opacity  : f32,         // 整体透明度（对齐淡化用）
-                _pad0    : vec2<f32>,
+                viewProj     : mat4x4<f32>,
+                light        : f32,         // 1 浅色背景，0 深色背景，-1 不换色（光栅图像）
+                opacity      : f32,         // 整体透明度（对齐淡化用）
+                fullCoverage : f32,         // >0.5 时将非零顶点 alpha 归一化为 1.0（对比底片防锁层淡显误判差异）
+                _pad0        : f32,
             };
             @group(0) @binding(0) var<uniform> u : Uniforms;
             @group(1) @binding(0) var tex  : texture_2d<f32>;
@@ -78,6 +79,15 @@ namespace MiniCAD
                 return o;
             }
 
+            fn VertexCoverage(a : f32) -> f32
+            {
+                if (u.fullCoverage > 0.5)
+                {
+                    return select(0.0, 1.0, a > 0.001);
+                }
+                return a;
+            }
+
             fn ApplyPaint(c : vec4<f32>) -> vec4<f32>
             {
                 return vec4<f32>(c.rgb, clamp(c.a * u.opacity, 0.0, 1.0));
@@ -85,18 +95,19 @@ namespace MiniCAD
 
             @fragment fn fsColor(i : VOut) -> @location(0) vec4<f32>
             {
-                return ApplyPaint(i.color);
+                return ApplyPaint(vec4<f32>(i.color.rgb, VertexCoverage(i.color.a)));
             }
 
             // 文字：字形图集只用 alpha
             @fragment fn fsText(i : VOut) -> @location(0) vec4<f32>
             {
-                return ApplyPaint(vec4<f32>(i.color.rgb, i.color.a * textureSample(tex, samp, i.uv).a));
+                return ApplyPaint(vec4<f32>(i.color.rgb, VertexCoverage(i.color.a) * textureSample(tex, samp, i.uv).a));
             }
 
             @fragment fn fsImage(i : VOut) -> @location(0) vec4<f32>
             {
-                return ApplyPaint(textureSample(tex, samp, i.uv) * i.color);
+                let t = textureSample(tex, samp, i.uv);
+                return ApplyPaint(vec4<f32>(t.rgb * i.color.rgb, t.a * VertexCoverage(i.color.a)));
             }
         )";
 
@@ -144,7 +155,8 @@ namespace MiniCAD
             float viewProj[16];
             float light;
             float opacity;
-            float pad0[2];
+            float fullCoverage;
+            float pad0;
         };
         static_assert(sizeof(Uniforms) == 80);
 
@@ -512,8 +524,9 @@ namespace MiniCAD
         Uniforms u{};
         for (int i = 0; i < 16; ++i)
             u.viewProj[i] = static_cast<float>(viewProj.m[i]);
-        u.light   = p == Program::Image ? -1.0f : (m_lightBackground ? 1.0f : 0.0f);
-        u.opacity = m_paintStyle.Opacity;
+        u.light        = p == Program::Image ? -1.0f : (m_lightBackground ? 1.0f : 0.0f);
+        u.opacity      = m_paintStyle.Opacity;
+        u.fullCoverage = m_paintStyle.FullCoverage ? 1.0f : 0.0f;
         const uint64_t offset = m_uniforms.used;
         wgpuQueueWriteBuffer(m_queue, m_uniforms.buffer, offset, &u, sizeof(u));
         m_uniforms.used += kUniformStride;

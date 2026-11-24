@@ -102,6 +102,10 @@ namespace MiniCAD
 
         #define MINICAD_GL_APPLY_PAINT \
             "uniform float uOpacity;\n" \
+            "uniform float uFullCoverage;\n" \
+            "float VertexCoverage(float a) {\n" \
+            "    return uFullCoverage > 0.5 ? (a > 0.001 ? 1.0 : 0.0) : a;\n" \
+            "}\n" \
             "vec4 ApplyPaint(vec4 c) {\n" \
             "    return vec4(c.rgb, clamp(c.a * uOpacity, 0.0, 1.0));\n" \
             "}\n"
@@ -110,20 +114,20 @@ namespace MiniCAD
             "#version 300 es\nprecision mediump float;\n"
             MINICAD_GL_APPLY_PAINT
             "in vec4 vColor;\nout vec4 outColor;\n"
-            "void main() { outColor = ApplyPaint(vColor); }";
+            "void main() { outColor = ApplyPaint(vec4(vColor.rgb, VertexCoverage(vColor.a))); }";
 
         // 文字：字形图集只用 alpha
         const char* kFragmentText =
             "#version 300 es\nprecision mediump float;\nuniform sampler2D uTex;\n"
             MINICAD_GL_APPLY_PAINT
             "in vec4 vColor;\nin vec2 vUV;\nout vec4 outColor;\n"
-            "void main() { outColor = ApplyPaint(vec4(vColor.rgb, vColor.a * texture(uTex, vUV).a)); }";
+            "void main() { outColor = ApplyPaint(vec4(vColor.rgb, VertexCoverage(vColor.a) * texture(uTex, vUV).a)); }";
 
         const char* kFragmentImage =
             "#version 300 es\nprecision mediump float;\nuniform sampler2D uTex;\n"
             MINICAD_GL_APPLY_PAINT
             "in vec4 vColor;\nin vec2 vUV;\nout vec4 outColor;\n"
-            "void main() { outColor = ApplyPaint(texture(uTex, vUV) * vColor); }";
+            "void main() { vec4 t = texture(uTex, vUV); outColor = ApplyPaint(vec4(t.rgb * vColor.rgb, t.a * VertexCoverage(vColor.a))); }";
 
         // 全屏三角形：双离屏底片三态差异合成（按像素覆盖度判定 重合 / 仅主图 / 仅对比图）
         const char* kVertexCompare = R"(#version 300 es
@@ -207,9 +211,10 @@ namespace MiniCAD
         {
             ProgramInfo& info = m_programs[i];
             info.program  = Link(i == 0 ? kVertexColor : kVertexTextured, fragments[i]);
-            info.viewProj = glGetUniformLocation(info.program, "uViewProj");
-            info.light    = glGetUniformLocation(info.program, "uLight");
-            info.opacity  = glGetUniformLocation(info.program, "uOpacity");
+            info.viewProj     = glGetUniformLocation(info.program, "uViewProj");
+            info.light        = glGetUniformLocation(info.program, "uLight");
+            info.opacity      = glGetUniformLocation(info.program, "uOpacity");
+            info.fullCoverage = glGetUniformLocation(info.program, "uFullCoverage");
             if (i != 0)
             {
                 glUseProgram(info.program);
@@ -218,10 +223,11 @@ namespace MiniCAD
         }
         {
             ProgramInfo& info = m_programs[static_cast<int>(Program::Glyph)];
-            info.program  = Link(kVertexGlyph, kFragmentColor);
-            info.viewProj = glGetUniformLocation(info.program, "uViewProj");
-            info.light    = glGetUniformLocation(info.program, "uLight");
-            info.opacity  = glGetUniformLocation(info.program, "uOpacity");
+            info.program      = Link(kVertexGlyph, kFragmentColor);
+            info.viewProj     = glGetUniformLocation(info.program, "uViewProj");
+            info.light        = glGetUniformLocation(info.program, "uLight");
+            info.opacity      = glGetUniformLocation(info.program, "uOpacity");
+            info.fullCoverage = glGetUniformLocation(info.program, "uFullCoverage");
         }
         InitVertexBuffer(m_stream, false);
         InitVertexBuffer(m_textStream, true);
@@ -397,6 +403,7 @@ namespace MiniCAD
         glUniformMatrix4fv(info.viewProj, 1, GL_FALSE, m);
         glUniform1f(info.light, p == Program::Image ? -1.0f : (m_lightBackground ? 1.0f : 0.0f));
         glUniform1f(info.opacity, m_paintStyle.Opacity);
+        glUniform1f(info.fullCoverage, m_paintStyle.FullCoverage ? 1.0f : 0.0f);
 
         // 深度：与 D3D11Renderer 相同——不测试 / 混合的只测试不写入 / 不混合的测试并写入（三维视图的着色面）
         if (!depth)

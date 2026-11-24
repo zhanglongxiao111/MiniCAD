@@ -73,6 +73,10 @@ namespace MiniCAD
 
         // ── 输入 ─────────────────────────────────────────────
         bool OnInput(const InputEvent& e);
+        // 仅按当前相机刷新光标悬停捕捉（无按键、不产生拖拽增量），用于滚轮缩放后同步对齐拾点捕捉
+        void RefreshHoverSnap(int mouseX, int mouseY, uint8_t modifiers = 0);
+        // 约束主图点击/框选/夹点拾取的水平像素可见范围 [minX, maxX)（叠图隐藏主图或卷帘分屏用）
+        void SetPickClipX(bool enabled, double minX = 0.0, double maxX = 0.0);
 
         // ── 渲染：收集顶点 + 提交到 Viewport ─────────────────
         void Render();

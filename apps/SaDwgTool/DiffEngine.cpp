@@ -1,9 +1,11 @@
 #include "DiffEngine.h"
 #include "CpuRasterizer.h"
 #include "JsonWriter.h"
+#include "PathGuard.h"
 #include "PngWriter.h"
 #include "SceneTessellator.h"
 #include "SqliteExporter.h"
+#include "SqliteGuard.h"
 #include "TchSemanticExport.h"
 #include "Core/PathUtils.h"
 #include "Core/Entity/InsertEntity.hpp"
@@ -13,7 +15,20 @@
 #include "Scene/Scene.h"
 #include "sqlite3.h"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -93,17 +108,6 @@ namespace MiniCAD::SaTool
                     total += std::max(1, d.Count);
             }
             return total;
-        }
-
-        std::string ResolveDefaultJsonPath(const std::string& pngPath)
-        {
-            if (pngPath.empty())
-                return {};
-            const size_t dot   = pngPath.find_last_of('.');
-            const size_t slash = pngPath.find_last_of("/\\");
-            if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
-                return pngPath.substr(0, dot) + ".json";
-            return pngPath + ".json";
         }
 
         bool WriteUtf8TextFile(const std::string& utf8Path, const std::string& content, std::string* error)
@@ -1117,6 +1121,7 @@ namespace MiniCAD::SaTool
             j.KeyString("dxf_name", w.DxfName);
             j.KeyDouble("thickness", w.TotalThickness, 1);
             if (w.HasHeight) j.KeyDouble("height", w.Height, 1);
+            else             j.KeyNull("height");
             j.KeyString("material", w.MaterialName);
             j.KeyDouble("length", w.Length, 1);
             j.KeyInt("opening_count", w.OpeningCount);
@@ -1255,13 +1260,13 @@ namespace MiniCAD::SaTool
             }
         }
 
-        void RunTrack3TchDiff(const CadSemanticSnapshot& snapA, const std::string& spaceA, const std::string& layoutA,
-                              const CadSemanticSnapshot& snapB, const std::string& spaceB, const std::string& layoutB,
-                              const std::array<double, 4>& cropInA,
-                              double dx, double dy,
-                              double tolMm,
-                              const std::vector<DiffRegionItem>& regions,
-                              DiffReport& report)
+        void RunTrack3TchDiffImpl(const CadSemanticSnapshot& snapA, const std::string& spaceA, const std::string& layoutA,
+                                  const CadSemanticSnapshot& snapB, const std::string& spaceB, const std::string& layoutB,
+                                  const std::array<double, 4>& cropInA,
+                                  double dx, double dy,
+                                  double tolMm,
+                                  const std::vector<DiffRegionItem>& regions,
+                                  DiffReport& report)
         {
             auto filterLayout = [](const std::string& sp, const std::string& lay,
                                    const std::string& targetSp, const std::string& targetLay) -> bool {
@@ -1352,24 +1357,43 @@ namespace MiniCAD::SaTool
                     stB.push_back(std::move(s));
             }
 
-            const size_t totalA = wallsA.size() + openA.size() + colA.size() + spA.size() + stA.size();
-            const size_t totalB = wallsB.size() + openB.size() + colB.size() + spB.size() + stB.size();
-            if (totalA == 0 && totalB == 0)
+            // CAD-18：按源图天正解码状态判定天正轨可用性，而非按裁剪后构件数量判定，
+            // 使原生天正图纸在裁剪窗口内单侧全删/全增或空侧新增均可正常产出差异项。
+            auto isNativeTch = [](const CadSemanticSnapshot& s) -> bool {
+                return s.TchDecodedCount > 0
+                    || !s.TchWalls.empty() || !s.TchOpenings.empty() || !s.TchColumns.empty()
+                    || !s.TchSpaces.empty() || !s.TchStairs.empty() || !s.TchDimensions.empty()
+                    || !s.TchAxes.empty() || !s.TchSheets.empty() || !s.TchTexts.empty();
+            };
+            const bool nativeA = isNativeTch(snapA);
+            const bool nativeB = isNativeTch(snapB);
+            const bool failedA = !nativeA && snapA.TchFailedCount > 0;
+            const bool failedB = !nativeB && snapB.TchFailedCount > 0;
+            const bool emptyA  = !nativeA && !failedA && snapA.EntityOrigins.empty();
+            const bool emptyB  = !nativeB && !failedB && snapB.EntityOrigins.empty();
+
+            if (!nativeA && !nativeB)
             {
                 report.TchAvailable = false;
-                report.TchReason    = "A/B 两侧在比较范围内均未检测到原生天正构件";
+                report.TchReason    = (failedA || failedB)
+                                        ? "A/B 两侧源图天正对象未能成功解码"
+                                        : "A/B 两侧源图均未检测到原生天正解码对象";
                 return;
             }
-            if (totalA == 0)
+            if (!nativeA && !emptyA)
             {
                 report.TchAvailable = false;
-                report.TchReason    = "A 侧非原生天正对象（已炸为普通图元或范围内无天正构件）";
+                report.TchReason    = failedA
+                                        ? "A 侧源图天正对象解码失败，无法启用天正语义轨"
+                                        : "A 侧源图非原生天正对象（已炸为普通图元），跳过天正语义轨以避免误报";
                 return;
             }
-            if (totalB == 0)
+            if (!nativeB && !emptyB)
             {
                 report.TchAvailable = false;
-                report.TchReason    = "B 侧非原生天正对象（已炸为普通图元或范围内无天正构件）";
+                report.TchReason    = failedB
+                                        ? "B 侧源图天正对象解码失败，无法启用天正语义轨"
+                                        : "B 侧源图非原生天正对象（已炸为普通图元），跳过天正语义轨以避免误报";
                 return;
             }
 
@@ -1399,6 +1423,16 @@ namespace MiniCAD::SaTool
                     std::vector<std::string> diffs;
                     if (std::abs(a.TotalThickness - b.TotalThickness) > 1.0)
                         diffs.push_back("墙厚 " + JsonDouble(a.TotalThickness, 0) + "->" + JsonDouble(b.TotalThickness, 0) + "mm");
+                    if (a.HasHeight != b.HasHeight)
+                    {
+                        const std::string hA = a.HasHeight ? (JsonDouble(a.Height, 0) + "mm") : "缺失";
+                        const std::string hB = b.HasHeight ? (JsonDouble(b.Height, 0) + "mm") : "缺失";
+                        diffs.push_back("墙高 " + hA + "->" + hB);
+                    }
+                    else if (a.HasHeight && b.HasHeight && std::abs(a.Height - b.Height) > 1.0)
+                    {
+                        diffs.push_back("墙高 " + JsonDouble(a.Height, 0) + "->" + JsonDouble(b.Height, 0) + "mm");
+                    }
                     if (a.MaterialName != b.MaterialName)
                         diffs.push_back("材料 " + a.MaterialName + "->" + b.MaterialName);
                     if (std::abs(a.Length - b.Length) > 5.0)
@@ -1446,7 +1480,8 @@ namespace MiniCAD::SaTool
                     item.Y           = 0.5 * (a.StartY + a.EndY);
                     item.BboxDrawing = { a.MinX, a.MinY, a.MaxX, a.MaxY };
                     item.Summary     = "仅 A 侧存在墙体（厚 " + JsonDouble(a.TotalThickness, 0)
-                                     + "mm，长 " + JsonDouble(a.Length, 0) + "mm）";
+                                     + "mm，长 " + JsonDouble(a.Length, 0) + "mm"
+                                     + (a.HasHeight ? ("，高 " + JsonDouble(a.Height, 0) + "mm") : "") + "）";
                     item.BeforeJson  = WallParamJson(a);
                     addChange(std::move(item), report.TchWallCount);
                 }
@@ -1463,7 +1498,8 @@ namespace MiniCAD::SaTool
                     item.Y           = 0.5 * (b.StartY + b.EndY);
                     item.BboxDrawing = { b.MinX, b.MinY, b.MaxX, b.MaxY };
                     item.Summary     = "仅 B 侧存在墙体（厚 " + JsonDouble(b.TotalThickness, 0)
-                                     + "mm，长 " + JsonDouble(b.Length, 0) + "mm）";
+                                     + "mm，长 " + JsonDouble(b.Length, 0) + "mm"
+                                     + (b.HasHeight ? ("，高 " + JsonDouble(b.Height, 0) + "mm") : "") + "）";
                     item.AfterJson   = WallParamJson(b);
                     addChange(std::move(item), report.TchWallCount);
                 }
@@ -1880,97 +1916,110 @@ CREATE INDEX idx_diff_tch_region ON diff_tch_changes(region_id);
 CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
 )SQL";
 
-        bool WriteDiffSqlite(const std::string& outDbPath, const DiffReport& report, std::string* error)
+        std::string MakeUniqueDiffTempPath(const std::string& outDbPath)
         {
-            const std::filesystem::path destFs = MiniCAD::Utf8ToPath(outDbPath);
-            std::error_code ec;
-            if (destFs.has_parent_path())
-                std::filesystem::create_directories(destFs.parent_path(), ec);
+            static std::atomic<uint64_t> s_seq{ 0 };
+#ifdef _WIN32
+            const unsigned long pid = static_cast<unsigned long>(GetCurrentProcessId());
+#else
+            const unsigned long pid = static_cast<unsigned long>(getpid());
+#endif
+            const uint64_t seq = ++s_seq;
+            return outDbPath + ".tmp." + std::to_string(pid) + "."
+                 + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())
+                 + "." + std::to_string(seq);
+        }
+    }
 
-            const std::string tempPath = outDbPath + ".tmp."
-                + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-            std::filesystem::remove(MiniCAD::Utf8ToPath(tempPath), ec);
+    void RunTrack3TchDiff(const CadSemanticSnapshot& snapA, const std::string& spaceA, const std::string& layoutA,
+                          const CadSemanticSnapshot& snapB, const std::string& spaceB, const std::string& layoutB,
+                          const std::array<double, 4>& cropInA,
+                          double dx, double dy,
+                          double tolMm,
+                          const std::vector<DiffRegionItem>& regions,
+                          DiffReport& report)
+    {
+        RunTrack3TchDiffImpl(snapA, spaceA, layoutA, snapB, spaceB, layoutB, cropInA, dx, dy, tolMm, regions, report);
+    }
 
-            sqlite3* db = nullptr;
-            if (sqlite3_open_v2(tempPath.c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK)
-            {
-                if (error) *error = std::string("无法创建比对库：") + (db ? sqlite3_errmsg(db) : "open failed");
-                if (db) sqlite3_close(db);
+    bool WriteDiffSqlite(const std::string& outDbPath, const DiffReport& report, std::string* error)
+    {
+        const std::filesystem::path destFs = MiniCAD::Utf8ToPath(outDbPath);
+        std::error_code ec;
+        if (destFs.has_parent_path())
+            std::filesystem::create_directories(destFs.parent_path(), ec);
+
+        const std::string tempPath = MakeUniqueDiffTempPath(outDbPath);
+        std::filesystem::remove(MiniCAD::Utf8ToPath(tempPath), ec);
+
+        // RAII 声明顺序：tempGuard -> dbGuard -> txGuard -> stmt，逆序析构自动 finalize/rollback/close/unlink（CAD-20）
+        ScopedTempFile tempGuard(tempPath);
+        ScopedSqliteDb dbGuard;
+        if (!dbGuard.Open(tempPath, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, error))
+            return false;
+
+        sqlite3* db = dbGuard.Get();
+        if (!ExecSqliteChecked(db, "PRAGMA journal_mode=DELETE; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;", error))
+            return false;
+        if (!ExecSqliteChecked(db, kDiffSchemaSql, error))
+            return false;
+
+        {
+            ScopedSqliteTransaction tx(db);
+            if (!tx.Begin("BEGIN IMMEDIATE;", error))
                 return false;
-            }
-
-            auto cleanupFail = [&](const std::string& msg) -> bool {
-                if (error) *error = msg;
-                if (db) sqlite3_close(db);
-                std::filesystem::remove(MiniCAD::Utf8ToPath(tempPath), ec);
-                return false;
-            };
-
-            auto execSql = [&](const char* sql) -> bool {
-                char* errMsg = nullptr;
-                if (sqlite3_exec(db, sql, nullptr, nullptr, &errMsg) != SQLITE_OK)
-                {
-                    const std::string m = errMsg ? errMsg : sqlite3_errmsg(db);
-                    if (errMsg) sqlite3_free(errMsg);
-                    if (error) *error = m;
-                    return false;
-                }
-                return true;
-            };
-
-            if (!execSql("PRAGMA journal_mode=DELETE; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;"))
-                return cleanupFail(error ? *error : "PRAGMA 失败");
-            if (!execSql(kDiffSchemaSql))
-                return cleanupFail(error ? *error : "建表失败");
-            if (!execSql("BEGIN TRANSACTION;"))
-                return cleanupFail(error ? *error : "开启事务失败");
-
-            auto bindOptText = [](sqlite3_stmt* st, int idx, const std::string& v) {
-                if (v.empty()) sqlite3_bind_null(st, idx);
-                else           sqlite3_bind_text(st, idx, v.c_str(), static_cast<int>(v.size()), SQLITE_TRANSIENT);
-            };
 
             // 1. diff_meta
             {
-                sqlite3_stmt* st = nullptr;
-                sqlite3_prepare_v2(db, "INSERT INTO diff_meta(key,value) VALUES(?1,?2);", -1, &st, nullptr);
-                auto putMeta = [&](const char* k, const std::string& v) {
-                    sqlite3_reset(st);
-                    sqlite3_bind_text(st, 1, k, -1, SQLITE_STATIC);
-                    sqlite3_bind_text(st, 2, v.c_str(), static_cast<int>(v.size()), SQLITE_TRANSIENT);
-                    sqlite3_step(st);
+                ScopedSqliteStmt st;
+                if (!st.Prepare(db, "INSERT INTO diff_meta(key,value) VALUES(?1,?2);", error))
+                    return false;
+                auto putMeta = [&](const char* k, const std::string& v) -> bool {
+                    return st.BindTextStatic(1, k, error)
+                        && st.BindText(2, v, error)
+                        && st.StepDone(error);
                 };
-                putMeta("schema_version", report.SchemaVersion);
-                putMeta("source_a", report.SideA.Source);
-                putMeta("source_b", report.SideB.Source);
-                putMeta("layout_a", report.SideA.Layout);
-                putMeta("layout_b", report.SideB.Layout);
-                putMeta("offset_dx", JsonDouble(report.OffsetBToA[0], 4));
-                putMeta("offset_dy", JsonDouble(report.OffsetBToA[1], 4));
-                putMeta("alignment_mode", report.Alignment.Mode);
-                putMeta("alignment_source", report.Alignment.Source);
-                putMeta("alignment_confidence", report.Alignment.Confidence);
-                putMeta("mm_per_px", JsonDouble(report.MmPerPx, 4));
-                putMeta("tolerance_mm", JsonDouble(report.ToleranceMm, 4));
-                putMeta("a_only_pixels", std::to_string(report.AOnlyPixels));
-                putMeta("b_only_pixels", std::to_string(report.BOnlyPixels));
-                putMeta("overlap_pixels", std::to_string(report.OverlapPixels));
-                putMeta("tch_available", report.TchAvailable ? "1" : "0");
-                sqlite3_finalize(st);
+                if (!putMeta("schema_version", report.SchemaVersion)
+                    || !putMeta("source_a", report.SideA.Source)
+                    || !putMeta("source_b", report.SideB.Source)
+                    || !putMeta("layout_a", report.SideA.Layout)
+                    || !putMeta("layout_b", report.SideB.Layout)
+                    || !putMeta("layout_space", report.IsPaperSpaceLayout ? "paper" : "model")
+                    || !putMeta("offset_dx", JsonDouble(report.OffsetBToA[0], 4))
+                    || !putMeta("offset_dy", JsonDouble(report.OffsetBToA[1], 4))
+                    || !putMeta("alignment_mode", report.Alignment.Mode)
+                    || !putMeta("alignment_source", report.Alignment.Source)
+                    || !putMeta("alignment_confidence", report.Alignment.Confidence)
+                    || !putMeta("mm_per_px", JsonDouble(report.MmPerPx, 4))
+                    || !putMeta("tolerance_mm", JsonDouble(report.ToleranceMm, 4))
+                    || !putMeta("tolerance_px", std::to_string(report.TolerancePx))
+                    || !putMeta("effective_tolerance_mm", JsonDouble(report.EffectiveToleranceMm, 4))
+                    || !putMeta("a_only_pixels", std::to_string(report.AOnlyPixels))
+                    || !putMeta("b_only_pixels", std::to_string(report.BOnlyPixels))
+                    || !putMeta("overlap_pixels", std::to_string(report.OverlapPixels))
+                    || !putMeta("tch_available", report.TchAvailable ? "1" : "0")
+                    || !putMeta("text_scope", report.IsPaperSpaceLayout ? "paper_space_only" : "model_space")
+                    || !putMeta("tch_scope", report.IsPaperSpaceLayout ? "paper_space_only" : "model_space")
+                    || !putMeta("viewport_model_semantics_included", report.PaperViewportSemanticsExcluded ? "0" : "1")
+                    || !putMeta("coverage_note", report.CoverageNote))
+                {
+                    return false;
+                }
             }
 
             // 2. diff_regions + diff_regions_rtree
             {
-                sqlite3_stmt* stR  = nullptr;
-                sqlite3_stmt* stRt = nullptr;
-                sqlite3_prepare_v2(db,
-                    "INSERT INTO diff_regions(id,minx,miny,maxx,maxy,px_x0,px_y0,px_x1,px_y1,"
-                    "a_only_pixels,b_only_pixels,dominant_side,sub_boxes_json) "
-                    "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13);",
-                    -1, &stR, nullptr);
-                sqlite3_prepare_v2(db,
-                    "INSERT INTO diff_regions_rtree(id,minx,maxx,miny,maxy) VALUES(?1,?2,?3,?4,?5);",
-                    -1, &stRt, nullptr);
+                ScopedSqliteStmt stR;
+                ScopedSqliteStmt stRt;
+                if (!stR.Prepare(db,
+                        "INSERT INTO diff_regions(id,minx,miny,maxx,maxy,px_x0,px_y0,px_x1,px_y1,"
+                        "a_only_pixels,b_only_pixels,dominant_side,sub_boxes_json) "
+                        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13);", error)
+                    || !stRt.Prepare(db,
+                        "INSERT INTO diff_regions_rtree(id,minx,maxx,miny,maxy) VALUES(?1,?2,?3,?4,?5);", error))
+                {
+                    return false;
+                }
 
                 for (const auto& r : report.Regions)
                 {
@@ -1985,113 +2034,121 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
                     subJ.EndArray();
                     const std::string subJson = subJ.Take();
 
-                    sqlite3_reset(stR);
-                    sqlite3_bind_int(stR, 1, r.Id);
-                    sqlite3_bind_double(stR, 2, r.BboxDrawing[0]);
-                    sqlite3_bind_double(stR, 3, r.BboxDrawing[1]);
-                    sqlite3_bind_double(stR, 4, r.BboxDrawing[2]);
-                    sqlite3_bind_double(stR, 5, r.BboxDrawing[3]);
-                    sqlite3_bind_int(stR, 6, r.BboxPx[0]);
-                    sqlite3_bind_int(stR, 7, r.BboxPx[1]);
-                    sqlite3_bind_int(stR, 8, r.BboxPx[2]);
-                    sqlite3_bind_int(stR, 9, r.BboxPx[3]);
-                    sqlite3_bind_int64(stR, 10, r.AOnlyPixels);
-                    sqlite3_bind_int64(stR, 11, r.BOnlyPixels);
-                    sqlite3_bind_text(stR, 12, r.DominantSide.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(stR, 13, subJson.c_str(), static_cast<int>(subJson.size()), SQLITE_TRANSIENT);
-                    sqlite3_step(stR);
+                    if (!stR.BindInt(1, r.Id, error)
+                        || !stR.BindDouble(2, r.BboxDrawing[0], error)
+                        || !stR.BindDouble(3, r.BboxDrawing[1], error)
+                        || !stR.BindDouble(4, r.BboxDrawing[2], error)
+                        || !stR.BindDouble(5, r.BboxDrawing[3], error)
+                        || !stR.BindInt(6, r.BboxPx[0], error)
+                        || !stR.BindInt(7, r.BboxPx[1], error)
+                        || !stR.BindInt(8, r.BboxPx[2], error)
+                        || !stR.BindInt(9, r.BboxPx[3], error)
+                        || !stR.BindInt64(10, r.AOnlyPixels, error)
+                        || !stR.BindInt64(11, r.BOnlyPixels, error)
+                        || !stR.BindText(12, r.DominantSide, error)
+                        || !stR.BindText(13, subJson, error)
+                        || !stR.StepDone(error))
+                    {
+                        return false;
+                    }
 
-                    sqlite3_reset(stRt);
-                    sqlite3_bind_int(stRt, 1, r.Id);
-                    sqlite3_bind_double(stRt, 2, r.BboxDrawing[0]);
-                    sqlite3_bind_double(stRt, 3, r.BboxDrawing[2]);
-                    sqlite3_bind_double(stRt, 4, r.BboxDrawing[1]);
-                    sqlite3_bind_double(stRt, 5, r.BboxDrawing[3]);
-                    sqlite3_step(stRt);
+                    if (!stRt.BindInt(1, r.Id, error)
+                        || !stRt.BindDouble(2, r.BboxDrawing[0], error)
+                        || !stRt.BindDouble(3, r.BboxDrawing[2], error)
+                        || !stRt.BindDouble(4, r.BboxDrawing[1], error)
+                        || !stRt.BindDouble(5, r.BboxDrawing[3], error)
+                        || !stRt.StepDone(error))
+                    {
+                        return false;
+                    }
                 }
-                sqlite3_finalize(stR);
-                sqlite3_finalize(stRt);
             }
 
             // 3. diff_texts
             {
-                sqlite3_stmt* st = nullptr;
-                sqlite3_prepare_v2(db,
-                    "INSERT INTO diff_texts(id,change_type,source_kind,tag,x,y,a_text,b_text,"
-                    "a_layer,b_layer,a_owner_handle,b_owner_handle,dist_mm,region_id) "
-                    "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14);",
-                    -1, &st, nullptr);
+                ScopedSqliteStmt st;
+                if (!st.Prepare(db,
+                        "INSERT INTO diff_texts(id,change_type,source_kind,tag,x,y,a_text,b_text,"
+                        "a_layer,b_layer,a_owner_handle,b_owner_handle,dist_mm,region_id) "
+                        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14);", error))
+                {
+                    return false;
+                }
                 int id = 1;
                 for (const auto& t : report.TextChanges)
                 {
-                    sqlite3_reset(st);
-                    sqlite3_bind_int(st, 1, id++);
-                    sqlite3_bind_text(st, 2, t.ChangeType.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(st, 3, t.SourceKind.c_str(), -1, SQLITE_TRANSIENT);
-                    bindOptText(st, 4, t.Tag);
-                    sqlite3_bind_double(st, 5, t.X);
-                    sqlite3_bind_double(st, 6, t.Y);
-                    bindOptText(st, 7, t.AText);
-                    bindOptText(st, 8, t.BText);
-                    bindOptText(st, 9, t.ALayer);
-                    bindOptText(st, 10, t.BLayer);
-                    bindOptText(st, 11, t.AOwnerHandle);
-                    bindOptText(st, 12, t.BOwnerHandle);
-                    if (t.HasDistMm) sqlite3_bind_double(st, 13, t.DistMm);
-                    else             sqlite3_bind_null(st, 13);
-                    if (t.RegionId > 0) sqlite3_bind_int(st, 14, t.RegionId);
-                    else                sqlite3_bind_null(st, 14);
-                    sqlite3_step(st);
+                    const bool distOk = t.HasDistMm ? st.BindDouble(13, t.DistMm, error) : st.BindNull(13, error);
+                    const bool regOk  = (t.RegionId > 0) ? st.BindInt(14, t.RegionId, error) : st.BindNull(14, error);
+                    if (!st.BindInt(1, id++, error)
+                        || !st.BindText(2, t.ChangeType, error)
+                        || !st.BindText(3, t.SourceKind, error)
+                        || !st.BindOptText(4, t.Tag, error)
+                        || !st.BindDouble(5, t.X, error)
+                        || !st.BindDouble(6, t.Y, error)
+                        || !st.BindOptText(7, t.AText, error)
+                        || !st.BindOptText(8, t.BText, error)
+                        || !st.BindOptText(9, t.ALayer, error)
+                        || !st.BindOptText(10, t.BLayer, error)
+                        || !st.BindOptText(11, t.AOwnerHandle, error)
+                        || !st.BindOptText(12, t.BOwnerHandle, error)
+                        || !distOk
+                        || !regOk
+                        || !st.StepDone(error))
+                    {
+                        return false;
+                    }
                 }
-                sqlite3_finalize(st);
             }
 
             // 4. diff_tch_changes
             {
-                sqlite3_stmt* st = nullptr;
-                sqlite3_prepare_v2(db,
-                    "INSERT INTO diff_tch_changes(id,category,change_type,handle_a,handle_b,label,"
-                    "x,y,minx,miny,maxx,maxy,summary,before_json,after_json,region_id) "
-                    "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16);",
-                    -1, &st, nullptr);
+                ScopedSqliteStmt st;
+                if (!st.Prepare(db,
+                        "INSERT INTO diff_tch_changes(id,category,change_type,handle_a,handle_b,label,"
+                        "x,y,minx,miny,maxx,maxy,summary,before_json,after_json,region_id) "
+                        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16);", error))
+                {
+                    return false;
+                }
                 int id = 1;
                 for (const auto& c : report.TchChanges)
                 {
-                    sqlite3_reset(st);
-                    sqlite3_bind_int(st, 1, id++);
-                    sqlite3_bind_text(st, 2, c.Category.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(st, 3, c.ChangeType.c_str(), -1, SQLITE_TRANSIENT);
-                    bindOptText(st, 4, c.HandleA);
-                    bindOptText(st, 5, c.HandleB);
-                    bindOptText(st, 6, c.Label);
-                    sqlite3_bind_double(st, 7, c.X);
-                    sqlite3_bind_double(st, 8, c.Y);
-                    sqlite3_bind_double(st, 9, c.BboxDrawing[0]);
-                    sqlite3_bind_double(st, 10, c.BboxDrawing[1]);
-                    sqlite3_bind_double(st, 11, c.BboxDrawing[2]);
-                    sqlite3_bind_double(st, 12, c.BboxDrawing[3]);
-                    sqlite3_bind_text(st, 13, c.Summary.c_str(), static_cast<int>(c.Summary.size()), SQLITE_TRANSIENT);
-                    bindOptText(st, 14, c.BeforeJson);
-                    bindOptText(st, 15, c.AfterJson);
-                    if (c.RegionId > 0) sqlite3_bind_int(st, 16, c.RegionId);
-                    else                sqlite3_bind_null(st, 16);
-                    sqlite3_step(st);
+                    const bool regOk = (c.RegionId > 0) ? st.BindInt(16, c.RegionId, error) : st.BindNull(16, error);
+                    if (!st.BindInt(1, id++, error)
+                        || !st.BindText(2, c.Category, error)
+                        || !st.BindText(3, c.ChangeType, error)
+                        || !st.BindOptText(4, c.HandleA, error)
+                        || !st.BindOptText(5, c.HandleB, error)
+                        || !st.BindOptText(6, c.Label, error)
+                        || !st.BindDouble(7, c.X, error)
+                        || !st.BindDouble(8, c.Y, error)
+                        || !st.BindDouble(9, c.BboxDrawing[0], error)
+                        || !st.BindDouble(10, c.BboxDrawing[1], error)
+                        || !st.BindDouble(11, c.BboxDrawing[2], error)
+                        || !st.BindDouble(12, c.BboxDrawing[3], error)
+                        || !st.BindText(13, c.Summary, error)
+                        || !st.BindOptText(14, c.BeforeJson, error)
+                        || !st.BindOptText(15, c.AfterJson, error)
+                        || !regOk
+                        || !st.StepDone(error))
+                    {
+                        return false;
+                    }
                 }
-                sqlite3_finalize(st);
             }
 
-            if (!execSql("COMMIT;"))
-                return cleanupFail(error ? *error : "提交事务失败");
-            sqlite3_close(db);
-            db = nullptr;
-
-            if (!AtomicReplaceFile(tempPath, outDbPath, error))
-            {
-                std::filesystem::remove(MiniCAD::Utf8ToPath(tempPath), ec);
+            if (!tx.Commit(error))
                 return false;
-            }
-            return true;
         }
+
+        if (!dbGuard.Close(error))
+            return false;
+
+        if (!AtomicReplaceFile(tempPath, outDbPath, error))
+            return false;
+
+        tempGuard.Release();
+        return true;
     }
 
     bool RunDiffCommand(const DiffOptions& opts,
@@ -2111,7 +2168,23 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
             return false;
         };
 
-        // 提前校验全部正则
+        // 提前推导全部输出路径（含默认派生 JSON）并检查输入/输出及多输出冲突（CAD-22）
+        std::string effectiveJsonPath = opts.OutJsonPath;
+        if (effectiveJsonPath.empty() && !opts.OutJsonExplicit && !opts.OutPngPath.empty())
+            effectiveJsonPath = DeriveDefaultJsonPathForPng(opts.OutPngPath);
+
+        {
+            std::string conflictCode, conflictMsg;
+            if (!ValidateIoPathConflicts(
+                    { { "A 侧图纸", opts.InputPathA }, { "B 侧图纸", opts.InputPathB } },
+                    { { "输出 PNG", opts.OutPngPath }, { "输出 JSON", effectiveJsonPath }, { "输出 SQLite", opts.OutDbPath } },
+                    &conflictCode, &conflictMsg))
+            {
+                return fail(conflictCode.c_str(), conflictMsg, true);
+            }
+        }
+
+        // 提前校验全部正则与显式字体目录（CAD-34）
         std::string err;
         if (!ValidateRegexPattern(opts.IncludeLayersRegex, &err))
             return fail("INVALID_REGEX", err, true);
@@ -2121,6 +2194,16 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
             return fail("INVALID_REGEX", err, true);
         if (!ValidateRegexPattern(opts.AlignLayersB, &err))
             return fail("INVALID_REGEX", err, true);
+
+        FontSystem fontSystem;
+        FontDirResolution fontRes;
+        if (!InitHeadlessFontSystem(fontSystem, opts.FontsDir, opts.FontsDirExplicit, &fontRes, &err))
+            return fail("INVALID_FONTS_DIR", err, true);
+        if (fontRes.UsedFallback)
+        {
+            report.Warnings.push_back(
+                "未自动探测到内置字体目录，已回退至系统字体；如需项目专用 SHX 字体请显式传入 --fonts-dir");
+        }
 
         Scene sceneA, sceneB;
         CadSemanticSnapshot snapA, snapB;
@@ -2144,31 +2227,13 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
         const std::string layNameB = layB.Model ? "Model" : layB.Name;
 
         // 纸张空间（布局）未显式传尺度参数时，自动切换为纸张毫米默认值，避免模型空间 30mm 容差 / 800mm 区域阈值吞没小尺寸变化
-        const bool   isPaperSpace       = !layA.Model;
+        const bool   isPaperSpace       = !layA.Model || !layB.Model;
         const double effectiveMmPerPx     = (isPaperSpace && !opts.MmPerPxExplicit)     ? 1.0 : opts.MmPerPx;
         const double effectiveToleranceMm = (isPaperSpace && !opts.ToleranceMmExplicit) ? 1.0 : opts.ToleranceMm;
         const double effectiveMinRegionMm = (isPaperSpace && !opts.MinRegionMmExplicit) ? 2.0 : opts.MinRegionMm;
         const double effectiveRegionGapMm = (isPaperSpace && !opts.RegionGapMmExplicit) ? 8.0 : opts.RegionGapMm;
 
-        std::array<double, 4> cropInA{};
-        if (opts.HasBbox)
-        {
-            cropInA = opts.Bbox;
-        }
-        else
-        {
-            if (!ComputeLayoutBbox(sceneA, layoutIdxA, cropInA, /*expandMargin*/ true))
-                return fail("EMPTY_LAYOUT", "A 侧目标布局中没有可比较的可见图元", false);
-            const double maxSpan = std::max(cropInA[2] - cropInA[0], cropInA[3] - cropInA[1]);
-            if (layA.Model && maxSpan > 200000.0)
-            {
-                report.Warnings.push_back(
-                    "模型空间跨度较大（" + JsonDouble(maxSpan / 1000.0, 1)
-                    + "m），可能包含多张图纸；建议指定 --bbox 聚焦单张图面以获得更高精度");
-            }
-        }
-
-        // 对齐估算（显式 --offset 优先于 --auto-align）
+        // 先执行对齐估算（显式 --offset 优先于 --auto-align），再计算 A 与变换后 B 的边界并集（CAD-15）
         AlignmentInfo align;
         if (opts.HasOffset)
         {
@@ -2182,7 +2247,7 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
         {
             align = ComputeAutoAlignment(sceneA, snapA, layoutIdxA,
                                          sceneB, snapB, layoutIdxB,
-                                         opts.HasBbox ? &cropInA : nullptr,
+                                         opts.HasBbox ? &opts.Bbox : nullptr,
                                          opts, report.Warnings);
         }
         else
@@ -2196,6 +2261,24 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
 
         const double dx = align.Dx;
         const double dy = align.Dy;
+
+        std::array<double, 4> cropInA{};
+        if (opts.HasBbox)
+        {
+            cropInA = opts.Bbox;
+        }
+        else
+        {
+            if (!ComputeCompareUnionBbox(sceneA, layoutIdxA, sceneB, layoutIdxB, dx, dy, cropInA, /*expandMargin*/ true))
+                return fail("EMPTY_LAYOUT", "A/B 两侧目标布局中均没有可比较的可见图元", false);
+            const double maxSpan = std::max(cropInA[2] - cropInA[0], cropInA[3] - cropInA[1]);
+            if (layA.Model && maxSpan > 200000.0)
+            {
+                report.Warnings.push_back(
+                    "模型空间跨度较大（" + JsonDouble(maxSpan / 1000.0, 1)
+                    + "m），可能包含多张图纸；建议指定 --bbox 聚焦单张图面以获得更高精度");
+            }
+        }
 
         CanvasLayout canvasA;
         if (!ComputeCanvasLayout(cropInA, effectiveMmPerPx, opts.MaxPx, kHardMaxTotalPx, canvasA, &err))
@@ -2213,9 +2296,6 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
             canvasA.Bbox[2] - dx,
             canvasA.Bbox[3] - dy
         };
-
-        FontSystem fontSystem;
-        InitHeadlessFontSystem(fontSystem, opts.FontsDir);
 
         // 轨 1 视觉掩膜过滤规则（默认排除注记，除非 --include-annotations）
         TessellateFilter maskFilter;
@@ -2236,7 +2316,16 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
         const uint64_t inkA = RasterizeSceneMask(tessA, canvasA, 1.0f, maskA);
         const uint64_t inkB = RasterizeSceneMask(tessB, canvasB, 1.0f, maskB);
 
-        const int tolerancePx = std::max(1, static_cast<int>(std::ceil(effectiveToleranceMm / canvasA.MmPerPx)));
+        // CAD-17：支持 --tolerance-mm 0 对应真实 0px 膨胀半径（不再强行 std::max(1, ...)），
+        // 正容差按向上取整像素并换算真实生效毫米容差（切比雪夫方形核）。
+        int tolerancePx = 0;
+        if (effectiveToleranceMm > 0.0)
+        {
+            const double rawPx = effectiveToleranceMm / canvasA.MmPerPx;
+            tolerancePx = std::max(1, static_cast<int>(std::ceil(rawPx - 1e-9)));
+        }
+        const double appliedToleranceMm = static_cast<double>(tolerancePx) * canvasA.MmPerPx;
+
         std::vector<uint8_t> dilA, dilB;
         DilateMaskSeparable(maskA, canvasA.WidthPx, canvasA.HeightPx, tolerancePx, dilA);
         DilateMaskSeparable(maskB, canvasA.WidthPx, canvasA.HeightPx, tolerancePx, dilB);
@@ -2257,21 +2346,28 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
         }
 
         // 填充报告基本字段
-        report.CropInASpace        = cropInA;
-        report.OffsetBToA          = { dx, dy };
-        report.Alignment           = align;
-        report.MmPerPx             = canvasA.MmPerPx;
-        report.Clamped             = canvasA.Clamped;
-        report.ToleranceMm         = effectiveToleranceMm;
-        report.TolerancePx         = tolerancePx;
-        report.WidthPx             = canvasA.WidthPx;
-        report.HeightPx            = canvasA.HeightPx;
-        report.AnnotationsIncluded = opts.IncludeAnnotations;
-        report.IncludeLayers       = opts.IncludeLayersRegex;
-        report.ExtraExcludeLayers  = opts.ExcludeLayersRegex;
-        report.ExcludeFrames       = opts.ExcludeFrames;
-        report.FramesExcludedA     = tessA.Stats.FramesExcluded;
-        report.FramesExcludedB     = tessB.Stats.FramesExcluded;
+        report.CropInASpace                   = cropInA;
+        report.OffsetBToA                     = { dx, dy };
+        report.Alignment                      = align;
+        report.MmPerPx                        = canvasA.MmPerPx;
+        report.Clamped                        = canvasA.Clamped;
+        report.ToleranceMm                    = effectiveToleranceMm;
+        report.EffectiveToleranceMm           = appliedToleranceMm;
+        report.TolerancePx                    = tolerancePx;
+        report.WidthPx                        = canvasA.WidthPx;
+        report.HeightPx                       = canvasA.HeightPx;
+        report.AnnotationsIncluded            = opts.IncludeAnnotations;
+        report.IncludeLayers                  = opts.IncludeLayersRegex;
+        report.ExtraExcludeLayers             = opts.ExcludeLayersRegex;
+        report.ExcludeFrames                  = opts.ExcludeFrames;
+        report.FramesExcludedA                = tessA.Stats.FramesExcluded;
+        report.FramesExcludedB                = tessB.Stats.FramesExcluded;
+        report.FontsDir                       = fontRes.ResolvedDir;
+        report.FontsFallback                  = fontRes.UsedFallback;
+        report.IsPaperSpaceLayout             = isPaperSpace;
+        report.PaperViewportCountA            = CountModelViewportsInLayout(sceneA, layoutIdxA);
+        report.PaperViewportCountB            = CountModelViewportsInLayout(sceneB, layoutIdxB);
+        report.PaperViewportSemanticsExcluded = isPaperSpace;
 
         report.SideA.Source            = opts.InputPathA;
         report.SideA.Layout            = layNameA;
@@ -2317,8 +2413,30 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
                          snapB, spaceB, layNameB,
                          cropInA, dx, dy, opts.TchMatchTolMm, report.Regions, report);
 
-        report.CoverageNote = "在已覆盖范围与 ±" + JsonDouble(effectiveToleranceMm, 1)
-                            + "mm 容差内检出差异；未纳入比较项见 annotations_included、include_layers、frames_excluded 及 undecoded_proxies / unresolved_xrefs。";
+        // CAD-16：纸张布局模式下明确披露语义轨边界（仅覆盖纸面空间实体，未采集浮动视口内模型对象）
+        std::string paperBoundaryNote;
+        if (isPaperSpace)
+        {
+            if (report.PaperViewportCountA > 0 || report.PaperViewportCountB > 0)
+            {
+                report.Warnings.push_back(
+                    "纸张布局覆盖边界：检测到浮动视口（A=" + std::to_string(report.PaperViewportCountA)
+                    + "，B=" + std::to_string(report.PaperViewportCountB)
+                    + "），轨 1 视觉像素已包含视口内模型几何，但轨 2（text_diff）与轨 3（tch_diff）仅覆盖纸面空间实体、未采集浮动视口内模型对象；如需比对模型文字或天正语义请使用 --layout Model");
+            }
+            else
+            {
+                report.Warnings.push_back(
+                    "纸张布局覆盖边界：轨 2（text_diff）与轨 3（tch_diff）仅覆盖纸面空间实体，未采集浮动视口内模型对象");
+            }
+            paperBoundaryNote = "纸张布局模式下 text_diff 与 tch_diff 语义轨仅覆盖纸面空间实体，未采集浮动视口内模型对象；";
+        }
+
+        report.CoverageNote = "在已覆盖范围与实际生效容差 ±" + JsonDouble(appliedToleranceMm, 2)
+                            + "mm（" + std::to_string(tolerancePx) + "px 切比雪夫膨胀，请求容差 "
+                            + JsonDouble(effectiveToleranceMm, 2) + "mm）内检出差异；"
+                            + paperBoundaryNote
+                            + "未纳入比较项见 annotations_included、include_layers、frames_excluded 及 undecoded_proxies / unresolved_xrefs。";
 
         // 输出三态差异叠加 PNG
         if (!opts.OutPngPath.empty())
@@ -2338,11 +2456,6 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
                 return fail("WRITE_PNG_FAILED", err, false);
             report.PngPath = opts.OutPngPath;
         }
-
-        // 决定 JSON 输出路径（若传了 --out-png 且未传 --out-json，默认写同名 .json）
-        std::string effectiveJsonPath = opts.OutJsonPath;
-        if (effectiveJsonPath.empty() && !opts.OutJsonExplicit && !opts.OutPngPath.empty())
-            effectiveJsonPath = ResolveDefaultJsonPath(opts.OutPngPath);
 
         if (!opts.OutDbPath.empty())
             report.DbPath = opts.OutDbPath;
@@ -2423,7 +2536,10 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
         j.KeyDouble("mm_per_px", r.MmPerPx, 4);
         j.KeyBool("clamped", r.Clamped);
         j.KeyDouble("tolerance_mm", r.ToleranceMm, 2);
+        j.KeyDouble("effective_tolerance_mm", r.EffectiveToleranceMm, 2);
         j.KeyInt("tolerance_px", r.TolerancePx);
+        j.KeyOptString("fonts_dir", r.FontsDir);
+        j.KeyBool("fonts_fallback", r.FontsFallback);
 
         j.Key("canvas_px");
         j.BeginArray();
@@ -2600,6 +2716,20 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
         j.BeginArray();
         for (const auto& w : r.Warnings) j.String(w);
         j.EndArray();
+
+        j.Key("coverage");
+        j.BeginObject();
+        j.KeyString("layout_space", r.IsPaperSpaceLayout ? "paper" : "model");
+        j.KeyBool("visual_includes_viewports", true);
+        j.KeyString("text_scope", r.IsPaperSpaceLayout ? "paper_space_only" : "model_space");
+        j.KeyString("tch_scope", r.IsPaperSpaceLayout ? "paper_space_only" : "model_space");
+        j.KeyInt("paper_viewport_count_a", r.PaperViewportCountA);
+        j.KeyInt("paper_viewport_count_b", r.PaperViewportCountB);
+        j.KeyBool("viewport_model_semantics_included", !r.PaperViewportSemanticsExcluded);
+        j.KeyDouble("effective_tolerance_mm", r.EffectiveToleranceMm, 2);
+        j.KeyInt("tolerance_px", r.TolerancePx);
+        j.KeyString("note", r.CoverageNote);
+        j.EndObject();
 
         j.KeyString("coverage_note", r.CoverageNote);
         j.KeyInt("elapsed_ms", r.ElapsedMs);

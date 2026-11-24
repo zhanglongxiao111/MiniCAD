@@ -3,6 +3,7 @@
 
 add_library(SaDwgToolCore STATIC
     "CliArgs.cpp"
+    "PathGuard.cpp"
     "PngWriter.cpp"
     "TchSemanticExport.cpp"
     "SqliteExporter.cpp"

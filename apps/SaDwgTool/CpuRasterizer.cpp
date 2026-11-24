@@ -1,5 +1,6 @@
 #include "CpuRasterizer.h"
 #include "JsonWriter.h"
+#include "PathGuard.h"
 #include "Import/CadExchange.h"
 #include "Import/CadSemanticSnapshot.h"
 #include "Scene/Scene.h"
@@ -754,12 +755,28 @@ namespace MiniCAD::SaTool
             return false;
         };
 
-        // 先提前校验正则表达式
+        // 提前校验输入/输出路径身份冲突，杜绝覆盖源 DWG（CAD-22）
+        const bool isCompare = !opts.ComparePath.empty();
+        {
+            std::vector<PathGuardEntry> inputs = { { "主图", opts.InputPath } };
+            if (isCompare)
+                inputs.push_back({ "对比图", opts.ComparePath });
+            std::string conflictCode, conflictMsg;
+            if (!ValidateIoPathConflicts(inputs, { { "输出 PNG", opts.OutputPngPath } }, &conflictCode, &conflictMsg))
+                return fail(conflictCode.c_str(), conflictMsg, true);
+        }
+
+        // 先提前校验正则表达式与显式字体目录（CAD-34）
         std::string err;
         if (!ValidateRegexPattern(opts.IncludeLayersRegex, &err))
             return fail("INVALID_REGEX", err, true);
         if (!ValidateRegexPattern(opts.ExcludeLayersRegex, &err))
             return fail("INVALID_REGEX", err, true);
+
+        FontSystem fontSystem;
+        FontDirResolution fontRes;
+        if (!InitHeadlessFontSystem(fontSystem, opts.FontsDir, opts.FontsDirExplicit, &fontRes, &err))
+            return fail("INVALID_FONTS_DIR", err, true);
 
         Scene sceneA;
         CadSemanticSnapshot snapA;
@@ -770,10 +787,34 @@ namespace MiniCAD::SaTool
         if (layoutIdxA < 0)
             return fail("LAYOUT_NOT_FOUND", err, true);
 
+        Scene sceneB;
+        CadSemanticSnapshot snapB;
+        int layoutIdxB = -1;
+        std::string layoutNameB;
+        if (isCompare)
+        {
+            if (!LoadCadFileWithSemantics(opts.ComparePath, sceneB, snapB, &err))
+                return fail("LOAD_FAILED", err.empty() ? ("无法加载对比图：" + opts.ComparePath) : err, false);
+
+            layoutIdxB = ResolveCompareLayoutIndex(sceneA, layoutIdxA, sceneB, opts.LayoutNameB, &err);
+            if (layoutIdxB < 0)
+                return fail("LAYOUT_NOT_FOUND", err, true);
+            layoutNameB = sceneB.Layouts()[static_cast<size_t>(layoutIdxB)].Model
+                            ? "Model"
+                            : sceneB.Layouts()[static_cast<size_t>(layoutIdxB)].Name;
+        }
+
         std::array<double, 4> bbox{};
         if (opts.HasBbox)
         {
             bbox = opts.Bbox;
+        }
+        else if (isCompare)
+        {
+            // CAD-15：双图对比默认窗口采用对齐后 A 与变换到 A 坐标系的 B 的边界并集（允许旧布局为空）
+            if (!ComputeCompareUnionBbox(sceneA, layoutIdxA, sceneB, layoutIdxB,
+                                         opts.OffsetDx, opts.OffsetDy, bbox, /*expandMargin*/ true))
+                return fail("EMPTY_LAYOUT", "对比图 A/B 目标布局中均没有可渲染的可见图元", false);
         }
         else
         {
@@ -784,9 +825,6 @@ namespace MiniCAD::SaTool
         CanvasLayout canvas;
         if (!ComputeCanvasLayout(bbox, opts.MmPerPx, opts.MaxPx, kHardMaxTotalPx, canvas, &err))
             return fail("INVALID_CANVAS", err, true);
-
-        FontSystem fontSystem;
-        InitHeadlessFontSystem(fontSystem, opts.FontsDir);
 
         TessellateFilter filter;
         filter.IncludeLayersRegex = opts.IncludeLayersRegex;
@@ -800,11 +838,9 @@ namespace MiniCAD::SaTool
             return fail("TESSELLATE_FAILED", err, false);
 
         RgbaImage image;
-        const bool isCompare = !opts.ComparePath.empty();
         int totalRendered = tessA.Stats.EntitiesRendered;
         int totalFiltered = tessA.Stats.EntitiesFiltered;
         int totalFrames   = tessA.Stats.FramesExcluded;
-        std::string layoutNameB;
 
         if (!isCompare)
         {
@@ -812,18 +848,6 @@ namespace MiniCAD::SaTool
         }
         else
         {
-            Scene sceneB;
-            CadSemanticSnapshot snapB;
-            if (!LoadCadFileWithSemantics(opts.ComparePath, sceneB, snapB, &err))
-                return fail("LOAD_FAILED", err.empty() ? ("无法加载对比图：" + opts.ComparePath) : err, false);
-
-            const int layoutIdxB = ResolveCompareLayoutIndex(sceneA, layoutIdxA, sceneB, opts.LayoutNameB, &err);
-            if (layoutIdxB < 0)
-                return fail("LAYOUT_NOT_FOUND", err, true);
-            layoutNameB = sceneB.Layouts()[static_cast<size_t>(layoutIdxB)].Model
-                            ? "Model"
-                            : sceneB.Layouts()[static_cast<size_t>(layoutIdxB)].Name;
-
             // B 侧窗口按 -(dx, dy) 平移，使 B + (dx, dy) 与 A 像素对齐
             CanvasLayout canvasB = canvas;
             canvasB.Bbox = {
@@ -865,6 +889,8 @@ namespace MiniCAD::SaTool
         result.MmPerPx          = canvas.MmPerPx;
         result.Clamped          = canvas.Clamped;
         result.Bg               = opts.DarkBg ? "black" : "white";
+        result.FontsDir         = fontRes.ResolvedDir;
+        result.FontsFallback    = fontRes.UsedFallback;
         result.EntitiesRendered = totalRendered;
         result.EntitiesFiltered = totalFiltered;
         result.FramesExcluded   = totalFrames;
@@ -903,6 +929,8 @@ namespace MiniCAD::SaTool
         j.KeyDouble("mm_per_px", r.MmPerPx, 4);
         j.KeyBool("clamped", r.Clamped);
         j.KeyString("bg", r.Bg);
+        j.KeyOptString("fonts_dir", r.FontsDir);
+        j.KeyBool("fonts_fallback", r.FontsFallback);
         j.KeyInt("entities_rendered", r.EntitiesRendered);
         j.KeyInt("entities_filtered", r.EntitiesFiltered);
         j.KeyInt("frames_excluded", r.FramesExcluded);

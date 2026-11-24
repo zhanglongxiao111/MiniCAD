@@ -3,6 +3,7 @@
 #include <array>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace MiniCAD::SaTool
@@ -24,7 +25,6 @@ namespace MiniCAD::SaTool
         bool        ReuseIfFresh    = false;
         bool        Force           = false;
         bool        NoBlockEntities = false;
-        std::string FontsDir;
         bool        Pretty          = false;
         bool        Verbose         = false;
     };
@@ -49,6 +49,7 @@ namespace MiniCAD::SaTool
         bool        ExcludeAnnotations = false;
         bool        ExcludeFrames      = false;
         std::string FontsDir;
+        bool        FontsDirExplicit   = false;
         bool        Pretty  = false;
         bool        Verbose = false;
     };
@@ -91,6 +92,7 @@ namespace MiniCAD::SaTool
         double      TchMatchTolMm      = 300.0;
         bool        NoRegionBoxes      = false;
         std::string FontsDir;
+        bool        FontsDirExplicit   = false;
         bool        Pretty  = false;
         bool        Verbose = false;
     };
@@ -111,4 +113,9 @@ namespace MiniCAD::SaTool
                       std::string& errorCode, std::string& errorMsg);
 
     std::string BuildUsageText(CommandKind topic = CommandKind::None);
+
+#ifdef _WIN32
+    // Win64 宽字符命令行参数安全转 UTF-8（显式长度 + WC_ERR_INVALID_CHARS + 返回值严格校验）。
+    bool WideArgToUtf8(std::wstring_view wide, std::string& out, unsigned long* win32Error = nullptr);
+#endif
 }

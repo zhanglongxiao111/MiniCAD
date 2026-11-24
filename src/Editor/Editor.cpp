@@ -346,8 +346,11 @@ namespace MiniCAD
             return;
         if (m_tool)
         {
-            m_tool->Cancel();
-            m_tool.reset();
+            auto old = std::move(m_tool);
+            m_toolSuspended    = false;
+            m_pendingToolReset = false;
+            m_overlay.Clear();
+            old->Cancel();
         }
         m_toolSuspended    = false;
         m_pendingToolReset = false;
@@ -379,8 +382,11 @@ namespace MiniCAD
     {
         if (m_tool)
         {
-            m_tool->Cancel();
-            m_tool.reset();
+            auto old = std::move(m_tool);
+            m_toolSuspended    = false;
+            m_pendingToolReset = false;
+            m_overlay.Clear();
+            old->Cancel();
         }
         m_toolSuspended    = false;
         m_pendingToolReset = false;
@@ -1169,8 +1175,11 @@ namespace MiniCAD
     {
         if (m_tool)
         {
-            m_tool->Cancel();
-            m_tool.reset();
+            auto old = std::move(m_tool);
+            m_toolSuspended    = false;
+            m_pendingToolReset = false;
+            m_overlay.Clear();
+            old->Cancel();
         }
 
         m_toolSuspended = false;
@@ -2462,6 +2471,28 @@ namespace MiniCAD
         return SubmitPoint(target);
     }
 
+    void Editor::SetPickClipX(bool enabled, double minX, double maxX)
+    {
+        m_picking.SetClipX(enabled, minX, maxX);
+        if (enabled && minX >= maxX && m_gripEditor.IsDragging())
+            m_gripEditor.CancelDrag();
+    }
+
+    void Editor::RefreshHoverSnap(int mouseX, int mouseY, uint8_t modifiers)
+    {
+        InputEvent hover{};
+        hover.Type         = InputEventType::MouseMove;
+        hover.Modifiers    = modifiers;
+        hover.MouseButtons = 0;
+        hover.MouseX       = mouseX;
+        hover.MouseY       = mouseY;
+        hover.LastMouseX   = mouseX;
+        hover.LastMouseY   = mouseY;
+        hover.PressMouseX  = mouseX;
+        hover.PressMouseY  = mouseY;
+        OnInput(hover);
+    }
+
     // ─────────────────────────────────────────────────────────────
     //  OnInput
     // ─────────────────────────────────────────────────────────────
@@ -2529,7 +2560,8 @@ namespace MiniCAD
         if (m_tool && !m_toolSuspended)
             return m_tool->OnInput(ctx);
 
-        if (m_gripEditor.OnInput(ctx.event))
+        const bool allowGrip = !m_picking.IsClipEnabled() || m_gripEditor.IsDragging() || m_picking.PointInClip(ctx.event.MouseX);
+        if (allowGrip && m_gripEditor.OnInput(ctx.event))
             return true;
 
         if (!m_gripEditor.IsDragging())
@@ -2629,9 +2661,11 @@ namespace MiniCAD
         auto& cmdStack = m_doc->GetCommandStack();
 
         // 撤销 / 重做：每条命令自己按实体标脏（AddEntity / RemoveEntity / MarkEntityDirty），这里不再整体标脏——
-        // 整体标脏会让所有实体重新细分，几十万实体的图纸要几十秒
+        // 整体标脏会让所有实体重新细分，几十万实体的图纸要几十秒。先过 CommandStack::CanUndo/CanRedo 策略门禁。
         if (e.IsUndo())
         {
+            if (!cmdStack.CanUndo())
+                return true;
             if (m_tool) m_tool->OnSceneChanged();
             cmdStack.Undo(scene);
             m_gripEditor.MarkDirty();
@@ -2640,6 +2674,8 @@ namespace MiniCAD
 
         if (e.IsRedo())
         {
+            if (!cmdStack.CanRedo())
+                return true;
             if (m_tool) m_tool->OnSceneChanged();
             cmdStack.Redo(scene);
             m_gripEditor.MarkDirty();
@@ -2650,10 +2686,11 @@ namespace MiniCAD
         {
             if (m_tool)
             {
-                m_tool->Cancel();
-                m_tool.reset();
-                m_toolSuspended = false;
+                auto old = std::move(m_tool);
+                m_toolSuspended    = false;
+                m_pendingToolReset = false;
                 m_overlay.Clear();
+                old->Cancel();
                 return true;
             }
             else if (m_gripEditor.IsDragging())

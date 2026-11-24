@@ -6,6 +6,7 @@
 //   - 轨 3：原生天正构件语义比对（墙/门窗/柱/房间/楼梯两级匹配与参数差分）
 //   - 输出三态叠加 PNG、完整 JSON 报告、可选 4 表 diff.sqlite（支持 ATTACH 联表分析）
 #include "CliArgs.h"
+#include "Import/CadSemanticSnapshot.h"
 #include <array>
 #include <cstdint>
 #include <string>
@@ -95,18 +96,25 @@ namespace MiniCAD::SaTool
         std::array<double, 4> CropInASpace{};
         std::array<double, 2> OffsetBToA{ 0.0, 0.0 };
         AlignmentInfo         Alignment;
-        double                MmPerPx      = 20.0;
-        bool                  Clamped      = false;
-        double                ToleranceMm  = 30.0;
-        int                   TolerancePx  = 1;
-        int                   WidthPx      = 0;
-        int                   HeightPx     = 0;
-        bool                  AnnotationsIncluded = false;
+        double                MmPerPx              = 20.0;
+        bool                  Clamped              = false;
+        double                ToleranceMm          = 30.0;
+        double                EffectiveToleranceMm = 30.0;
+        int                   TolerancePx          = 1;
+        int                   WidthPx              = 0;
+        int                   HeightPx             = 0;
+        bool                  AnnotationsIncluded  = false;
         std::string           IncludeLayers;
         std::string           ExtraExcludeLayers;
-        bool                  ExcludeFrames = false;
-        int                   FramesExcludedA = 0;
-        int                   FramesExcludedB = 0;
+        bool                  ExcludeFrames        = false;
+        int                   FramesExcludedA      = 0;
+        int                   FramesExcludedB      = 0;
+        std::string           FontsDir;
+        bool                  FontsFallback        = false;
+        bool                  IsPaperSpaceLayout   = false;
+        int                   PaperViewportCountA  = 0;
+        int                   PaperViewportCountB  = 0;
+        bool                  PaperViewportSemanticsExcluded = false;
 
         DiffSideSummary       SideA;
         DiffSideSummary       SideB;
@@ -159,6 +167,18 @@ namespace MiniCAD::SaTool
                         std::string* errorCode = nullptr,
                         std::string* errorMsg = nullptr,
                         bool* isUsageError = nullptr);
+
+    // 原子写出 4 表比对 SQLite 库（含 diff_regions_rtree；全链路错误检查 + RAII 回滚清理）。
+    bool WriteDiffSqlite(const std::string& outDbPath, const DiffReport& report, std::string* error = nullptr);
+
+    // 执行轨 3 原生天正构件语义比对（供 RunDiffCommand 调用及单元测试覆盖缺失字段/单侧空场景）。
+    void RunTrack3TchDiff(const CadSemanticSnapshot& snapA, const std::string& spaceA, const std::string& layoutA,
+                          const CadSemanticSnapshot& snapB, const std::string& spaceB, const std::string& layoutB,
+                          const std::array<double, 4>& cropInA,
+                          double dx, double dy,
+                          double tolMm,
+                          const std::vector<DiffRegionItem>& regions,
+                          DiffReport& report);
 
     // 格式化 diff JSON：compactSummary=true 时省略超长明细分项数组（当已写入 --out-json 时给 stdout 用）。
     std::string FormatDiffReportJson(const DiffReport& report, bool compactSummary = false, bool pretty = false);

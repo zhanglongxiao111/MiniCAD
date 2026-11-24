@@ -29,7 +29,10 @@ namespace MiniCAD
 
     struct PaintStyle
     {
-        float Opacity = 1.0f;
+        float Opacity      = 1.0f;
+        // 对比底片覆盖度模式：忽略顶点自身透明度/锁层淡显（alpha > 0 的可见图元统一按满覆盖 1.0 写入，
+        // 仅保留纹理自身 alpha 与退化删除图元的 alpha == 0），避免批注锁层淡显导致相同图元被误判为差异
+        bool  FullCoverage = false;
     };
 
     // 双离屏底片三态差异合成参数：

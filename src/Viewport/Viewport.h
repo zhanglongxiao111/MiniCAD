@@ -64,6 +64,21 @@ namespace MiniCAD
         // 库内不创建 RenderTarget，应用层负责创建并在 Render() 时传入
         Viewport(float width, float height);
 
+        // 主图在当前对比模式下的水平可见像素范围 [MinX, MaxX)（与渲染裁剪、拾取裁剪共享单一口径）
+        struct MainVisibleClip
+        {
+            bool Constrained = false; // false = 全视口可见
+            int  MinX        = 0;
+            int  MaxX        = 0;
+            bool IsHidden() const { return Constrained && MinX >= MaxX; }
+        };
+        static MainVisibleClip ComputeMainVisibleClip(CompareDisplayMode mode, bool soloCompare, int splitX, int pixelWidth);
+        static MainVisibleClip ComputeMainVisibleClip(const CompareRenderPass* compare, int pixelWidth);
+
+        // 显式释放双离屏三态对比底片渲染目标（关闭对比会话时立即回收显存）
+        void ReleaseCompareLayers();
+        bool HasCompareLayers() const { return m_compareMainLayer != nullptr || m_compareOtherLayer != nullptr; }
+
         // 应用层每帧调用：传入自己的 renderer + renderTarget，Viewport 负责提交所有几何（可选单引擎同相机对比通道）
         void Render(IRenderer& renderer, IRenderTarget& target, const ViewState& viewState,
                     const CompareRenderPass* compare = nullptr);

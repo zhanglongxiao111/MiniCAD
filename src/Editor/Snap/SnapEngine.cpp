@@ -80,27 +80,35 @@ namespace MiniCAD
                 && sp.y >= y0 - radiusPx && sp.y <= y1 + radiusPx;
         }
 
+        constexpr size_t kMaxBlockLeaves         = 1024;
+        constexpr size_t kMaxIntersectCandidates = 64;
+
         // 裁剪边界跨边时收集被截断的线段为世界 LineEntity
         class ClippedSegmentSink final : public IDrawSink
         {
         public:
-            ClippedSegmentSink(const LayerManager& layers, std::vector<std::unique_ptr<Entity>>& out)
-                : m_layers(layers), m_out(out) {}
+            ClippedSegmentSink(const LayerManager& layers, std::vector<std::unique_ptr<Entity>>& out, size_t limit = kMaxBlockLeaves)
+                : m_layers(layers), m_out(out), m_limit(limit) {}
 
             bool IsLayerVisible(LayerID id) const override { return IsLayerVisibleById(m_layers, id); }
             void DrawLine(const Math::Point3& a, const Math::Point3& b, const Math::Color4&, bool) override
             {
+                if (m_out.size() >= m_limit)
+                    return;
                 if ((b - a).LengthSq() > 1e-24)
                     m_out.push_back(std::make_unique<LineEntity>(Object::InvalidID, a, b));
             }
             void DrawPoint(const Math::Point3& p, const Math::Color4&, bool) override
             {
+                if (m_out.size() >= m_limit)
+                    return;
                 m_out.push_back(std::make_unique<PointEntity>(Object::InvalidID, p));
             }
 
         private:
             const LayerManager&                   m_layers;
             std::vector<std::unique_ptr<Entity>>& m_out;
+            size_t                                m_limit = kMaxBlockLeaves;
         };
 
         void EmitTransformedPrimitive(const Entity& src, const Math::Mat4& m, std::vector<std::unique_ptr<Entity>>& out)
@@ -110,7 +118,9 @@ namespace MiniCAD
             const double lx = std::hypot(ux.x, ux.y);
             const double ly = std::hypot(uy.x, uy.y);
             const double crossZ = ux.x * uy.y - ux.y * uy.x;
-            const bool uniformXY = lx > 1e-12 && std::abs(lx - ly) <= 1e-5 * std::max(lx, ly);
+            const bool uniformXY = lx > 1e-12
+                && std::abs(lx - ly) <= 1e-5 * std::max(lx, ly)
+                && std::abs(ux.x * uy.x + ux.y * uy.y) <= 1e-5 * lx * ly;
 
             if (src.IsKindOf<PointEntity>())
             {
@@ -238,27 +248,29 @@ namespace MiniCAD
                                  int depth,
                                  std::vector<std::unique_ptr<Entity>>& out)
         {
-            if (depth > 8 || out.size() > 1024) return;
+            if (depth > 8 || out.size() >= kMaxBlockLeaves) return;
             const BlockEntity* block = ins.GetBlock();
             if (!block || block->IsUnresolvedXRef()) return;
 
             const LayerManager& layers = scene.GetLayerManager();
             const bool hasClip = ins.HasClipBoundary();
 
-            for (int r = 0; r < ins.GetRowCount(); ++r)
-                for (int c = 0; c < ins.GetColumnCount(); ++c)
+            for (int r = 0; r < ins.GetRowCount() && out.size() < kMaxBlockLeaves; ++r)
+                for (int c = 0; c < ins.GetColumnCount() && out.size() < kMaxBlockLeaves; ++c)
                 {
                     const Math::Mat4 worldMat = ins.CellMatrix(c, r) * parentMat;
                     if (!ins.IsBoundless() && !BoxHitsAperture(block->GetBoundingBox(), worldMat, cam, sp, radiusPx))
                         continue;
 
-                    ClippedSegmentSink rawSink(layers, out);
+                    ClippedSegmentSink rawSink(layers, out, kMaxBlockLeaves);
                     TransformDrawSink  tsink(rawSink, worldMat);
                     ClipDrawSink       csink(tsink, ins.GetClipBoundary());
                     const bool useClip = hasClip && csink.Valid();
 
                     for (const auto& child : block->GetEntities())
                     {
+                        if (out.size() >= kMaxBlockLeaves)
+                            return;
                         if (!child || !child->GetAttr().Visible) continue;
                         const LayerID effLayer = child->GetAttr().LayerId == Layer::DefaultLayerID
                             ? hostLayerId
@@ -336,6 +348,7 @@ namespace MiniCAD
         const double cullRadius = m_snapRadiusPx + 2.0;
         auto expandIfInsert = [&](const Object& obj)
         {
+            if (m_blockLeaves.size() >= kMaxBlockLeaves) return;
             if (exclude.contains(obj.GetID()) || !IsSnapVisible(scene, obj)) return;
             if (!obj.IsKindOf<InsertEntity>()) return;
             const auto& ins = static_cast<const InsertEntity&>(obj);
@@ -576,7 +589,12 @@ namespace MiniCAD
     {
         const Math::Point3 worldMouse = cam.ScreenToWorld(sp.x, sp.y);
 
-        struct Cand { Object::ObjectID id; std::unique_ptr<ICurve> curve; };
+        struct Cand
+        {
+            Object::ObjectID        id;
+            std::unique_ptr<ICurve> curve;
+            double                  distPx = 0.0;
+        };
         std::vector<Cand> cands;
 
         ForEachSnapObject(scene, [&](const Object& obj)
@@ -589,10 +607,20 @@ namespace MiniCAD
 
                 auto curve = ce->MakeCurve();
                 Math::Point3 onCurve = curve->ClosestPoint(worldMouse);
-                if (Math::Distance(sp, cam.WorldToScreen(onCurve)) > m_snapRadiusPx) return;
+                const double distPx = Math::Distance(sp, cam.WorldToScreen(onCurve));
+                if (distPx > m_snapRadiusPx) return;
 
-                cands.push_back({ obj.GetID(), std::move(curve) });
+                cands.push_back({ obj.GetID(), std::move(curve), distPx });
             });
+
+        // 严格施加交点求交候选预算：优先保留离光标最近的至多 kMaxIntersectCandidates 条曲线，避免密集外参下 O(N²) 阻塞
+        auto byDist = [](const Cand& a, const Cand& b) { return a.distPx < b.distPx; };
+        if (cands.size() > kMaxIntersectCandidates)
+        {
+            std::nth_element(cands.begin(), cands.begin() + kMaxIntersectCandidates, cands.end(), byDist);
+            cands.resize(kMaxIntersectCandidates);
+        }
+        std::sort(cands.begin(), cands.end(), byDist);
 
         SnapResult best;
         double bestDist = std::numeric_limits<double>::max();

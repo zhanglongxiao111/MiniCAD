@@ -79,9 +79,10 @@ namespace
             case CommandKind::ExportDb:
             {
                 ExportDbResult res;
-                std::string err;
-                if (!RunExportDbCommand(cmd.ExportDb, res, &err))
-                    return EmitError("EXPORT_DB_FAILED", err, 1, cmd.ExportDb.Pretty);
+                std::string code, err;
+                bool usageErr = false;
+                if (!RunExportDbCommand(cmd.ExportDb, res, &err, &code, &usageErr))
+                    return EmitError(code.empty() ? "EXPORT_DB_FAILED" : code, err, usageErr ? 2 : 1, cmd.ExportDb.Pretty);
                 WriteStdoutLine(FormatExportDbResultJson(res, cmd.ExportDb.Pretty));
                 return 0;
             }
@@ -138,14 +139,14 @@ int wmain(int argc, wchar_t** argv)
             utf8Args.emplace_back();
             continue;
         }
-        const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-        if (n <= 1)
+        std::string s;
+        unsigned long winErr = 0;
+        if (!WideArgToUtf8(w, s, &winErr))
         {
-            utf8Args.emplace_back();
-            continue;
+            return EmitError("INVALID_ARGS",
+                             "命令行参数 UTF-8 转码失败（Win32 error " + std::to_string(winErr) + "）",
+                             2, false);
         }
-        std::string s(static_cast<size_t>(n - 1), '\0');
-        WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n - 1, nullptr, nullptr);
         utf8Args.push_back(std::move(s));
     }
     return RunMainUtf8(utf8Args);

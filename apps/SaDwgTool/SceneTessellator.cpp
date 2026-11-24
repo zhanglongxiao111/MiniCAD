@@ -56,20 +56,6 @@ namespace MiniCAD::SaTool
             return out;
         }
 
-        std::string WideToUtf8(const std::wstring& wide)
-        {
-            if (wide.empty())
-                return {};
-            const int n = WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
-                                              nullptr, 0, nullptr, nullptr);
-            if (n <= 0)
-                return {};
-            std::string out(static_cast<size_t>(n), '\0');
-            WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
-                                out.data(), n, nullptr, nullptr);
-            return out;
-        }
-
         std::filesystem::path GetExecutableDir()
         {
             wchar_t buf[MAX_PATH * 4]{};
@@ -87,11 +73,8 @@ namespace MiniCAD::SaTool
 
         std::string PathToUtf8String(const std::filesystem::path& p)
         {
-#ifdef _WIN32
-            return WideToUtf8(p.wstring());
-#else
-            return p.string();
-#endif
+            const std::u8string u8 = p.u8string();
+            return std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
         }
 
         std::string EnsureTrailingSlash(std::string dir)
@@ -211,15 +194,15 @@ namespace MiniCAD::SaTool
         bool IsAnnotationEntity(const Entity& e)
         {
             // TableEntity 继承自 MTextEntity，按普通表格实体放行（若在注记图层仍由图层正则拦截）
-            if (e.IsKindOf<TableEntity>())
+            // WipeoutEntity 属于几何遮罩语义（如门窗块/详图遮挡背景线），不得当作注记删除
+            if (e.IsKindOf<TableEntity>() || e.IsKindOf<WipeoutEntity>())
                 return false;
             return e.IsKindOf<TextEntity>()
                 || e.IsKindOf<MTextEntity>()
                 || e.IsKindOf<AttribBase>()
                 || e.IsKindOf<DimensionEntity>()
                 || e.IsKindOf<LeaderEntity>()
-                || e.IsKindOf<MLeaderEntity>()
-                || e.IsKindOf<WipeoutEntity>();
+                || e.IsKindOf<MLeaderEntity>();
         }
 
         bool BoxesIntersect2D(const AABB& a, const AABB& b)
@@ -485,7 +468,6 @@ namespace MiniCAD::SaTool
             if (!scene.GetPaperSpaceLineTypeScaling())
                 ctx.SetLineTypeScale(savedLtScale * s);
 
-            const size_t clipDashFrom  = ctx.DeferredDashes().size();
             const size_t clipLineFrom  = ctx.LineCount();
             const size_t clipFillFrom  = ctx.FillCount();
             const size_t clipTextFrom  = ctx.TextCount();
@@ -546,54 +528,65 @@ namespace MiniCAD::SaTool
                 WipeClip::ClipFills(ctx.Fills(), clipRect, 5, clipFillFrom, /*keepInside*/ true);
                 WipeClip::ClipTexts(ctx.Texts(), clipRect, clipTextFrom);
                 WipeClip::ClipPoints(ctx.Points(), clipRect, clipPointFrom, /*keepInside*/ true);
-
-                // 延迟长虚线段按视口矩形（纸面坐标）Liang-Barsky 裁剪并推相位
-                auto& dashes = ctx.DeferredDashes();
-                const double xmin = vc.x - hw, xmax = vc.x + hw;
-                const double ymin = vc.y - hh, ymax = vc.y + hh;
-                size_t kept = clipDashFrom;
-                for (size_t i = clipDashFrom; i < dashes.size(); ++i)
-                {
-                    DeferredDash d = dashes[i];
-                    const double dx = d.b.x - d.a.x, dy = d.b.y - d.a.y, dz = d.b.z - d.a.z;
-                    double t0 = 0.0, t1 = 1.0;
-                    auto clip = [&](double p, double q) {
-                        if (p == 0.0) return q >= 0.0;
-                        const double r = q / p;
-                        if (p < 0.0) { if (r > t1) return false; if (r > t0) t0 = r; }
-                        else         { if (r < t0) return false; if (r < t1) t1 = r; }
-                        return true;
-                    };
-                    if (!clip(-dx, d.a.x - xmin) || !clip(dx, xmax - d.a.x)
-                        || !clip(-dy, d.a.y - ymin) || !clip(dy, ymax - d.a.y))
-                        continue;
-                    if (t0 > 0.0 || t1 < 1.0)
-                    {
-                        const Math::Point3 a = d.a;
-                        d.a = { a.x + dx * t0, a.y + dy * t0, a.z + dz * t0 };
-                        d.b = { a.x + dx * t1, a.y + dy * t1, a.z + dz * t1 };
-                        d.phase += std::sqrt(dx * dx + dy * dy + dz * dz) * t0;
-                    }
-                    dashes[kept++] = d;
-                }
-                dashes.resize(kept);
             }
         }
     }
 
-    std::string ResolveFontsDirectory(const std::string& explicitDir)
+    bool ResolveFontsDirectoryStrict(const std::string& explicitDir,
+                                     bool explicitGiven,
+                                     FontDirResolution& out,
+                                     std::string* error)
     {
         namespace fs = std::filesystem;
-        auto existsDir = [](const fs::path& p) -> bool {
+        out = {};
+        auto isAccessibleDir = [](const fs::path& p, std::string* reason) -> bool {
+            if (p.empty())
+            {
+                if (reason) *reason = "路径为空";
+                return false;
+            }
             std::error_code ec;
-            return !p.empty() && fs::exists(p, ec) && fs::is_directory(p, ec);
+            if (!fs::exists(p, ec) || ec)
+            {
+                if (reason) *reason = ec ? ec.message() : "目录不存在";
+                return false;
+            }
+            if (!fs::is_directory(p, ec) || ec)
+            {
+                if (reason) *reason = ec ? ec.message() : "路径不是目录";
+                return false;
+            }
+            // 实际打开目录迭代器，确认目录具备读取权限而非拒绝访问
+            fs::directory_iterator it(p, ec);
+            (void)it;
+            if (ec)
+            {
+                if (reason) *reason = ec.message();
+                return false;
+            }
+            return true;
         };
 
-        if (!explicitDir.empty())
+        const bool isExplicit = explicitGiven || !explicitDir.empty();
+        if (isExplicit)
         {
+            out.Explicit = true;
+            std::string reason;
             const fs::path p = MiniCAD::Utf8ToPath(explicitDir);
-            if (existsDir(p))
-                return EnsureTrailingSlash(PathToUtf8String(p));
+            if (!isAccessibleDir(p, &reason))
+            {
+                if (error)
+                {
+                    *error = "指定的 --fonts-dir 字体目录不存在或无法访问：" + explicitDir
+                           + (reason.empty() ? "" : ("（" + reason + "）"));
+                }
+                return false;
+            }
+            std::error_code ec;
+            const fs::path canon = fs::weakly_canonical(p, ec);
+            out.ResolvedDir  = EnsureTrailingSlash(PathToUtf8String(ec ? p : canon));
+            out.UsedFallback = false;
+            return true;
         }
 
         const fs::path exeDir = GetExecutableDir();
@@ -608,28 +601,49 @@ namespace MiniCAD::SaTool
         };
         for (const auto& c : candidates)
         {
-            if (existsDir(c))
+            if (isAccessibleDir(c, nullptr))
             {
                 std::error_code ec;
                 const fs::path canon = fs::weakly_canonical(c, ec);
-                return EnsureTrailingSlash(PathToUtf8String(ec ? c : canon));
+                out.ResolvedDir  = EnsureTrailingSlash(PathToUtf8String(ec ? c : canon));
+                out.UsedFallback = false;
+                return true;
             }
         }
-        return {};
+        out.UsedFallback = true;
+        return true;
     }
 
-    void InitHeadlessFontSystem(FontSystem& fontSystem, const std::string& explicitFontsDir)
+    std::string ResolveFontsDirectory(const std::string& explicitDir)
     {
+        FontDirResolution res;
+        if (!ResolveFontsDirectoryStrict(explicitDir, !explicitDir.empty(), res, nullptr))
+            return {};
+        return res.ResolvedDir;
+    }
+
+    bool InitHeadlessFontSystem(FontSystem& fontSystem,
+                                const std::string& explicitFontsDir,
+                                bool explicitGiven,
+                                FontDirResolution* resolutionOut,
+                                std::string* error)
+    {
+        FontDirResolution res;
+        if (!ResolveFontsDirectoryStrict(explicitFontsDir, explicitGiven, res, error))
+            return false;
+
         if (!fontSystem.IsReady())
             fontSystem.Initialize();
 
-        const std::string fontDir = ResolveFontsDirectory(explicitFontsDir);
-        if (!fontDir.empty())
-            fontSystem.GetFontEngine().SetFontDir(fontDir);
+        if (!res.ResolvedDir.empty())
+            fontSystem.GetFontEngine().SetFontDir(res.ResolvedDir);
 
 #ifdef _WIN32
         fontSystem.GetFontEngine().AddSearchDir("C:\\Windows\\Fonts\\");
 #endif
+        if (resolutionOut)
+            *resolutionOut = std::move(res);
+        return true;
     }
 
     int ResolveLayoutIndex(const Scene& scene, const std::string& layoutSpec, std::string* error)
@@ -719,90 +733,160 @@ namespace MiniCAD::SaTool
         return -1;
     }
 
+    namespace
+    {
+        bool ComputeLayoutRawBounds(const Scene& scene, int layoutIdx, AABB& outBounds)
+        {
+            const auto& layouts = scene.Layouts();
+            if (layoutIdx < 0 || layoutIdx >= static_cast<int>(layouts.size()))
+                return false;
+
+            const DrawingLayout& layout = layouts[static_cast<size_t>(layoutIdx)];
+            const LayerManager& lm = scene.GetLayerManager();
+
+            AABB bounds = AABB::Empty();
+            bool hasAny = false;
+
+            scene.ForEachObject([&](const Object& obj) {
+                if (!obj.IsKindOf<Entity>())
+                    return;
+                const auto& e = static_cast<const Entity&>(obj);
+                if (!e.GetAttr().Visible || IsUnboundedEntity(e))
+                    return;
+
+                if (layout.Model)
+                {
+                    if (e.GetAttr().InPaperSpace || e.IsKindOf<ViewportEntity>())
+                        return;
+                }
+                else
+                {
+                    if (!e.GetAttr().InPaperSpace)
+                        return;
+                    if (layout.OwnerKey != 0 && e.GetAttr().LayoutKey != 0 && e.GetAttr().LayoutKey != layout.OwnerKey)
+                        return;
+                    // 图纸空间主视口（ShowsModel==false）代表整张纸张视角，不参与内容框扩展以免过大
+                    if (const auto* vp = dynamic_cast<const ViewportEntity*>(&e))
+                    {
+                        if (!vp->ShowsModel())
+                            return;
+                    }
+                }
+
+                if (const auto* ins = dynamic_cast<const InsertEntity*>(&e))
+                {
+                    if (!ins->HasVisibleContentOnAnyLayer([&](LayerID id) {
+                            const Layer* l = lm.GetLayer(id);
+                            return !l || l->IsVisible();
+                        }))
+                        return;
+                }
+                else
+                {
+                    if (const Layer* l = lm.GetLayer(e.GetAttr().LayerId); l && !l->IsVisible())
+                        return;
+                }
+
+                const AABB box = e.GetBoundingBox();
+                if (!IsFiniteValidBox(box))
+                    return;
+                bounds.Expand(box);
+                hasAny = true;
+            });
+
+            // 图纸空间若没有任何可见实体，则回退到布局纸张范围
+            if (!hasAny && !layout.Model && layout.MaxX > layout.MinX && layout.MaxY > layout.MinY)
+            {
+                bounds.Min = { layout.MinX, layout.MinY, 0.0 };
+                bounds.Max = { layout.MaxX, layout.MaxY, 0.0 };
+                hasAny = true;
+            }
+            if (!hasAny || !IsFiniteValidBox(bounds))
+                return false;
+
+            outBounds = bounds;
+            return true;
+        }
+
+        void FinalizeBboxFromBounds(const AABB& bounds, bool expandMargin, std::array<double, 4>& outBbox)
+        {
+            const double w = bounds.Max.x - bounds.Min.x;
+            const double h = bounds.Max.y - bounds.Min.y;
+            const double maxSpan = std::max(w, h);
+            const double minPad  = maxSpan > 1e-6 ? maxSpan * 0.02 : 1.0;
+
+            const double padX = expandMargin ? std::max(w * 0.02, w < 1e-6 ? minPad : 0.0) : (w < 1e-6 ? minPad : 0.0);
+            const double padY = expandMargin ? std::max(h * 0.02, h < 1e-6 ? minPad : 0.0) : (h < 1e-6 ? minPad : 0.0);
+
+            outBbox = {
+                bounds.Min.x - padX,
+                bounds.Min.y - padY,
+                bounds.Max.x + padX,
+                bounds.Max.y + padY
+            };
+        }
+    }
+
     bool ComputeLayoutBbox(const Scene& scene, int layoutIdx, std::array<double, 4>& outBbox, bool expandMargin)
+    {
+        AABB bounds = AABB::Empty();
+        if (!ComputeLayoutRawBounds(scene, layoutIdx, bounds))
+            return false;
+        FinalizeBboxFromBounds(bounds, expandMargin, outBbox);
+        return true;
+    }
+
+    bool ComputeCompareUnionBbox(const Scene& sceneA, int layoutIdxA,
+                                 const Scene& sceneB, int layoutIdxB,
+                                 double dxBToA, double dyBToA,
+                                 std::array<double, 4>& outBbox,
+                                 bool expandMargin)
+    {
+        AABB boundsA = AABB::Empty();
+        AABB boundsB = AABB::Empty();
+        const bool hasA = ComputeLayoutRawBounds(sceneA, layoutIdxA, boundsA);
+        const bool hasB = ComputeLayoutRawBounds(sceneB, layoutIdxB, boundsB);
+        if (!hasA && !hasB)
+            return false;
+
+        AABB uni = AABB::Empty();
+        if (hasA)
+            uni.Expand(boundsA);
+        if (hasB)
+        {
+            AABB shiftedB;
+            shiftedB.Min = { boundsB.Min.x + dxBToA, boundsB.Min.y + dyBToA, boundsB.Min.z };
+            shiftedB.Max = { boundsB.Max.x + dxBToA, boundsB.Max.y + dyBToA, boundsB.Max.z };
+            uni.Expand(shiftedB);
+        }
+        if (!IsFiniteValidBox(uni))
+            return false;
+
+        FinalizeBboxFromBounds(uni, expandMargin, outBbox);
+        return true;
+    }
+
+    int CountModelViewportsInLayout(const Scene& scene, int layoutIdx)
     {
         const auto& layouts = scene.Layouts();
         if (layoutIdx < 0 || layoutIdx >= static_cast<int>(layouts.size()))
-            return false;
-
+            return 0;
         const DrawingLayout& layout = layouts[static_cast<size_t>(layoutIdx)];
-        const LayerManager& lm = scene.GetLayerManager();
+        if (layout.Model)
+            return 0;
 
-        AABB bounds = AABB::Empty();
-        bool hasAny = false;
-
+        int count = 0;
         scene.ForEachObject([&](const Object& obj) {
-            if (!obj.IsKindOf<Entity>())
+            if (!obj.IsKindOf<ViewportEntity>())
                 return;
-            const auto& e = static_cast<const Entity&>(obj);
-            if (!e.GetAttr().Visible || IsUnboundedEntity(e))
+            const auto& vp = static_cast<const ViewportEntity&>(obj);
+            if (!vp.GetAttr().InPaperSpace || !vp.GetAttr().Visible || !vp.ShowsModel())
                 return;
-
-            if (layout.Model)
-            {
-                if (e.GetAttr().InPaperSpace || e.IsKindOf<ViewportEntity>())
-                    return;
-            }
-            else
-            {
-                if (!e.GetAttr().InPaperSpace)
-                    return;
-                if (layout.OwnerKey != 0 && e.GetAttr().LayoutKey != 0 && e.GetAttr().LayoutKey != layout.OwnerKey)
-                    return;
-                // 图纸空间主视口（ShowsModel==false）代表整张纸张视角，不参与内容框扩展以免过大
-                if (const auto* vp = dynamic_cast<const ViewportEntity*>(&e))
-                {
-                    if (!vp->ShowsModel())
-                        return;
-                }
-            }
-
-            if (const auto* ins = dynamic_cast<const InsertEntity*>(&e))
-            {
-                if (!ins->HasVisibleContentOnAnyLayer([&](LayerID id) {
-                        const Layer* l = lm.GetLayer(id);
-                        return !l || l->IsVisible();
-                    }))
-                    return;
-            }
-            else
-            {
-                if (const Layer* l = lm.GetLayer(e.GetAttr().LayerId); l && !l->IsVisible())
-                    return;
-            }
-
-            const AABB box = e.GetBoundingBox();
-            if (!IsFiniteValidBox(box))
+            if (layout.OwnerKey != 0 && vp.GetAttr().LayoutKey != 0 && vp.GetAttr().LayoutKey != layout.OwnerKey)
                 return;
-            bounds.Expand(box);
-            hasAny = true;
+            ++count;
         });
-
-        // 图纸空间若没有任何可见实体，则回退到布局纸张范围
-        if (!hasAny && !layout.Model && layout.MaxX > layout.MinX && layout.MaxY > layout.MinY)
-        {
-            bounds.Min = { layout.MinX, layout.MinY, 0.0 };
-            bounds.Max = { layout.MaxX, layout.MaxY, 0.0 };
-            hasAny = true;
-        }
-        if (!hasAny || !IsFiniteValidBox(bounds))
-            return false;
-
-        double w = bounds.Max.x - bounds.Min.x;
-        double h = bounds.Max.y - bounds.Min.y;
-        const double maxSpan = std::max(w, h);
-        const double minPad  = maxSpan > 1e-6 ? maxSpan * 0.02 : 1.0;
-
-        double padX = expandMargin ? std::max(w * 0.02, w < 1e-6 ? minPad : 0.0) : (w < 1e-6 ? minPad : 0.0);
-        double padY = expandMargin ? std::max(h * 0.02, h < 1e-6 ? minPad : 0.0) : (h < 1e-6 ? minPad : 0.0);
-
-        outBbox = {
-            bounds.Min.x - padX,
-            bounds.Min.y - padY,
-            bounds.Max.x + padX,
-            bounds.Max.y + padY
-        };
-        return true;
+        return count;
     }
 
     bool IsModificationFrame(const Entity& entity)
@@ -926,7 +1010,9 @@ namespace MiniCAD::SaTool
         ctx.SetTextStyleTable(&scene.GetTextStyleTable());
         ctx.SetInlineFontResolver(MakeInlineFontResolver(&fontSystem));
         ctx.SetShapeFontResolver(MakeShapeFontResolver(&fontSystem));
-        ctx.SetDeferLongDashes(true);
+        // 无头单次光栅化固定在单一 worldPerPixel：长虚线按绘制序即时展开，确保块内/块间 Wipeout 遮罩
+        // 与浮动视口矩形裁剪均严格遵循绘制序，并天然保留原始虚线相位（CAD-14）。
+        ctx.SetDeferLongDashes(false);
 
         // 局部放大曲线加密，保证大弧度曲线在高清裁图下平滑无折角
         if (worldPerPixel > 0.0)
@@ -1023,12 +1109,6 @@ namespace MiniCAD::SaTool
         }
 
         ctx.BeginEntity(nullptr);
-
-        // 展开所有延迟长虚线段
-        const auto deferred = ctx.TakeDeferredDashes();
-        for (const auto& d : deferred)
-            DrawContext::EmitDeferredDash(d, scene.GetLineTypeTable(), worldPerPixel, out.Lines, renderOrigin);
-
         out.Points = ctx.TakePoints();
         return true;
     }

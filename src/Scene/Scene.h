@@ -57,9 +57,18 @@ namespace MiniCAD
 
 		bool Has(ObjectID id) const ;
 
-		// 对象是否在锁定的图层上（锁定语义：淡显、可捕捉，但不能选中、修改、删除；选不中由 Picking::IsPickable 保证）。
-		// 程序直接设的选择集里仍可能有锁定对象：会修改或删除已有对象的操作都应再跳过它们
+		// 对象是否被锁定（所在图层锁定，或属于嵌入批注模式保护的原图实体水位线之前）：
+		// 锁定对象不能选中、修改、删除；选不中由 Picking::IsPickable 保证，修改/删除操作也统一经此校验
 		bool IsEntityLocked(const Object& obj) const;
+		// 嵌入批注模式原图实体保护水位线：> 0 时所有 ID < beforeId 的既有实体均视为锁定（即使原图已有批注层也不误放行）；0 = 关闭保护
+		void     SetProtectedEntityWatermark(ObjectID beforeId)
+		{
+			if (m_protectedBeforeId == beforeId)
+				return;
+			m_protectedBeforeId = beforeId;
+			MarkDisplayDirty();
+		}
+		ObjectID ProtectedEntityWatermark() const { return m_protectedBeforeId; }
 
 		std::vector<ObjectID> GetAllIDs() const;             // 返回所有实体 ID
 
@@ -208,15 +217,17 @@ namespace MiniCAD
 
 		// ── ID 分配 ────────────────────────────────────────── 
 		ObjectID NextObjectID() { return m_nextObjectID.fetch_add(1, std::memory_order_relaxed); }
+		ObjectID PeekNextObjectID() const { return m_nextObjectID.load(std::memory_order_relaxed); }
+		void     SyncNextObjectID();
 
 	private:
-		void SyncNextObjectID();
 
 	private:
 		std::unordered_map<ObjectID, std::unique_ptr<Object>> m_entities;
 
 		std::vector<std::unique_ptr<Object>> m_previews;          // 预览对象 ID 列表（保持顺序） 
 		std::atomic<ObjectID>                m_nextObjectID{ 1 }; // 0 保留为 InvalidID
+		ObjectID                             m_protectedBeforeId = 0; // > 0 时 ID < 该值的既有实体受批注保护锁定
 
 		LayerManager  m_layerManager;
 		BlockTable    m_blockTable;        // 块定义表，拥有全部 BlockEntity

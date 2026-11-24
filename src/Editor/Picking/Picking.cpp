@@ -307,6 +307,9 @@ namespace MiniCAD
             if (!layer->IsVisible() || layer->IsLocked())
                 return false;
 
+        if (m_scene->IsEntityLocked(obj))
+            return false;
+
         return true;
     }
 
@@ -327,6 +330,9 @@ namespace MiniCAD
     // 点选命中测试：返回距离最近且在阈值内的对象 ID
     Picking::ObjectID Picking::HitTest(const Math::Point2& pt, double thresh)
     {
+        if (!PointInClip(pt.x))
+            return Object::InvalidID;
+
         ObjectID best = Object::InvalidID;
         double   bestDist = std::numeric_limits<double>::max();
 
@@ -774,7 +780,15 @@ namespace MiniCAD
         double yMin = std::min(a.y, b.y);
         double yMax = std::max(a.y, b.y);
 
-        Box2 box({ std::min(a.x, b.x), std::min(a.y, b.y) }, { std::max(a.x, b.x), std::max(a.y, b.y) });
+        if (m_clipEnabled)
+        {
+            xMin = std::max(xMin, m_clipMinX);
+            xMax = std::min(xMax, m_clipMaxX);
+            if (xMin >= xMax)
+                return {};
+        }
+
+        Box2 box({ xMin, yMin }, { xMax, yMax });
 
         bool fullyContain = (b.x > a.x);
 
@@ -1256,7 +1270,7 @@ namespace MiniCAD
         // 俯视时包围盒完全落在框内的实体直接选中（窗选、交叉选都算命中），不做精确判定：
         // 框选全图时几乎所有实体都走这一步，一次 Draw 都不用
         EnsureIndex();
-        AABB q = ScreenRectToWorldAABB(a.x, a.y, b.x, b.y);
+        AABB q = ScreenRectToWorldAABB(xMin, yMin, xMax, yMax);
         m_index.Query(q, m_candidates);
         const bool plan = camera.IsPlanView();
         for (ObjectID id : m_candidates)
@@ -1290,6 +1304,8 @@ namespace MiniCAD
     // ───────────────── 输入处理 ─────────────────
     void Picking::OnMouseDown(const InputEvent& e)
     {
+        if (!PointInClip(e.MouseX))
+            return;
         m_drag = DragState::Pressing;
         m_pressX = e.MouseX;
         m_pressY = e.MouseY;
@@ -1367,6 +1383,8 @@ namespace MiniCAD
 
     void Picking::DoPointPick(const InputEvent& e)
     {
+        if (!PointInClip(e.MouseX))
+            return;
         bool ctrl = e.HasModifier(ModifierKey::Ctrl);
         bool alt = e.HasModifier(ModifierKey::Alt);
         bool shift = e.HasModifier(ModifierKey::Shift);

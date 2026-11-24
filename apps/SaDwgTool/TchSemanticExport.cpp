@@ -1,5 +1,6 @@
 #include "TchSemanticExport.h"
 #include "JsonWriter.h"
+#include "SqliteGuard.h"
 #include "sqlite3.h"
 #include <algorithm>
 #include <cmath>
@@ -10,35 +11,6 @@ namespace MiniCAD::SaTool
     namespace
     {
         constexpr double kRadToDeg = 180.0 / 3.14159265358979323846;
-
-        void BindTextOrNull(sqlite3_stmt* st, int idx, const std::string& s)
-        {
-            if (s.empty())
-                sqlite3_bind_null(st, idx);
-            else
-                sqlite3_bind_text(st, idx, s.c_str(), static_cast<int>(s.size()), SQLITE_TRANSIENT);
-        }
-
-        void BindTextNonNull(sqlite3_stmt* st, int idx, const std::string& s)
-        {
-            sqlite3_bind_text(st, idx, s.c_str(), static_cast<int>(s.size()), SQLITE_TRANSIENT);
-        }
-
-        void BindOptDouble(sqlite3_stmt* st, int idx, const std::optional<double>& v)
-        {
-            if (v.has_value() && std::isfinite(*v))
-                sqlite3_bind_double(st, idx, *v);
-            else
-                sqlite3_bind_null(st, idx);
-        }
-
-        void BindOptInt(sqlite3_stmt* st, int idx, const std::optional<int>& v)
-        {
-            if (v.has_value())
-                sqlite3_bind_int(st, idx, *v);
-            else
-                sqlite3_bind_null(st, idx);
-        }
 
         std::string TrimText(std::string s)
         {
@@ -70,29 +42,6 @@ namespace MiniCAD::SaTool
             miny = y - effH * 0.3;
             maxy = y + effH;
         }
-
-        bool PrepareStmt(sqlite3* db, const char* sql, sqlite3_stmt*& stmt, std::string* error)
-        {
-            if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
-            {
-                if (error) *error = std::string("SQLite prepare 失败：") + sqlite3_errmsg(db);
-                return false;
-            }
-            return true;
-        }
-
-        bool StepReset(sqlite3* db, sqlite3_stmt* stmt, std::string* error)
-        {
-            const int rc = sqlite3_step(stmt);
-            sqlite3_reset(stmt);
-            sqlite3_clear_bindings(stmt);
-            if (rc != SQLITE_DONE)
-            {
-                if (error) *error = std::string("SQLite step 失败：") + sqlite3_errmsg(db);
-                return false;
-            }
-            return true;
-        }
     }
 
     bool WriteTchSemanticTables(sqlite3* db, const CadSemanticSnapshot& snap,
@@ -102,7 +51,7 @@ namespace MiniCAD::SaTool
 
         // 1. tch_walls
         {
-            sqlite3_stmt* st = nullptr;
+            ScopedSqliteStmt st;
             const char* sql =
                 "INSERT INTO tch_walls("
                 "handle,dxf_name,layer,space,layout_name,"
@@ -113,75 +62,68 @@ namespace MiniCAD::SaTool
                 "joins_json,has_connections,connected_wall_handles_json,"
                 "minx,miny,maxx,maxy"
                 ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-            if (!PrepareStmt(db, sql, st, error)) return false;
+            if (!st.Prepare(db, sql, error)) return false;
             for (const auto& w : snap.TchWalls)
             {
                 if (!w.BlockName.empty()) continue;
-                BindTextNonNull(st, 1, FormatHandleHex(w.Handle));
-                BindTextNonNull(st, 2, w.DxfName);
-                BindTextNonNull(st, 3, w.Layer);
-                BindTextNonNull(st, 4, w.Space);
-                BindTextNonNull(st, 5, w.LayoutName);
-                sqlite3_bind_double(st, 6, w.StartX);
-                sqlite3_bind_double(st, 7, w.StartY);
-                sqlite3_bind_double(st, 8, w.StartZ);
-                sqlite3_bind_double(st, 9, w.EndX);
-                sqlite3_bind_double(st, 10, w.EndY);
-                sqlite3_bind_double(st, 11, w.EndZ);
-                sqlite3_bind_double(st, 12, w.Length);
-                sqlite3_bind_double(st, 13, w.ArcAngleRad);
-                if (w.HasArc)
-                {
-                    sqlite3_bind_double(st, 14, w.ArcCx);
-                    sqlite3_bind_double(st, 15, w.ArcCy);
-                    sqlite3_bind_double(st, 16, w.ArcRadius);
-                }
-                else
-                {
-                    sqlite3_bind_null(st, 14);
-                    sqlite3_bind_null(st, 15);
-                    sqlite3_bind_null(st, 16);
-                }
-                sqlite3_bind_double(st, 17, w.LeftWidth);
-                sqlite3_bind_double(st, 18, w.RightWidth);
-                sqlite3_bind_double(st, 19, w.TotalThickness);
-                if (w.HasHeight) sqlite3_bind_double(st, 20, w.Height);
-                else             sqlite3_bind_null(st, 20);
-                sqlite3_bind_int(st, 21, w.MaterialCode);
-                BindTextNonNull(st, 22, w.MaterialName);
-                sqlite3_bind_int64(st, 23, static_cast<sqlite3_int64>(w.Flags));
-                sqlite3_bind_double(st, 24, w.Scale);
-                sqlite3_bind_int(st, 25, w.OpeningCount);
 
                 JsonWriter jw;
                 jw.BeginArray();
                 for (double j : w.Joins) jw.Double(j, 3);
                 jw.EndArray();
-                BindTextNonNull(st, 26, jw.Str());
-
-                sqlite3_bind_int(st, 27, w.HasConnections ? 1 : 0);
 
                 JsonWriter cw;
                 cw.BeginArray();
                 for (uint64_t ch : w.ConnectedHandles)
                     if (ch != 0) cw.String(FormatHandleHex(ch));
                 cw.EndArray();
-                BindTextNonNull(st, 28, cw.Str());
 
-                sqlite3_bind_double(st, 29, w.MinX);
-                sqlite3_bind_double(st, 30, w.MinY);
-                sqlite3_bind_double(st, 31, w.MaxX);
-                sqlite3_bind_double(st, 32, w.MaxY);
+                const bool arcOk = w.HasArc
+                    ? (st.BindDouble(14, w.ArcCx, error) && st.BindDouble(15, w.ArcCy, error) && st.BindDouble(16, w.ArcRadius, error))
+                    : (st.BindNull(14, error) && st.BindNull(15, error) && st.BindNull(16, error));
+                const bool hOk = w.HasHeight ? st.BindDouble(20, w.Height, error) : st.BindNull(20, error);
 
-                if (!StepReset(db, st, error)) { sqlite3_finalize(st); return false; }
+                if (!st.BindText(1, FormatHandleHex(w.Handle), error)
+                    || !st.BindText(2, w.DxfName, error)
+                    || !st.BindText(3, w.Layer, error)
+                    || !st.BindText(4, w.Space, error)
+                    || !st.BindText(5, w.LayoutName, error)
+                    || !st.BindDouble(6, w.StartX, error)
+                    || !st.BindDouble(7, w.StartY, error)
+                    || !st.BindDouble(8, w.StartZ, error)
+                    || !st.BindDouble(9, w.EndX, error)
+                    || !st.BindDouble(10, w.EndY, error)
+                    || !st.BindDouble(11, w.EndZ, error)
+                    || !st.BindDouble(12, w.Length, error)
+                    || !st.BindDouble(13, w.ArcAngleRad, error)
+                    || !arcOk
+                    || !st.BindDouble(17, w.LeftWidth, error)
+                    || !st.BindDouble(18, w.RightWidth, error)
+                    || !st.BindDouble(19, w.TotalThickness, error)
+                    || !hOk
+                    || !st.BindInt(21, w.MaterialCode, error)
+                    || !st.BindText(22, w.MaterialName, error)
+                    || !st.BindInt64(23, static_cast<int64_t>(w.Flags), error)
+                    || !st.BindDouble(24, w.Scale, error)
+                    || !st.BindInt(25, w.OpeningCount, error)
+                    || !st.BindText(26, jw.Str(), error)
+                    || !st.BindInt(27, w.HasConnections ? 1 : 0, error)
+                    || !st.BindText(28, cw.Str(), error)
+                    || !st.BindDouble(29, w.MinX, error)
+                    || !st.BindDouble(30, w.MinY, error)
+                    || !st.BindDouble(31, w.MaxX, error)
+                    || !st.BindDouble(32, w.MaxY, error)
+                    || !st.StepDone(error))
+                {
+                    return false;
+                }
                 ++counts.Walls;
             }
-            sqlite3_finalize(st);
         }
 
         // 2. tch_openings
         {
-            sqlite3_stmt* st = nullptr;
+            ScopedSqliteStmt st;
             const char* sql =
                 "INSERT INTO tch_openings("
                 "handle,parent_handle,layer,label_layer,space,layout_name,"
@@ -190,74 +132,62 @@ namespace MiniCAD::SaTool
                 "label_x,label_y,label_height,scale,flags,display_flags,"
                 "minx,miny,maxx,maxy"
                 ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-            if (!PrepareStmt(db, sql, st, error)) return false;
+            if (!st.Prepare(db, sql, error)) return false;
             for (const auto& o : snap.TchOpenings)
             {
                 if (!o.BlockName.empty()) continue;
-                BindTextNonNull(st, 1, FormatHandleHex(o.Handle));
-                BindTextOrNull(st, 2, FormatHandleHex(o.ParentHandle));
-                BindTextNonNull(st, 3, o.Layer);
-                BindTextOrNull(st, 4, o.LabelLayer);
-                BindTextNonNull(st, 5, o.Space);
-                BindTextNonNull(st, 6, o.LayoutName);
-                sqlite3_bind_int(st, 7, o.KindCode);
-                BindTextNonNull(st, 8, o.KindName);
-                BindTextOrNull(st, 9, o.Label);
-                sqlite3_bind_double(st, 10, o.X);
-                sqlite3_bind_double(st, 11, o.Y);
-                sqlite3_bind_double(st, 12, o.SillZ);
-                sqlite3_bind_double(st, 13, o.Width);
-                sqlite3_bind_double(st, 14, o.Height);
-                sqlite3_bind_double(st, 15, o.Thickness);
-                sqlite3_bind_double(st, 16, o.AngleRad);
-                sqlite3_bind_double(st, 17, o.AngleRad * kRadToDeg);
-                sqlite3_bind_int(st, 18, o.Mirror);
-                sqlite3_bind_int(st, 19, o.MirrorX ? 1 : 0);
-                sqlite3_bind_int(st, 20, o.MirrorY ? 1 : 0);
-                BindTextOrNull(st, 21, FormatHandleHex(o.WallHandle));
-                sqlite3_bind_double(st, 22, o.LabelX);
-                sqlite3_bind_double(st, 23, o.LabelY);
-                sqlite3_bind_double(st, 24, o.LabelHeight);
-                sqlite3_bind_double(st, 25, o.Scale);
-                sqlite3_bind_int(st, 26, o.Flags);
-                sqlite3_bind_int(st, 27, o.DisplayFlags);
-                sqlite3_bind_double(st, 28, o.MinX);
-                sqlite3_bind_double(st, 29, o.MinY);
-                sqlite3_bind_double(st, 30, o.MaxX);
-                sqlite3_bind_double(st, 31, o.MaxY);
-
-                if (!StepReset(db, st, error)) { sqlite3_finalize(st); return false; }
+                if (!st.BindText(1, FormatHandleHex(o.Handle), error)
+                    || !st.BindOptText(2, FormatHandleHex(o.ParentHandle), error)
+                    || !st.BindText(3, o.Layer, error)
+                    || !st.BindOptText(4, o.LabelLayer, error)
+                    || !st.BindText(5, o.Space, error)
+                    || !st.BindText(6, o.LayoutName, error)
+                    || !st.BindInt(7, o.KindCode, error)
+                    || !st.BindText(8, o.KindName, error)
+                    || !st.BindOptText(9, o.Label, error)
+                    || !st.BindDouble(10, o.X, error)
+                    || !st.BindDouble(11, o.Y, error)
+                    || !st.BindDouble(12, o.SillZ, error)
+                    || !st.BindDouble(13, o.Width, error)
+                    || !st.BindDouble(14, o.Height, error)
+                    || !st.BindDouble(15, o.Thickness, error)
+                    || !st.BindDouble(16, o.AngleRad, error)
+                    || !st.BindDouble(17, o.AngleRad * kRadToDeg, error)
+                    || !st.BindInt(18, o.Mirror, error)
+                    || !st.BindInt(19, o.MirrorX ? 1 : 0, error)
+                    || !st.BindInt(20, o.MirrorY ? 1 : 0, error)
+                    || !st.BindOptText(21, FormatHandleHex(o.WallHandle), error)
+                    || !st.BindDouble(22, o.LabelX, error)
+                    || !st.BindDouble(23, o.LabelY, error)
+                    || !st.BindDouble(24, o.LabelHeight, error)
+                    || !st.BindDouble(25, o.Scale, error)
+                    || !st.BindInt(26, o.Flags, error)
+                    || !st.BindInt(27, o.DisplayFlags, error)
+                    || !st.BindDouble(28, o.MinX, error)
+                    || !st.BindDouble(29, o.MinY, error)
+                    || !st.BindDouble(30, o.MaxX, error)
+                    || !st.BindDouble(31, o.MaxY, error)
+                    || !st.StepDone(error))
+                {
+                    return false;
+                }
                 ++counts.Openings;
             }
-            sqlite3_finalize(st);
         }
 
         // 3. tch_columns
         {
-            sqlite3_stmt* st = nullptr;
+            ScopedSqliteStmt st;
             const char* sql =
                 "INSERT INTO tch_columns("
                 "handle,layer,space,layout_name,x,y,base_z,height,"
                 "material_code,material_name,scale,area_m2,outline_json,"
                 "minx,miny,maxx,maxy"
                 ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-            if (!PrepareStmt(db, sql, st, error)) return false;
+            if (!st.Prepare(db, sql, error)) return false;
             for (const auto& c : snap.TchColumns)
             {
                 if (!c.BlockName.empty()) continue;
-                BindTextNonNull(st, 1, FormatHandleHex(c.Handle));
-                BindTextNonNull(st, 2, c.Layer);
-                BindTextNonNull(st, 3, c.Space);
-                BindTextNonNull(st, 4, c.LayoutName);
-                sqlite3_bind_double(st, 5, c.X);
-                sqlite3_bind_double(st, 6, c.Y);
-                sqlite3_bind_double(st, 7, c.BaseZ);
-                sqlite3_bind_double(st, 8, c.Height);
-                sqlite3_bind_int(st, 9, c.MaterialCode);
-                BindTextNonNull(st, 10, c.MaterialName);
-                sqlite3_bind_double(st, 11, c.Scale);
-                if (c.HasArea) sqlite3_bind_double(st, 12, c.AreaM2);
-                else           sqlite3_bind_null(st, 12);
 
                 JsonWriter ow;
                 ow.BeginArray();
@@ -268,41 +198,45 @@ namespace MiniCAD::SaTool
                     ow.EndArray();
                 }
                 ow.EndArray();
-                BindTextNonNull(st, 13, ow.Str());
 
-                sqlite3_bind_double(st, 14, c.MinX);
-                sqlite3_bind_double(st, 15, c.MinY);
-                sqlite3_bind_double(st, 16, c.MaxX);
-                sqlite3_bind_double(st, 17, c.MaxY);
-
-                if (!StepReset(db, st, error)) { sqlite3_finalize(st); return false; }
+                const bool areaOk = c.HasArea ? st.BindDouble(12, c.AreaM2, error) : st.BindNull(12, error);
+                if (!st.BindText(1, FormatHandleHex(c.Handle), error)
+                    || !st.BindText(2, c.Layer, error)
+                    || !st.BindText(3, c.Space, error)
+                    || !st.BindText(4, c.LayoutName, error)
+                    || !st.BindDouble(5, c.X, error)
+                    || !st.BindDouble(6, c.Y, error)
+                    || !st.BindDouble(7, c.BaseZ, error)
+                    || !st.BindDouble(8, c.Height, error)
+                    || !st.BindInt(9, c.MaterialCode, error)
+                    || !st.BindText(10, c.MaterialName, error)
+                    || !st.BindDouble(11, c.Scale, error)
+                    || !areaOk
+                    || !st.BindText(13, ow.Str(), error)
+                    || !st.BindDouble(14, c.MinX, error)
+                    || !st.BindDouble(15, c.MinY, error)
+                    || !st.BindDouble(16, c.MaxX, error)
+                    || !st.BindDouble(17, c.MaxY, error)
+                    || !st.StepDone(error))
+                {
+                    return false;
+                }
                 ++counts.Columns;
             }
-            sqlite3_finalize(st);
         }
 
         // 4. tch_spaces
         {
-            sqlite3_stmt* st = nullptr;
+            ScopedSqliteStmt st;
             const char* sql =
                 "INSERT INTO tch_spaces("
                 "handle,layer,space,layout_name,name,area_m2,perimeter_mm,"
                 "centroid_x,centroid_y,scale,outline_json,minx,miny,maxx,maxy"
                 ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-            if (!PrepareStmt(db, sql, st, error)) return false;
+            if (!st.Prepare(db, sql, error)) return false;
             for (const auto& s : snap.TchSpaces)
             {
                 if (!s.BlockName.empty()) continue;
-                BindTextNonNull(st, 1, FormatHandleHex(s.Handle));
-                BindTextNonNull(st, 2, s.Layer);
-                BindTextNonNull(st, 3, s.Space);
-                BindTextNonNull(st, 4, s.LayoutName);
-                BindTextOrNull(st, 5, s.Name);
-                sqlite3_bind_double(st, 6, s.AreaM2);
-                sqlite3_bind_double(st, 7, s.PerimeterMm);
-                sqlite3_bind_double(st, 8, s.CentroidX);
-                sqlite3_bind_double(st, 9, s.CentroidY);
-                sqlite3_bind_double(st, 10, s.Scale);
 
                 JsonWriter ow;
                 ow.BeginArray();
@@ -311,22 +245,33 @@ namespace MiniCAD::SaTool
                     ow.BeginArray(); ow.Double(px, 3); ow.Double(py, 3); ow.EndArray();
                 }
                 ow.EndArray();
-                BindTextNonNull(st, 11, ow.Str());
 
-                sqlite3_bind_double(st, 12, s.MinX);
-                sqlite3_bind_double(st, 13, s.MinY);
-                sqlite3_bind_double(st, 14, s.MaxX);
-                sqlite3_bind_double(st, 15, s.MaxY);
-
-                if (!StepReset(db, st, error)) { sqlite3_finalize(st); return false; }
+                if (!st.BindText(1, FormatHandleHex(s.Handle), error)
+                    || !st.BindText(2, s.Layer, error)
+                    || !st.BindText(3, s.Space, error)
+                    || !st.BindText(4, s.LayoutName, error)
+                    || !st.BindOptText(5, s.Name, error)
+                    || !st.BindDouble(6, s.AreaM2, error)
+                    || !st.BindDouble(7, s.PerimeterMm, error)
+                    || !st.BindDouble(8, s.CentroidX, error)
+                    || !st.BindDouble(9, s.CentroidY, error)
+                    || !st.BindDouble(10, s.Scale, error)
+                    || !st.BindText(11, ow.Str(), error)
+                    || !st.BindDouble(12, s.MinX, error)
+                    || !st.BindDouble(13, s.MinY, error)
+                    || !st.BindDouble(14, s.MaxX, error)
+                    || !st.BindDouble(15, s.MaxY, error)
+                    || !st.StepDone(error))
+                {
+                    return false;
+                }
                 ++counts.Spaces;
             }
-            sqlite3_finalize(st);
         }
 
         // 5. tch_stairs
         {
-            sqlite3_stmt* st = nullptr;
+            ScopedSqliteStmt st;
             const char* sql =
                 "INSERT INTO tch_stairs("
                 "handle,stair_kind,layer,space,layout_name,x,y,rotation_deg,"
@@ -334,168 +279,161 @@ namespace MiniCAD::SaTool
                 "steps1,steps2,floor_type,floor_type_name,mirror,scale,extra_json,"
                 "minx,miny,maxx,maxy"
                 ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-            if (!PrepareStmt(db, sql, st, error)) return false;
+            if (!st.Prepare(db, sql, error)) return false;
             for (const auto& s : snap.TchStairs)
             {
                 if (!s.BlockName.empty()) continue;
-                BindTextNonNull(st, 1, FormatHandleHex(s.Handle));
-                BindTextNonNull(st, 2, s.StairKind);
-                BindTextNonNull(st, 3, s.Layer);
-                BindTextNonNull(st, 4, s.Space);
-                BindTextNonNull(st, 5, s.LayoutName);
-                sqlite3_bind_double(st, 6, s.X);
-                sqlite3_bind_double(st, 7, s.Y);
-                sqlite3_bind_double(st, 8, s.RotationDeg);
-                BindOptDouble(st, 9, s.StepHeight);
-                BindOptDouble(st, 10, s.TreadWidth);
-                BindOptDouble(st, 11, s.FlightWidth);
-                BindOptDouble(st, 12, s.LandingWidth);
-                BindOptDouble(st, 13, s.TotalWidth);
-                BindOptInt(st, 14, s.Steps1);
-                BindOptInt(st, 15, s.Steps2);
-                BindOptInt(st, 16, s.FloorType);
-                BindTextOrNull(st, 17, s.FloorTypeName);
-                if (s.Mirror.has_value()) sqlite3_bind_int(st, 18, *s.Mirror ? 1 : 0);
-                else                      sqlite3_bind_null(st, 18);
-                BindOptDouble(st, 19, s.Scale);
-                BindTextOrNull(st, 20, s.ExtraJson);
-                sqlite3_bind_double(st, 21, s.MinX);
-                sqlite3_bind_double(st, 22, s.MinY);
-                sqlite3_bind_double(st, 23, s.MaxX);
-                sqlite3_bind_double(st, 24, s.MaxY);
-
-                if (!StepReset(db, st, error)) { sqlite3_finalize(st); return false; }
+                const bool mirrorOk = s.Mirror.has_value()
+                    ? st.BindInt(18, *s.Mirror ? 1 : 0, error)
+                    : st.BindNull(18, error);
+                if (!st.BindText(1, FormatHandleHex(s.Handle), error)
+                    || !st.BindText(2, s.StairKind, error)
+                    || !st.BindText(3, s.Layer, error)
+                    || !st.BindText(4, s.Space, error)
+                    || !st.BindText(5, s.LayoutName, error)
+                    || !st.BindDouble(6, s.X, error)
+                    || !st.BindDouble(7, s.Y, error)
+                    || !st.BindDouble(8, s.RotationDeg, error)
+                    || !st.BindOptDouble(9, s.StepHeight, error)
+                    || !st.BindOptDouble(10, s.TreadWidth, error)
+                    || !st.BindOptDouble(11, s.FlightWidth, error)
+                    || !st.BindOptDouble(12, s.LandingWidth, error)
+                    || !st.BindOptDouble(13, s.TotalWidth, error)
+                    || !st.BindOptInt(14, s.Steps1, error)
+                    || !st.BindOptInt(15, s.Steps2, error)
+                    || !st.BindOptInt(16, s.FloorType, error)
+                    || !st.BindOptText(17, s.FloorTypeName, error)
+                    || !mirrorOk
+                    || !st.BindOptDouble(19, s.Scale, error)
+                    || !st.BindOptText(20, s.ExtraJson, error)
+                    || !st.BindDouble(21, s.MinX, error)
+                    || !st.BindDouble(22, s.MinY, error)
+                    || !st.BindDouble(23, s.MaxX, error)
+                    || !st.BindDouble(24, s.MaxY, error)
+                    || !st.StepDone(error))
+                {
+                    return false;
+                }
                 ++counts.Stairs;
             }
-            sqlite3_finalize(st);
         }
 
         // 6. tch_dimensions
         {
-            sqlite3_stmt* st = nullptr;
+            ScopedSqliteStmt st;
             const char* sql =
                 "INSERT INTO tch_dimensions("
                 "handle,dxf_name,layer,space,layout_name,x,y,z,angle_deg,offset_val,"
                 "is_arc,arc_radius,measured_radius,span_count,total_span,"
                 "spans_json,text_overrides_json,flags,scale,minx,miny,maxx,maxy"
                 ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-            if (!PrepareStmt(db, sql, st, error)) return false;
+            if (!st.Prepare(db, sql, error)) return false;
             for (const auto& d : snap.TchDimensions)
             {
                 if (!d.BlockName.empty()) continue;
-                BindTextNonNull(st, 1, FormatHandleHex(d.Handle));
-                BindTextNonNull(st, 2, d.DxfName);
-                BindTextNonNull(st, 3, d.Layer);
-                BindTextNonNull(st, 4, d.Space);
-                BindTextNonNull(st, 5, d.LayoutName);
-                sqlite3_bind_double(st, 6, d.X);
-                sqlite3_bind_double(st, 7, d.Y);
-                sqlite3_bind_double(st, 8, d.Z);
-                sqlite3_bind_double(st, 9, d.AngleDeg);
-                sqlite3_bind_double(st, 10, d.OffsetVal);
-                sqlite3_bind_int(st, 11, d.IsArc ? 1 : 0);
-                BindOptDouble(st, 12, d.ArcRadius);
-                BindOptDouble(st, 13, d.MeasuredRadius);
-                sqlite3_bind_int(st, 14, static_cast<int>(d.Spans.size()));
-                sqlite3_bind_double(st, 15, d.TotalSpan);
 
                 JsonWriter sw;
                 sw.BeginArray();
                 for (double sp : d.Spans) sw.Double(sp, 3);
                 sw.EndArray();
-                BindTextNonNull(st, 16, sw.Str());
 
-                if (d.TextOverrides.empty())
-                {
-                    sqlite3_bind_null(st, 17);
-                }
-                else
+                std::string overridesJson;
+                if (!d.TextOverrides.empty())
                 {
                     JsonWriter tw;
                     tw.BeginObject();
                     for (const auto& [idx, txt] : d.TextOverrides)
                         tw.KeyString(std::to_string(idx), txt);
                     tw.EndObject();
-                    BindTextNonNull(st, 17, tw.Str());
+                    overridesJson = tw.Take();
                 }
 
-                sqlite3_bind_int(st, 18, d.Flags);
-                sqlite3_bind_double(st, 19, d.Scale);
-                sqlite3_bind_double(st, 20, d.MinX);
-                sqlite3_bind_double(st, 21, d.MinY);
-                sqlite3_bind_double(st, 22, d.MaxX);
-                sqlite3_bind_double(st, 23, d.MaxY);
-
-                if (!StepReset(db, st, error)) { sqlite3_finalize(st); return false; }
+                if (!st.BindText(1, FormatHandleHex(d.Handle), error)
+                    || !st.BindText(2, d.DxfName, error)
+                    || !st.BindText(3, d.Layer, error)
+                    || !st.BindText(4, d.Space, error)
+                    || !st.BindText(5, d.LayoutName, error)
+                    || !st.BindDouble(6, d.X, error)
+                    || !st.BindDouble(7, d.Y, error)
+                    || !st.BindDouble(8, d.Z, error)
+                    || !st.BindDouble(9, d.AngleDeg, error)
+                    || !st.BindDouble(10, d.OffsetVal, error)
+                    || !st.BindInt(11, d.IsArc ? 1 : 0, error)
+                    || !st.BindOptDouble(12, d.ArcRadius, error)
+                    || !st.BindOptDouble(13, d.MeasuredRadius, error)
+                    || !st.BindInt(14, static_cast<int>(d.Spans.size()), error)
+                    || !st.BindDouble(15, d.TotalSpan, error)
+                    || !st.BindText(16, sw.Str(), error)
+                    || !st.BindOptText(17, overridesJson, error)
+                    || !st.BindInt(18, d.Flags, error)
+                    || !st.BindDouble(19, d.Scale, error)
+                    || !st.BindDouble(20, d.MinX, error)
+                    || !st.BindDouble(21, d.MinY, error)
+                    || !st.BindDouble(22, d.MaxX, error)
+                    || !st.BindDouble(23, d.MaxY, error)
+                    || !st.StepDone(error))
+                {
+                    return false;
+                }
                 ++counts.Dimensions;
             }
-            sqlite3_finalize(st);
         }
 
         // 7. tch_axes
         {
-            sqlite3_stmt* st = nullptr;
+            ScopedSqliteStmt st;
             const char* sql =
                 "INSERT INTO tch_axes("
                 "group_handle,axis_index,layer,text_layer,space,layout_name,label,"
                 "spacing,offset_from_first,x1,y1,x2,y2,orientation,coord,"
                 "scale,show_text,flags,minx,miny,maxx,maxy"
                 ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-            if (!PrepareStmt(db, sql, st, error)) return false;
+            if (!st.Prepare(db, sql, error)) return false;
             for (const auto& ax : snap.TchAxes)
             {
                 if (!ax.BlockName.empty()) continue;
-                BindTextNonNull(st, 1, FormatHandleHex(ax.GroupHandle));
-                sqlite3_bind_int(st, 2, ax.AxisIndex);
-                BindTextNonNull(st, 3, ax.Layer);
-                BindTextOrNull(st, 4, ax.TextLayer);
-                BindTextNonNull(st, 5, ax.Space);
-                BindTextNonNull(st, 6, ax.LayoutName);
-                BindTextOrNull(st, 7, ax.Label);
-                sqlite3_bind_double(st, 8, ax.Spacing);
-                sqlite3_bind_double(st, 9, ax.OffsetFromFirst);
-                sqlite3_bind_double(st, 10, ax.X1);
-                sqlite3_bind_double(st, 11, ax.Y1);
-                sqlite3_bind_double(st, 12, ax.X2);
-                sqlite3_bind_double(st, 13, ax.Y2);
-                BindTextNonNull(st, 14, ax.Orientation);
-                BindOptDouble(st, 15, ax.Coord);
-                sqlite3_bind_double(st, 16, ax.Scale);
-                sqlite3_bind_int(st, 17, ax.ShowText ? 1 : 0);
-                sqlite3_bind_int(st, 18, ax.Flags);
-                sqlite3_bind_double(st, 19, ax.MinX);
-                sqlite3_bind_double(st, 20, ax.MinY);
-                sqlite3_bind_double(st, 21, ax.MaxX);
-                sqlite3_bind_double(st, 22, ax.MaxY);
-
-                if (!StepReset(db, st, error)) { sqlite3_finalize(st); return false; }
+                if (!st.BindText(1, FormatHandleHex(ax.GroupHandle), error)
+                    || !st.BindInt(2, ax.AxisIndex, error)
+                    || !st.BindText(3, ax.Layer, error)
+                    || !st.BindOptText(4, ax.TextLayer, error)
+                    || !st.BindText(5, ax.Space, error)
+                    || !st.BindText(6, ax.LayoutName, error)
+                    || !st.BindOptText(7, ax.Label, error)
+                    || !st.BindDouble(8, ax.Spacing, error)
+                    || !st.BindDouble(9, ax.OffsetFromFirst, error)
+                    || !st.BindDouble(10, ax.X1, error)
+                    || !st.BindDouble(11, ax.Y1, error)
+                    || !st.BindDouble(12, ax.X2, error)
+                    || !st.BindDouble(13, ax.Y2, error)
+                    || !st.BindText(14, ax.Orientation, error)
+                    || !st.BindOptDouble(15, ax.Coord, error)
+                    || !st.BindDouble(16, ax.Scale, error)
+                    || !st.BindInt(17, ax.ShowText ? 1 : 0, error)
+                    || !st.BindInt(18, ax.Flags, error)
+                    || !st.BindDouble(19, ax.MinX, error)
+                    || !st.BindDouble(20, ax.MinY, error)
+                    || !st.BindDouble(21, ax.MaxX, error)
+                    || !st.BindDouble(22, ax.MaxY, error)
+                    || !st.StepDone(error))
+                {
+                    return false;
+                }
                 ++counts.Axes;
             }
-            sqlite3_finalize(st);
         }
 
         // 8. tch_sheets
         {
-            sqlite3_stmt* st = nullptr;
+            ScopedSqliteStmt st;
             const char* sql =
                 "INSERT INTO tch_sheets("
                 "handle,layer,space,layout_name,title,row_count,col_count,"
                 "x,y,rotation_deg,cells_json,minx,miny,maxx,maxy"
                 ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-            if (!PrepareStmt(db, sql, st, error)) return false;
+            if (!st.Prepare(db, sql, error)) return false;
             for (const auto& sh : snap.TchSheets)
             {
                 if (!sh.BlockName.empty()) continue;
-                BindTextNonNull(st, 1, FormatHandleHex(sh.Handle));
-                BindTextNonNull(st, 2, sh.Layer);
-                BindTextNonNull(st, 3, sh.Space);
-                BindTextNonNull(st, 4, sh.LayoutName);
-                BindTextOrNull(st, 5, sh.Title);
-                sqlite3_bind_int(st, 6, sh.RowCount);
-                sqlite3_bind_int(st, 7, sh.ColCount);
-                sqlite3_bind_double(st, 8, sh.X);
-                sqlite3_bind_double(st, 9, sh.Y);
-                sqlite3_bind_double(st, 10, sh.RotationDeg);
 
                 JsonWriter cw;
                 cw.BeginArray();
@@ -506,17 +444,28 @@ namespace MiniCAD::SaTool
                     cw.EndArray();
                 }
                 cw.EndArray();
-                BindTextNonNull(st, 11, cw.Str());
 
-                sqlite3_bind_double(st, 12, sh.MinX);
-                sqlite3_bind_double(st, 13, sh.MinY);
-                sqlite3_bind_double(st, 14, sh.MaxX);
-                sqlite3_bind_double(st, 15, sh.MaxY);
-
-                if (!StepReset(db, st, error)) { sqlite3_finalize(st); return false; }
+                if (!st.BindText(1, FormatHandleHex(sh.Handle), error)
+                    || !st.BindText(2, sh.Layer, error)
+                    || !st.BindText(3, sh.Space, error)
+                    || !st.BindText(4, sh.LayoutName, error)
+                    || !st.BindOptText(5, sh.Title, error)
+                    || !st.BindInt(6, sh.RowCount, error)
+                    || !st.BindInt(7, sh.ColCount, error)
+                    || !st.BindDouble(8, sh.X, error)
+                    || !st.BindDouble(9, sh.Y, error)
+                    || !st.BindDouble(10, sh.RotationDeg, error)
+                    || !st.BindText(11, cw.Str(), error)
+                    || !st.BindDouble(12, sh.MinX, error)
+                    || !st.BindDouble(13, sh.MinY, error)
+                    || !st.BindDouble(14, sh.MaxX, error)
+                    || !st.BindDouble(15, sh.MaxY, error)
+                    || !st.StepDone(error))
+                {
+                    return false;
+                }
                 ++counts.Sheets;
             }
-            sqlite3_finalize(st);
         }
 
         return true;
@@ -612,7 +561,16 @@ namespace MiniCAD::SaTool
                 acc += span;
                 std::string label;
                 if (auto it = d.TextOverrides.find(static_cast<int>(i)); it != d.TextOverrides.end() && !it->second.empty())
+                {
                     label = it->second;
+                    const std::string num = FormatSpanText(span);
+                    size_t pos = 0;
+                    while ((pos = label.find("<>", pos)) != std::string::npos)
+                    {
+                        label.replace(pos, 2, num);
+                        pos += num.size();
+                    }
+                }
                 else
                     label = FormatSpanText(span);
                 const double px = d.X + ux * mid + nx * off;

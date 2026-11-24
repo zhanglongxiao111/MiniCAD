@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cctype>
+#include <optional>
 
 namespace MiniCAD
 {
@@ -1097,4 +1098,196 @@ namespace MiniCAD
         double                 m_angleDeg = 0.0; // 图案整体旋转（度）
         HatchGradient           m_gradient;   // 渐变填充（未启用时为空，普通填充）
     };
+
+    namespace Detail
+    {
+        inline bool PointInPolygon2D(double px, double py, const std::vector<Math::Point3>& pts)
+        {
+            bool inside = false;
+            const std::size_t n = pts.size();
+            for (std::size_t i = 0, j = n - 1; i < n; j = i++)
+            {
+                const double xi = pts[i].x, yi = pts[i].y;
+                const double xj = pts[j].x, yj = pts[j].y;
+                if (((yi > py) != (yj > py)) &&
+                    (px < (xj - xi) * (py - yi) / (yj - yi) + xi))
+                {
+                    inside = !inside;
+                }
+            }
+            return inside;
+        }
+
+        // 用水平扫描线为任意简单多边形（含凹多边形）取一个严格内点，
+        // 避免把顶点落到外环边界上时射线法产生边界歧义。
+        inline bool FindPolygonInteriorPoint2D(const std::vector<Math::Point3>& pts, double& outX, double& outY)
+        {
+            const std::size_t n = pts.size();
+            if (n < 3)
+                return false;
+
+            std::vector<double> ys;
+            ys.reserve(n);
+            for (const auto& p : pts)
+                ys.push_back(p.y);
+            std::sort(ys.begin(), ys.end());
+            ys.erase(std::unique(ys.begin(), ys.end(),
+                     [](double a, double b) { return std::abs(a - b) <= 1e-9; }), ys.end());
+
+            if (ys.size() >= 2)
+            {
+                struct Band { double span; double ymid; };
+                std::vector<Band> bands;
+                bands.reserve(ys.size() - 1);
+                for (std::size_t k = 0; k + 1 < ys.size(); ++k)
+                {
+                    const double span = ys[k + 1] - ys[k];
+                    if (span > 1e-12)
+                        bands.push_back({ span, 0.5 * (ys[k] + ys[k + 1]) });
+                }
+                std::sort(bands.begin(), bands.end(),
+                          [](const Band& a, const Band& b) { return a.span > b.span; });
+
+                std::vector<double> xs;
+                for (const Band& band : bands)
+                {
+                    xs.clear();
+                    for (std::size_t i = 0, j = n - 1; i < n; j = i++)
+                    {
+                        const double yi = pts[i].y, yj = pts[j].y;
+                        if ((yi > band.ymid) != (yj > band.ymid))
+                        {
+                            const double t = (band.ymid - yi) / (yj - yi);
+                            xs.push_back(pts[i].x + (pts[j].x - pts[i].x) * t);
+                        }
+                    }
+                    std::sort(xs.begin(), xs.end());
+                    double bestWidth = 0.0;
+                    double bestX = 0.0;
+                    for (std::size_t k = 0; k + 1 < xs.size(); k += 2)
+                    {
+                        const double w = xs[k + 1] - xs[k];
+                        if (w > bestWidth)
+                        {
+                            bestWidth = w;
+                            bestX = 0.5 * (xs[k] + xs[k + 1]);
+                        }
+                    }
+                    if (bestWidth > 1e-12)
+                    {
+                        outX = bestX;
+                        outY = band.ymid;
+                        return true;
+                    }
+                }
+            }
+
+            double sx = 0.0, sy = 0.0;
+            for (const auto& p : pts) { sx += p.x; sy += p.y; }
+            outX = sx / static_cast<double>(n);
+            outY = sy / static_cast<double>(n);
+            return std::isfinite(outX) && std::isfinite(outY);
+        }
+    }
+
+    // 按边界环包含关系（奇偶规则：外环加、孔洞减、洞内岛加回）计算 HatchEntity 净面积。
+    // maxPoints > 0 时，若离散总顶点数超限返回 std::nullopt；无效或净面积 <= 0 返回 std::nullopt。
+    inline std::optional<double> ComputeHatchNetArea(const HatchEntity& hatch, std::size_t maxPoints = 200000)
+    {
+        struct LoopInfo
+        {
+            std::vector<Math::Point3> pts;
+            double area  = 0.0;
+            double minX  = 0.0, minY = 0.0, maxX = 0.0, maxY = 0.0;
+            double testX = 0.0, testY = 0.0;
+        };
+
+        std::vector<LoopInfo> loops;
+        loops.reserve(hatch.GetLoops().size());
+        std::size_t totalPts = 0;
+
+        for (const auto& loop : hatch.GetLoops())
+        {
+            std::vector<Math::Point3> raw = loop.Tessellate();
+            totalPts += raw.size();
+            if (maxPoints > 0 && totalPts > maxPoints)
+                return std::nullopt;
+            if (raw.size() < 3)
+                continue;
+
+            std::vector<Math::Point3> pts;
+            pts.reserve(raw.size());
+            for (const auto& p : raw)
+            {
+                if (!std::isfinite(p.x) || !std::isfinite(p.y))
+                    continue;
+                if (!pts.empty() && std::abs(p.x - pts.back().x) <= 1e-12 && std::abs(p.y - pts.back().y) <= 1e-12)
+                    continue;
+                pts.push_back(p);
+            }
+            while (pts.size() >= 2
+                   && std::abs(pts.back().x - pts.front().x) <= 1e-12
+                   && std::abs(pts.back().y - pts.front().y) <= 1e-12)
+            {
+                pts.pop_back();
+            }
+            if (pts.size() < 3)
+                continue;
+
+            double a2 = 0.0;
+            double minX = pts[0].x, maxX = pts[0].x;
+            double minY = pts[0].y, maxY = pts[0].y;
+            for (std::size_t i = 0; i < pts.size(); ++i)
+            {
+                const auto& p = pts[i];
+                const auto& q = pts[(i + 1) % pts.size()];
+                a2 += p.x * q.y - q.x * p.y;
+                minX = std::min(minX, p.x); maxX = std::max(maxX, p.x);
+                minY = std::min(minY, p.y); maxY = std::max(maxY, p.y);
+            }
+            const double area = std::abs(a2) * 0.5;
+            if (!std::isfinite(area) || area <= 1e-12)
+                continue;
+
+            LoopInfo info;
+            info.area = area;
+            info.minX = minX; info.minY = minY;
+            info.maxX = maxX; info.maxY = maxY;
+            if (!Detail::FindPolygonInteriorPoint2D(pts, info.testX, info.testY))
+                continue;
+            info.pts = std::move(pts);
+            loops.push_back(std::move(info));
+        }
+
+        if (loops.empty())
+            return std::nullopt;
+
+        double netArea = 0.0;
+        for (std::size_t i = 0; i < loops.size(); ++i)
+        {
+            const LoopInfo& cur = loops[i];
+            std::size_t depth = 0;
+            for (std::size_t j = 0; j < loops.size(); ++j)
+            {
+                if (i == j)
+                    continue;
+                const LoopInfo& other = loops[j];
+                const double tol = 1e-9 * std::max({ 1.0, cur.area, other.area });
+                const bool canContain = (other.area > cur.area + tol)
+                                     || (std::abs(other.area - cur.area) <= tol && j < i);
+                if (!canContain)
+                    continue;
+                if (cur.testX < other.minX || cur.testX > other.maxX
+                    || cur.testY < other.minY || cur.testY > other.maxY)
+                    continue;
+                if (Detail::PointInPolygon2D(cur.testX, cur.testY, other.pts))
+                    ++depth;
+            }
+            netArea += (depth % 2 == 0) ? cur.area : -cur.area;
+        }
+
+        if (std::isfinite(netArea) && netArea > 1e-12)
+            return netArea;
+        return std::nullopt;
+    }
 }

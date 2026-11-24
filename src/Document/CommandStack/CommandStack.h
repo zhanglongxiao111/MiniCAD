@@ -20,6 +20,9 @@ namespace MiniCAD
         // 嵌入模式：全局否决钩子。命令生效后、入栈前调用，返回 true 则立即撤销该命令、不入栈（嵌入页只浏览 / 只批注时防误改）
         using VetoHook = std::function<bool(const ICommand&)>;
         static void SetVetoHook(VetoHook fn);
+        // 嵌入模式：撤销/重做策略门禁。返回 false 时阻止执行与汇报可用（浏览态统一拦住 Ctrl+Shift+Z/Y 等直接入口）
+        using UndoRedoGate = std::function<bool(const ICommand&, bool isRedo)>;
+        static void SetUndoRedoGate(UndoRedoGate fn);
         void SetScene(Scene* scene) { m_scene = scene; }   // Push（已经发生的改动）被否决时用来撤销
 
         // Execute = 执行 + 入栈；Execute 返回 false 时不入栈
@@ -29,8 +32,8 @@ namespace MiniCAD
 
         // Push = 只入栈，不执行（例如：拖拽这种"已经发生"的操作）
         void Push(std::unique_ptr<ICommand> cmd);
-        bool CanUndo() const { return !m_undoStack.empty(); }
-        bool CanRedo() const { return !m_redoStack.empty(); }
+        bool CanUndo() const;
+        bool CanRedo() const;
 
         void Clear();
 

@@ -62,10 +62,11 @@ namespace MiniCAD
 
         struct ProgramInfo
         {
-            GLuint program  = 0;
-            GLint  viewProj = -1;
-            GLint  light    = -1;
-            GLint  opacity  = -1;
+            GLuint program      = 0;
+            GLint  viewProj     = -1;
+            GLint  light        = -1;
+            GLint  opacity      = -1;
+            GLint  fullCoverage = -1;
         };
 
         struct CompareProgramInfo

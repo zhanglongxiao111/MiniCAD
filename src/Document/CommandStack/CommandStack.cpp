@@ -32,8 +32,31 @@ namespace MiniCAD
         };
     }
 
-    namespace { CommandStack::VetoHook& VetoHookRef() { static CommandStack::VetoHook hook; return hook; } }
+    namespace
+    {
+        CommandStack::VetoHook& VetoHookRef() { static CommandStack::VetoHook hook; return hook; }
+        CommandStack::UndoRedoGate& UndoRedoGateRef() { static CommandStack::UndoRedoGate gate; return gate; }
+    }
     void CommandStack::SetVetoHook(VetoHook fn) { VetoHookRef() = std::move(fn); }
+    void CommandStack::SetUndoRedoGate(UndoRedoGate fn) { UndoRedoGateRef() = std::move(fn); }
+
+    bool CommandStack::CanUndo() const
+    {
+        if (m_undoStack.empty())
+            return false;
+        if (UndoRedoGateRef() && !UndoRedoGateRef()(*m_undoStack.top(), false))
+            return false;
+        return true;
+    }
+
+    bool CommandStack::CanRedo() const
+    {
+        if (m_redoStack.empty())
+            return false;
+        if (UndoRedoGateRef() && !UndoRedoGateRef()(*m_redoStack.top(), true))
+            return false;
+        return true;
+    }
 
     void CommandStack::PushNew(std::unique_ptr<ICommand> cmd)
     {

@@ -124,6 +124,62 @@ namespace MiniCAD
     //   动态层 —— 每帧：先把缓存层整块复制过来，再画选中、叠加层（橡皮筋 / 悬停高亮）、
     //            夹点、框选框、捕捉标记、十字光标。鼠标移动只改这些，GPU 开销与场景规模无关。
     // 后端不支持缓存层（CreateLayerTarget 返回空）时，两层都画在目标上，结果相同。
+    Viewport::MainVisibleClip Viewport::ComputeMainVisibleClip(CompareDisplayMode mode, bool soloCompare, int splitX, int pixelWidth)
+    {
+        MainVisibleClip clip{};
+        const int pw = std::max(pixelWidth, 0);
+        switch (mode)
+        {
+        case CompareDisplayMode::CompareOnly:
+            clip.Constrained = true;
+            clip.MinX = 0;
+            clip.MaxX = 0;
+            break;
+        case CompareDisplayMode::AlignPickBase:
+            if (soloCompare)
+            {
+                clip.Constrained = true;
+                clip.MinX = 0;
+                clip.MaxX = 0;
+            }
+            break;
+        case CompareDisplayMode::Split:
+        {
+            const int sx = std::clamp(splitX, 0, pw);
+            if (sx < pw)
+            {
+                clip.Constrained = true;
+                clip.MinX = 0;
+                clip.MaxX = sx;
+            }
+            break;
+        }
+        default:
+            break;
+        }
+        return clip;
+    }
+
+    Viewport::MainVisibleClip Viewport::ComputeMainVisibleClip(const CompareRenderPass* compare, int pixelWidth)
+    {
+        if (!compare || !compare->State || compare->Mode == CompareDisplayMode::Off)
+            return {};
+        return ComputeMainVisibleClip(compare->Mode, compare->SoloCompare, compare->SplitX, pixelWidth);
+    }
+
+    void Viewport::ReleaseCompareLayers()
+    {
+        const bool hadLayers = (m_compareMainLayer != nullptr || m_compareOtherLayer != nullptr);
+        m_compareMainLayer.reset();
+        m_compareOtherLayer.reset();
+        m_compareMainKey    = 0;
+        m_compareMainValid  = false;
+        m_compareOtherKey   = 0;
+        m_compareOtherValid = false;
+        if (hadLayers)
+            m_layerValid = false;
+    }
+
     void Viewport::Render(IRenderer& renderer, IRenderTarget& target, const ViewState& viewState,
                           const CompareRenderPass* compare)
     {
@@ -214,10 +270,7 @@ namespace MiniCAD
         };
         if (!hasCompare)
         {
-            m_compareMainLayer.reset();
-            m_compareOtherLayer.reset();
-            m_compareMainValid  = false;
-            m_compareOtherValid = false;
+            ReleaseCompareLayers();
         }
         uint64_t compSceneVersion = 0;
         Math::Mat4 compVp = vpWorld, compVpLines = vpWorldLines, compVpSilhouettes = vpWorldSilhouettes;
@@ -345,10 +398,12 @@ namespace MiniCAD
 
                 if (!m_compareMainValid || mainKey != m_compareMainKey)
                 {
+                    PaintStyle coverageStyle{};
+                    coverageStyle.FullCoverage = true;
                     renderer.SetClearColor(0.0f, 0.0f, 0.0f, 0.0f);
                     renderer.BeginFrame(*m_compareMainLayer, m_viewportDesc);
                     renderer.SetScissorRect({});
-                    renderer.SetPaintStyle({});
+                    renderer.SetPaintStyle(coverageStyle);
                     drawScenePass(viewState, sceneVersion, 0, vp, vpLines, vpSilhouettes, false);
                     renderer.EndFrame();
                     m_compareMainKey   = mainKey;
@@ -370,10 +425,12 @@ namespace MiniCAD
 
                 if (!m_compareOtherValid || otherKey != m_compareOtherKey)
                 {
+                    PaintStyle coverageStyle{};
+                    coverageStyle.FullCoverage = true;
                     renderer.SetClearColor(0.0f, 0.0f, 0.0f, 0.0f);
                     renderer.BeginFrame(*m_compareOtherLayer, m_viewportDesc);
                     renderer.SetScissorRect({});
-                    renderer.SetPaintStyle({});
+                    renderer.SetPaintStyle(coverageStyle);
                     drawScenePass(*compare->State, compSceneVersion, kCompareSlotOffset, compVp, compVpLines, compVpSilhouettes, false);
                     renderer.EndFrame();
                     m_compareOtherKey   = otherKey;
@@ -506,43 +563,54 @@ namespace MiniCAD
             else
                 drawStatic();
 
-            // 选中流叠加在场景之上（覆盖为选中色）；Overlay 每帧重建且体量小，保持非缓存路径
-            renderer.SubmitCached(kSlotSelFill, viewState.SelVersion, viewState.SelFill,  vp, PrimitiveType::Triangle, true, true);
-            renderer.SubmitCached(kSlotSel,     viewState.SelVersion, viewState.SelScene, vp, PrimitiveType::Line,     true, true);
-            if (viewState.FontTexture)
-                renderer.SubmitTexturedCached(kSlotSelText, viewState.SelVersion, viewState.SelText, vp, viewState.FontTexture, false, true);
-            renderer.SubmitCached(kSlotSelDynFill, viewState.SelDynVersion, viewState.SelDynFill, vp, PrimitiveType::Triangle, true, true);
-            renderer.SubmitCached(kSlotSelDyn,     viewState.SelDynVersion, viewState.SelDyn,     vp, PrimitiveType::Line,     true, true);
-            if (viewState.FontTexture)
-                renderer.SubmitTexturedCached(kSlotSelDynText, viewState.SelDynVersion, viewState.SelDynText, vp, viewState.FontTexture, false, true);
-            renderer.Submit(viewState.Overlay, vp, PrimitiveType::Line, true, true);
-
-            if (!viewState.Grips.empty())
+            // 选中流 / 覆盖层 / 夹点 / 框选框按主图可见区域约束（隐藏主图时跳过，卷帘模式裁剪到主图一侧）
+            const MainVisibleClip mainClip = ComputeMainVisibleClip(hasCompare ? compare : nullptr, pw);
+            if (!mainClip.IsHidden())
             {
-                // 夹点几何按内容缓存：夹点、悬停、相机都没变时不重建、不重新上传
-                uint64_t key = 1469598103934665603ull;
-                for (const GripDraw& g : viewState.Grips)
-                {
-                    key = HashCombine(key, &g.Pos.x, sizeof(g.Pos.x));
-                    key = HashCombine(key, &g.Pos.y, sizeof(g.Pos.y));
-                    const unsigned char t = static_cast<unsigned char>(static_cast<unsigned char>(g.GripType) | (g.Hovered ? 0x80 : 0));
-                    key = HashCombine(key, &t, sizeof(t));
-                }
-                if (!m_gripValid || key != m_gripKey)
-                {
-                    m_gripGeom  = BuildGripGeometry(viewState);
-                    m_gripKey   = key;
-                    m_gripValid = true;
-                }
-                renderer.SubmitCached(kSlotGripFill, m_gripKey, m_gripGeom.fill,   screenVP, PrimitiveType::Triangle, true, true);
-                renderer.SubmitCached(kSlotGrip,     m_gripKey, m_gripGeom.border, screenVP, PrimitiveType::Line,     true, true);
-            }
+                if (mainClip.Constrained && ph > 0)
+                    renderer.SetScissorRect({ true, mainClip.MinX, 0, mainClip.MaxX - mainClip.MinX, ph });
 
-            if (viewState.Selection.Active)
-            {
-                auto sel = BuildSelectionGeometry(viewState);
-                renderer.Submit(sel.fill,   screenVP, PrimitiveType::Triangle, true, true);
-                renderer.Submit(sel.border, screenVP, PrimitiveType::Line,     true, true);
+                // 选中流叠加在场景之上（覆盖为选中色）；Overlay 每帧重建且体量小，保持非缓存路径
+                renderer.SubmitCached(kSlotSelFill, viewState.SelVersion, viewState.SelFill,  vp, PrimitiveType::Triangle, true, true);
+                renderer.SubmitCached(kSlotSel,     viewState.SelVersion, viewState.SelScene, vp, PrimitiveType::Line,     true, true);
+                if (viewState.FontTexture)
+                    renderer.SubmitTexturedCached(kSlotSelText, viewState.SelVersion, viewState.SelText, vp, viewState.FontTexture, false, true);
+                renderer.SubmitCached(kSlotSelDynFill, viewState.SelDynVersion, viewState.SelDynFill, vp, PrimitiveType::Triangle, true, true);
+                renderer.SubmitCached(kSlotSelDyn,     viewState.SelDynVersion, viewState.SelDyn,     vp, PrimitiveType::Line,     true, true);
+                if (viewState.FontTexture)
+                    renderer.SubmitTexturedCached(kSlotSelDynText, viewState.SelDynVersion, viewState.SelDynText, vp, viewState.FontTexture, false, true);
+                renderer.Submit(viewState.Overlay, vp, PrimitiveType::Line, true, true);
+
+                if (!viewState.Grips.empty())
+                {
+                    // 夹点几何按内容缓存：夹点、悬停、相机都没变时不重建、不重新上传
+                    uint64_t key = 1469598103934665603ull;
+                    for (const GripDraw& g : viewState.Grips)
+                    {
+                        key = HashCombine(key, &g.Pos.x, sizeof(g.Pos.x));
+                        key = HashCombine(key, &g.Pos.y, sizeof(g.Pos.y));
+                        const unsigned char t = static_cast<unsigned char>(static_cast<unsigned char>(g.GripType) | (g.Hovered ? 0x80 : 0));
+                        key = HashCombine(key, &t, sizeof(t));
+                    }
+                    if (!m_gripValid || key != m_gripKey)
+                    {
+                        m_gripGeom  = BuildGripGeometry(viewState);
+                        m_gripKey   = key;
+                        m_gripValid = true;
+                    }
+                    renderer.SubmitCached(kSlotGripFill, m_gripKey, m_gripGeom.fill,   screenVP, PrimitiveType::Triangle, true, true);
+                    renderer.SubmitCached(kSlotGrip,     m_gripKey, m_gripGeom.border, screenVP, PrimitiveType::Line,     true, true);
+                }
+
+                if (viewState.Selection.Active)
+                {
+                    auto sel = BuildSelectionGeometry(viewState);
+                    renderer.Submit(sel.fill,   screenVP, PrimitiveType::Triangle, true, true);
+                    renderer.Submit(sel.border, screenVP, PrimitiveType::Line,     true, true);
+                }
+
+                if (mainClip.Constrained)
+                    renderer.SetScissorRect({});
             }
 
             const ViewState& interactVs = (hasCompare && compare->PickCompare) ? *compare->State : viewState;

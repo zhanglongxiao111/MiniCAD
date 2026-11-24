@@ -63,8 +63,11 @@ namespace MiniCAD::SaTool
                              const std::string& outDbPath, bool includeBlockEntities,
                              ExportDbResult& result, std::string* error = nullptr);
 
-    // 完整执行 export-db 子命令（含 --reuse-if-fresh 缓存命中判定与单趟 DWG 解析）。
-    bool RunExportDbCommand(const ExportDbOptions& opts, ExportDbResult& result, std::string* error = nullptr);
+    // 完整执行 export-db 子命令（含路径冲突守卫、--reuse-if-fresh 缓存命中判定与单趟 DWG 解析）。
+    bool RunExportDbCommand(const ExportDbOptions& opts, ExportDbResult& result,
+                            std::string* error = nullptr,
+                            std::string* errorCode = nullptr,
+                            bool* isUsageError = nullptr);
 
     // 格式化 export-db 返回 JSON。
     std::string FormatExportDbResultJson(const ExportDbResult& result, bool pretty = false);

@@ -15,7 +15,7 @@
   相邻的字面量（"甲" "乙"，可以跨行）按 C++ 的规则连成一条
 - 界面描述文件 assets/ui/minicad_ui.json 的 title / label / tooltip / text / search（只取含非 ASCII 字符的）
 - 节点示例索引 assets/nodes/examples/examples.json、示例图纸索引 assets/samples/samples.json 的 name / description
-不提取：自测（apps/Win32/src/Host/SelfTest.cpp）、tests/、tools/。
+不提取：自测（apps/Win32/src/Host/SelfTest.cpp）、无头命令行工具（apps/SaDwgTool/、apps/SaDwgText/）、tests/、tools/。
 
 漏网检查（--lint）跳过：
 - 行里或紧挨着的上一行（只有注释的行）有 "i18n:" 注释的（// i18n: 数据、// i18n: 上下文……，写明为什么不翻）
@@ -33,6 +33,11 @@ I18N_DIR = ROOT / "assets" / "i18n"
 UI_FILES = [ROOT / "assets" / "ui" / "minicad_ui.json"]
 CODE_DIRS = [ROOT / "src", ROOT / "apps"]
 CODE_EXCLUDE = {ROOT / "apps" / "Win32" / "src" / "Host" / "SelfTest.cpp"}
+# 无头命令行工具，不参与桌面 GUI 国际化
+CODE_EXCLUDE_DIRS = {
+    ROOT / "apps" / "SaDwgTool",
+    ROOT / "apps" / "SaDwgText",
+}
 UI_TEXT_FIELDS = {"title", "label", "tooltip", "text", "search"}
 # 其他要翻译的资源文件：文件 → 要取的字段（节点示例的名称与说明，节点面板“示例”菜单里显示）
 TEXT_FILES = {ROOT / "assets" / "nodes" / "examples" / "examples.json": {"name", "description"},
@@ -486,10 +491,19 @@ def check(msgs):
     return errors, warnings
 
 
+def is_excluded_code_file(path):
+    if path in CODE_EXCLUDE:
+        return True
+    for excluded_dir in CODE_EXCLUDE_DIRS:
+        if path == excluded_dir or excluded_dir in path.parents:
+            return True
+    return False
+
+
 def code_files():
     for d in CODE_DIRS:
         for path in sorted(d.rglob("*")):
-            if path.suffix in (".h", ".hpp", ".cpp") and path not in CODE_EXCLUDE:
+            if path.suffix in (".h", ".hpp", ".cpp") and not is_excluded_code_file(path):
                 yield path
 
 
@@ -575,7 +589,7 @@ def main():
     ap.add_argument("--lint", action="store_true", help="列出没有包 Tr / N_ 的中文字面量与格式串含中文的日志")
     args = ap.parse_args()
 
-    if args.lint:
+    if args.lint and not args.check:
         problems = lint()
         for p in problems:
             print(p)
@@ -592,7 +606,14 @@ def main():
         for e in errors:
             print("错误：" + e)
         print(f"{len(msgs.where)} 条原文，{len(catalogs())} 个翻译文件，{len(errors)} 个错误")
-        return 1 if errors else 0
+        lint_rc = 0
+        if args.lint:
+            problems = lint()
+            for p in problems:
+                print(p)
+            print(f"{len(problems)} 处漏网的中文")
+            lint_rc = 1 if problems else 0
+        return 1 if (errors or lint_rc) else 0
     I18N_DIR.mkdir(parents=True, exist_ok=True)
     print(f"{len(msgs.where)} 条原文")
     for path in catalogs():

@@ -79,6 +79,8 @@ namespace MiniCAD::SaTool
         double                MmPerPx          = 0.0;
         bool                  Clamped          = false;
         std::string           Bg               = "white";
+        std::string           FontsDir;
+        bool                  FontsFallback    = false;
         int                   EntitiesRendered = 0;
         int                   EntitiesFiltered = 0;
         int                   FramesExcluded   = 0;

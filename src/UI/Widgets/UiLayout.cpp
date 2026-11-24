@@ -238,7 +238,7 @@ namespace MiniGUI
 
         // ── 清空旧界面（推迟销毁）并重建 ──────────────────────────
         if (m_ribbon && m_ribbon->GetSelectedTab() >= 0)
-            m_ribbonTab = m_ribbon->GetTabTitle(m_ribbon->GetSelectedTab());   // 重新加载后仍停在这个选项卡
+            m_ribbonTab = m_ribbon->GetTabId(m_ribbon->GetSelectedTab());   // 重新加载/切换语言后仍按稳定标识停在这个选项卡
         ReclaimPanels();
         m_menuBar  = nullptr;
         m_titleBar = nullptr;
@@ -653,7 +653,9 @@ namespace MiniGUI
             ribbon->SetIconDir(m_iconDir);
             for (const JsonValue& t : (*def)["tabs"].GetArray())
             {
-                const int tab = ribbon->AddTab(Tr(t["title"].AsString()));
+                const std::string rawTitle = t["title"].AsString();
+                const std::string tabId    = t["id"].AsString(rawTitle);
+                const int tab = ribbon->AddTab(Tr(rawTitle), tabId);
                 for (const JsonValue& p : t["panels"].GetArray())
                 {
                     const int panel = ribbon->AddPanel(tab, Tr(p["title"].AsString()));
@@ -686,7 +688,10 @@ namespace MiniGUI
                 ribbon->EnableSearch(Tr(search.AsString()));
             else if (search.AsBool(true))
                 ribbon->EnableSearch();
-            if (const int keep = ribbon->FindTab(m_ribbonTab); keep >= 0)
+            int keep = ribbon->FindTabById(m_ribbonTab);
+            if (keep < 0)
+                keep = ribbon->FindTab(m_ribbonTab);
+            if (keep >= 0)
                 ribbon->SelectTab(keep);
             if (m_ribbon)
                 m_warnings.push_back(TrF("{0}：出现了多个功能区，GetRibbon 只返回最后一个", where));

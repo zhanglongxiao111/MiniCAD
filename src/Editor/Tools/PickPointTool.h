@@ -25,7 +25,8 @@ namespace MiniCAD
 
         ~PickPointTool() override
         {
-            NotifyCancelled();
+            if (auto onCancelled = TakeCancelled())
+                onCancelled();
         }
 
         bool OnInput(const EditorContext& ctx) override
@@ -38,9 +39,14 @@ namespace MiniCAD
                     ? e.SnapWorld
                     : ctx.viewport.GetCamera().ScreenToWorld(e.MouseX, e.MouseY);
 
+                // 先完成内部状态清理并拷贝/移出回调，最后再通知外部，
+                // 避免外部回调重入替换工具或销毁编辑器后继续访问 this 造成 UAF。
                 m_done = true;
-                if (m_onPicked) m_onPicked(p);
-                if (OnFinished) OnFinished();
+                auto onPicked   = std::move(m_onPicked);
+                auto onFinished = OnFinished;
+                m_onCancelled   = nullptr;
+                if (onFinished) onFinished();
+                if (onPicked)   onPicked(p);
                 return true;
             }
 
@@ -55,18 +61,21 @@ namespace MiniCAD
 
         void Cancel() override
         {
-            NotifyCancelled();
-            if (OnFinished) OnFinished();
+            auto onCancelled = TakeCancelled();
+            auto onFinished  = OnFinished;
+            if (onFinished)  onFinished();
+            if (onCancelled) onCancelled();
         }
 
         std::string GetPrompt() const override { return Tr(m_prompt); }
 
     private:
-        void NotifyCancelled()
+        std::function<void()> TakeCancelled()
         {
-            if (m_done) return;
+            if (m_done) return {};
             m_done = true;
-            if (m_onCancelled) m_onCancelled();
+            m_onPicked = nullptr;
+            return std::move(m_onCancelled);
         }
 
         std::string                               m_prompt;

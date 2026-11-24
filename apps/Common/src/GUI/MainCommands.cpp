@@ -87,7 +87,7 @@ namespace MiniCAD
                                       return;
                                   }
                                   dm.GetEditor().GetCmdLine().Echo(TrF("{0} 个外部参照没有找到，请选择所在的文件夹", missing));
-                                  LocateXrefs({ doc });
+                                  LocateXrefs({ doc->InstanceID() });
                               },
                               .canExecute = hasDoc });
         m_commands.Register({ .id = "app.exit",     .label = N_("退出(&X)"),     .shortcut = "Alt+F4",       .execute = [platform] { platform->CloseWindow(); } });

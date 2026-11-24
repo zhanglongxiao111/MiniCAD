@@ -37,6 +37,23 @@ namespace MiniCAD
         using LayoutFilter = std::function<bool(const EntityAttr&)>;
         void SetLayoutFilter(LayoutFilter filter) { m_layoutFilter = std::move(filter); }
 
+        // 水平可见区裁剪（叠图对比隐藏主图或卷帘分屏时与渲染区保持同一口径）：
+        // enabled=true 且 minX >= maxX 时主图完全不可拾取；否则仅 [minX, maxX) 允许点选/悬停/框选。
+        void SetClipX(bool enabled, double minX = 0.0, double maxX = 0.0)
+        {
+            const bool changed = (m_clipEnabled != enabled)
+                || (enabled && (m_clipMinX != minX || m_clipMaxX != maxX));
+            m_clipEnabled = enabled;
+            m_clipMinX    = minX;
+            m_clipMaxX    = maxX;
+            if (changed)
+                m_hovered.clear();
+            if (m_clipEnabled && m_clipMinX >= m_clipMaxX)
+                m_drag = DragState::Idle;
+        }
+        bool IsClipEnabled() const { return m_clipEnabled; }
+        bool PointInClip(double x) const { return !m_clipEnabled || (x >= m_clipMinX && x < m_clipMaxX); }
+
         // 输入入口
         bool OnInput(const InputEvent& e);
 
@@ -115,6 +132,9 @@ namespace MiniCAD
             m_scene    = nullptr;
             m_viewport = nullptr;
             m_layoutFilter = nullptr;   // 回调捕获的是 Editor，解绑后不得再调用
+            m_clipEnabled  = false;
+            m_clipMinX     = 0.0;
+            m_clipMaxX     = 0.0;
             m_index    = {};
             m_indexVersion = ~0ull;
             m_displayVersion = ~0ull;
@@ -182,6 +202,9 @@ namespace MiniCAD
         // 布局过滤（布局页）：非空时 IsPickable 先用它排除不属于当前布局的图纸空间实体，
         // 与渲染侧的 Document::IsVisibleInActiveLayout 保持同一口径
         LayoutFilter m_layoutFilter;
+        bool         m_clipEnabled = false;
+        double       m_clipMinX    = 0.0;
+        double       m_clipMaxX    = 0.0;
 
         // 空间索引及其同步的几何版本（UINT64_MAX = 尚未构建）
         SpatialIndex m_index;

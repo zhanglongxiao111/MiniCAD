@@ -28,7 +28,7 @@ namespace MiniGUI
 
         void SetIconDir(std::string dir) { m_iconDir = std::move(dir); }
 
-        int  AddTab(std::string title);                                         // 返回选项卡序号
+        int  AddTab(std::string title, std::string id = {});                    // 返回选项卡序号；id 为翻译无关的稳定标识
         int  AddPanel(int tab, std::string title);                              // 返回组序号（在该选项卡内）
         void AddCommand(int tab, int panel, const std::string& id);
         void AddHostNode(int tab, int panel, std::unique_ptr<Node> node);       // 宿主控件（按自身尺寸，垂直居中）
@@ -54,7 +54,9 @@ namespace MiniGUI
         int  GetSelectedTab() const { return m_selected; }
         void SelectTab(int index);
         int  FindTab(const std::string& title) const;
+        int  FindTabById(std::string_view id) const;
         const std::string& GetTabTitle(int index) const;
+        const std::string& GetTabId(int index) const;
 
         // 收起：只留选项卡行（选项卡行右端的 ⌃ 按钮或双击选项卡切换，与 SolidCraft / AutoCAD 相同），给绘图区和停靠面板腾出高度
         void SetCollapsed(bool collapsed);
@@ -102,6 +104,7 @@ namespace MiniGUI
         struct Tab
         {
             std::string        title;
+            std::string        id;           // 翻译无关的稳定标识（默认来自界面描述的 id 或未翻译原名）
             std::vector<Panel> panels;
             float x0 = 0.0f, x1 = 0.0f;      // 选项卡标题的位置
         };

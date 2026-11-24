@@ -342,10 +342,10 @@ namespace MiniCAD
         // 外部参照（XREF）：本批打开的图纸有找不到的参照时，先让平台自动找（AppPlatform::FindXrefsForDrawing，
         // 如网页版到图纸所在的网站找），还缺的再提示，可选一个文件夹再找（网页版经浏览器授权读本地文件夹）
         void PromptMissingXrefs();
-        void AutoLocateXrefs(std::vector<Document*> docs);
-        void ShowMissingXrefs(std::vector<Document*> docs);      // 提示还缺的参照，可"选择文件夹…"
+        void AutoLocateXrefs(std::vector<uint64_t> docIds);
+        void ShowMissingXrefs(std::vector<uint64_t> docIds);     // 提示还缺的参照，可"选择文件夹…"
         void OnXrefsLoaded(const std::vector<Document*>& docs, int loaded);   // 读入后重新缩放、命令行回显
-        void LocateXrefs(std::vector<Document*> docs);   // 选文件夹，在里面找这些图纸没读进来的参照并读入
+        void LocateXrefs(std::vector<uint64_t> docIds);          // 选文件夹，在里面找这些图纸没读进来的参照并读入
         void UpdateTitle();
         void ActivateDocument(Document* doc);
         // 布局标签（模型 / 图纸空间布局）同步与切换
@@ -542,10 +542,13 @@ namespace MiniCAD
         bool                                   m_viewCubeVisible = true; // 视图方块的显示开关（同上）
         int                                    m_embedMode = -1;         // 嵌入模式：-1 不是嵌入；0 浏览；1 批注
         std::function<void(int)>               m_embedModeListener;
-        std::unordered_map<const Document*, std::vector<std::pair<LayerID, bool>>> m_embedSavedLocks;   // 批注模式锁图层前的原锁定状态
+        MiniGUI::Ribbon*                       m_boundEmbedRibbon = nullptr; // 已绑定嵌入切换回调的功能区实例（避免回调内重绑）
+        std::unordered_map<uint64_t, std::vector<std::pair<LayerID, bool>>> m_embedSavedLocks;   // 批注模式锁图层前的原锁定状态（按 Document::InstanceID）
+        std::unordered_map<uint64_t, Object::ObjectID>                      m_embedDocWatermark; // 每个文档进入批注保护前既有实体的 ID 水位线（防止误改原图 SA-问题批注 层实体）
         LayerID EmbedEnsureMarkupLayer(Document& doc);
         void    EmbedApplyMarkupLocks(Document& doc);
         void    EmbedRestoreLocks(Document& doc);
+        void    EmbedSyncActiveDocumentProtection();
         bool                                   m_compact = false;        // 用的是紧凑布局：只浏览
         bool                                   m_flushLayout = false;    // "设置 > 布局"选了紧凑（贴边）；与只浏览的 m_compact 无关
         static constexpr const char*           kLayoutSettingKey = "layout";   // 用户设置里的值："floating" / "compact"
@@ -618,7 +621,9 @@ namespace MiniCAD
         std::vector<std::string>               m_sampleOpens;            // 其中按示例打开的（读完去掉路径，不记入"最近"）
         DocumentManager::PaneId                m_openPane = DocumentManager::kMainPane;   // 读完的图纸加进哪个窗口（发起打开时的）
         std::string                            m_openFailures;           // 本批打开失败的汇总，全部读完后显示
-        std::vector<Document*>                 m_xrefMissingDocs;        // 本批打开的、有找不到的外部参照的图纸
+        std::vector<uint64_t>                  m_xrefMissingDocs;        // 本批打开的、有找不到的外部参照的图纸（存 Document::InstanceID 防 ABA）
+        uint64_t                               m_openGeneration = 0;     // 主图打开请求代次（换图/关闭全部时递增以作废在途异步加载）
+        uint64_t                               m_compareOpenGeneration = 0; // 对比图打开请求代次
         bool                                   m_openedAny  = false;
         bool                                   m_hideOpenProgress = false;   // 最后一张已加入：它生成完显示后隐藏进度
         Document*                             m_buildDoc = nullptr;     // 最近加入、还在生成显示的图纸（只用来比较，可能已关闭）
@@ -635,11 +640,16 @@ namespace MiniCAD
 
         void SyncCompareCamera();
         void SyncCompareLayout();
+        void SyncMainVisibleClip();
         void NotifyEmbedLayoutChanged();
         void RouteComparePointer(const MiniGUI::ViewportPointerEvent& original);
 
+        void CancelPendingMainOpens();
         void EmbedCloseDocumentsExcept(Document* keep);
+        bool IsPickTargetAlive(int target, uint64_t docId) const;
+        void DispatchPickCallback(std::function<void()> fn);
 
+        std::shared_ptr<bool>      m_alive = std::make_shared<bool>(true); // 供异步回调感知 MainFrame 存活
         std::function<void(const EmbedLayoutInfo&)> m_embedLayoutListener;
         const Document*            m_lastNotifiedLayoutDoc   = nullptr;
         int                        m_lastNotifiedLayoutIndex = -1;
@@ -663,6 +673,7 @@ namespace MiniCAD
         bool                       m_compareShowCompare    = true;
         int                        m_compareLayoutIndex    = -1;   // -1 = 自动跟随主图布局，>= 0 = 手动指定对比图布局
         int                        m_pickPointTarget       = -1;   // -1 = 未拾取，0 = 主图，1 = 底图
+        uint64_t                   m_pickPointSession      = 0;    // 拾点会话号（递增即作废旧会话的延迟回调）
 
         // ── 视口指针状态（物理像素，视口内坐标）──────────────────
         ViewInput m_mainInput;      // 主视口的鼠标状态（光标是否在视口里：m_main.hovered）

@@ -1,7 +1,19 @@
 #include "CliArgs.h"
+#include "PathGuard.h"
+#include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace MiniCAD::SaTool
 {
@@ -133,16 +145,42 @@ namespace MiniCAD::SaTool
             if (name == "diff")      return CommandKind::Diff;
             return CommandKind::None;
         }
-
-        std::string DefaultJsonPathForPng(const std::string& pngPath)
-        {
-            const size_t dot = pngPath.find_last_of('.');
-            const size_t sep = pngPath.find_last_of("/\\");
-            if (dot != std::string::npos && (sep == std::string::npos || dot > sep))
-                return pngPath.substr(0, dot) + ".json";
-            return pngPath + ".json";
-        }
     }
+
+#ifdef _WIN32
+    bool WideArgToUtf8(std::wstring_view wide, std::string& out, unsigned long* win32Error)
+    {
+        out.clear();
+        if (win32Error) *win32Error = 0;
+        if (wide.empty())
+            return true;
+        if (wide.size() > static_cast<size_t>(INT_MAX))
+        {
+            if (win32Error) *win32Error = ERROR_INVALID_PARAMETER;
+            return false;
+        }
+
+        const int wlen = static_cast<int>(wide.size());
+        const int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                          wide.data(), wlen, nullptr, 0, nullptr, nullptr);
+        if (n <= 0)
+        {
+            if (win32Error) *win32Error = GetLastError();
+            return false;
+        }
+
+        out.assign(static_cast<size_t>(n), '\0');
+        const int written = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                                wide.data(), wlen, out.data(), n, nullptr, nullptr);
+        if (written != n)
+        {
+            if (win32Error) *win32Error = GetLastError();
+            out.clear();
+            return false;
+        }
+        return true;
+    }
+#endif
 
     std::string BuildUsageText(CommandKind topic)
     {
@@ -155,13 +193,15 @@ namespace MiniCAD::SaTool
                 "  SaDwgTool export-db <in.dwg|dxf> <out.sqlite> [选项]\n"
                 "\n"
                 "选项:\n"
-                "  --reuse-if-fresh      输出库存在且源文件未变动时直接复用缓存（默认关闭）\n"
+                "  --reuse-if-fresh      输出库存在且源文件、选项与外部参照依赖均未变动时复用缓存（默认关闭）\n"
                 "  --force               忽略缓存强制重新导出（默认关闭）\n"
                 "  --no-block-entities   跳过导出 block_entities 块定义内部图元表（默认导出）\n"
-                "  --fonts-dir <dir>     指定 SHX/TTF 字体目录（默认自动探测）\n"
                 "  --pretty              美化缩进输出 JSON（默认紧凑单行）\n"
                 "  --verbose             输出详细日志到 stderr（默认仅错误）\n"
                 "  -h, --help            显示本帮助信息（退出码 0）\n"
+                "\n"
+                "说明:\n"
+                "  - export-db 仅提取图纸结构与文字语义，不执行字形光栅化，无需也不接受 --fonts-dir（请在 render/diff 中指定）。\n"
                 "\n"
                 "示例:\n"
                 "  SaDwgTool export-db drawing.dwg cache.sqlite --reuse-if-fresh\n";
@@ -229,7 +269,7 @@ namespace MiniCAD::SaTool
                 "尺度与容差选项（纸张布局非 Model 时未显式指定则自动切为纸张默认尺度）:\n"
                 "  --mm-per-px <f>                 光栅分辨率 mm/px（模型默认 20.0，纸张布局自动 1.0）\n"
                 "  --max-px <n>                    画布长边像素上限，范围 16..8192（默认 4096）\n"
-                "  --tolerance-mm <f>              像素膨胀容差 mm，别名 --tolerance（模型默认 30.0，纸张自动 1.0）\n"
+                "  --tolerance-mm <f>              像素膨胀容差 mm，别名 --tolerance；0 表示 0px 逐像素比对（模型默认 30.0，纸张自动 1.0）\n"
                 "  --min-region-mm <f>             差异区最小长边 mm（模型默认 800.0，纸张自动 2.0）\n"
                 "  --region-gap-mm <f>             相邻差异合并间距 mm（模型默认 1200.0，纸张自动 8.0）\n"
                 "  --max-region-mm <f>             单差异区最大长边，超限递归切分（默认 15000.0）\n"
@@ -257,7 +297,7 @@ namespace MiniCAD::SaTool
             "用法:\n"
             "  SaDwgTool --version | -v\n"
             "  SaDwgTool --help | -h | help [export-db|render|diff]\n"
-            "  SaDwgTool export-db <in.dwg|dxf> <out.sqlite> [--reuse-if-fresh] [--force] [--no-block-entities] [--fonts-dir <dir>] [--pretty] [--verbose]\n"
+            "  SaDwgTool export-db <in.dwg|dxf> <out.sqlite> [--reuse-if-fresh] [--force] [--no-block-entities] [--pretty] [--verbose]\n"
             "  SaDwgTool render <in.dwg|dxf> <out.png> [--compare <b.dwg|dxf>] [--offset <dx> <dy>] [--layout <name>] [--layout-b <name>]\n"
             "                   [--bbox <xmin> <ymin> <xmax> <ymax> | <xmin,ymin,xmax,ymax>] [--mm-per-px <f>] [--max-px <n>]\n"
             "                   [--bg white|black] [--line-width-px <f>] [--include-layers <re>] [--exclude-layers <re>]\n"
@@ -328,8 +368,9 @@ namespace MiniCAD::SaTool
                 else if (a == "--verbose")         { out.ExportDb.Verbose = true; out.Verbose = true; }
                 else if (a == "--fonts-dir")
                 {
-                    if (!NeedArgs(args, i, 1, a, errorCode, errorMsg)) return false;
-                    out.ExportDb.FontsDir = args[++i];
+                    errorCode = "UNKNOWN_OPTION";
+                    errorMsg  = "export-db 仅导出图纸结构与文本语义，不执行字形渲染，不支持 --fonts-dir（请在 render 或 diff 子命令中指定字体目录）";
+                    return false;
                 }
                 else if (!a.empty() && a[0] == '-')
                 {
@@ -458,7 +499,8 @@ namespace MiniCAD::SaTool
                 else if (a == "--fonts-dir")
                 {
                     if (!NeedArgs(args, i, 1, a, errorCode, errorMsg)) return false;
-                    out.Render.FontsDir = args[++i];
+                    out.Render.FontsDir         = args[++i];
+                    out.Render.FontsDirExplicit = true;
                 }
                 else if (a == "--pretty")  { out.Render.Pretty = true; out.Pretty = true; }
                 else if (a == "--verbose") { out.Render.Verbose = true; out.Verbose = true; }
@@ -655,7 +697,8 @@ namespace MiniCAD::SaTool
                 else if (a == "--fonts-dir")
                 {
                     if (!NeedArgs(args, i, 1, a, errorCode, errorMsg)) return false;
-                    out.Diff.FontsDir = args[++i];
+                    out.Diff.FontsDir         = args[++i];
+                    out.Diff.FontsDirExplicit = true;
                 }
                 else if (a == "--pretty")  { out.Diff.Pretty = true; out.Pretty = true; }
                 else if (a == "--verbose") { out.Diff.Verbose = true; out.Verbose = true; }
@@ -679,7 +722,7 @@ namespace MiniCAD::SaTool
             out.Diff.InputPathA = pos[0];
             out.Diff.InputPathB = pos[1];
             if (!out.Diff.OutJsonExplicit && !out.Diff.OutPngPath.empty())
-                out.Diff.OutJsonPath = DefaultJsonPathForPng(out.Diff.OutPngPath);
+                out.Diff.OutJsonPath = DeriveDefaultJsonPathForPng(out.Diff.OutPngPath);
             return true;
         }
 

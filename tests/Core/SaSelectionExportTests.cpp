@@ -1,14 +1,21 @@
-// ── 嵌入选中图元摘要导出测试：DWG Handle 查询、JSON 序列化、截断、UTF-8/转义、版本号 ──
+// ── 嵌入选中图元摘要导出、文字导出、批注导出、拾点重入、保护门禁、对比视口与捕捉回归测试 ──
 #include "Document/SaSelectionExport.h"
+#include "Document/SaTextExport.h"
+#include "Document/SaMarkupExport.h"
 #include "Document/Document.h"
+#include "Document/Command/AddEntityCommand.h"
 #include "Editor/Editor.h"
 #include "Import/CadExchange.h"
+#include "Render/IRenderer.h"
+#include "Render/IRenderTarget.h"
 #include "Scene/Scene.h"
 #include "Serialization/JsonSerializer.h"
 #include "Viewport/Viewport.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -38,18 +45,11 @@ namespace
         const std::size_t n = s.size();
         while (i < n)
         {
-            const unsigned char c = static_cast<unsigned char>(s[i]);
-            if (c < 0x80u) { ++i; continue; }
-            std::size_t len = 0;
-            if ((c & 0xE0u) == 0xC0u)      len = 2;
-            else if ((c & 0xF0u) == 0xE0u) len = 3;
-            else if ((c & 0xF8u) == 0xF0u) len = 4;
-            else return false;
-            if (i + len > n) return false;
-            for (std::size_t k = 1; k < len; ++k)
-                if ((static_cast<unsigned char>(s[i + k]) & 0xC0u) != 0x80u)
-                    return false;
-            i += len;
+            bool valid = false;
+            const std::size_t step = SaSelectionExport::Detail::DecodeUtf8Step(s, i, valid);
+            if (!valid || step == 0)
+                return false;
+            i += step;
         }
         return true;
     }
@@ -156,7 +156,7 @@ namespace
     void TestEmptyAndInvalidSelection()
     {
         Scene scene;
-        const std::string expected = "{\"count\":0,\"truncated\":false,\"bounds\":null,\"typeCounts\":{},\"items\":[]}";
+        const std::string expected = "{\"count\":0,\"scannedCount\":0,\"truncated\":false,\"statsTruncated\":false,\"bounds\":null,\"typeCounts\":{},\"items\":[]}";
         const std::string emptyJson = SaSelectionExport::ExportSelectionJson(scene, {}, nullptr, 20);
         Check(emptyJson == expected, "空选择集返回精确空 JSON");
 
@@ -605,6 +605,736 @@ namespace
         const std::uint32_t vNewDoc = SaSelectionExport::ComputeEmbedSelectionVersion(doc2.get(), &ed2);
         Check(vNewDoc != 0u && vNewDoc != v0, "ComputeEmbedSelectionVersion: 换主图重建文档后版本号变化（防 ABA）");
     }
+
+    // ── CAD-23：带孔 / 洞内岛 / 共边孔 / 分离多外环 Hatch 净面积 ────────────────────────
+    void TestHatchNetArea()
+    {
+        auto makeRect = [](double x0, double y0, double x1, double y1) {
+            return Polyline(std::vector<Math::Point3>{
+                { x0, y0, 0 }, { x1, y0, 0 }, { x1, y1, 0 }, { x0, y1, 0 }, { x0, y0, 0 }
+            });
+        };
+
+        // 1. 外环 100 ㎡ + 内部开洞 10 ㎡ → 净面积 90 ㎡（不能错算成 110）
+        HatchEntity hatchWithHole(1, std::vector<Polyline>{
+            makeRect(0, 0, 10, 10),
+            makeRect(2, 2, 4, 7) // 2x5 = 10
+        });
+        const auto areaHole = ComputeHatchNetArea(hatchWithHole);
+        Check(areaHole.has_value() && Near(*areaHole, 90.0, 1e-3), "CAD-23: 外环 100 减洞口 10 = 90");
+
+        // 2. 外环 100 + 洞口 36 + 洞内岛 4 → 净面积 68
+        HatchEntity hatchWithIsland(2, std::vector<Polyline>{
+            makeRect(0, 0, 10, 10),
+            makeRect(2, 2, 8, 8), // 6x6 = 36
+            makeRect(4, 4, 6, 6)  // 2x2 = 4
+        });
+        const auto areaIsland = ComputeHatchNetArea(hatchWithIsland);
+        Check(areaIsland.has_value() && Near(*areaIsland, 68.0, 1e-3), "CAD-23: 外环 100 - 洞 36 + 岛 4 = 68");
+
+        // 3. 孔洞与外环共边（测试扫描线严格内点不因共边误判）
+        HatchEntity hatchSharedEdge(3, std::vector<Polyline>{
+            makeRect(0, 0, 10, 10),
+            makeRect(0, 2, 4, 6) // 4x4 = 16，左侧与外环共边 x=0
+        });
+        const auto areaShared = ComputeHatchNetArea(hatchSharedEdge);
+        Check(areaShared.has_value() && Near(*areaShared, 84.0, 1e-3), "CAD-23: 共边洞口外环 100 - 16 = 84");
+
+        // 4. 两个互不相交的外环：50 + 30 = 80
+        HatchEntity hatchDisjoint(4, std::vector<Polyline>{
+            makeRect(0, 0, 10, 5),
+            makeRect(20, 0, 26, 5)
+        });
+        const auto areaDisjoint = ComputeHatchNetArea(hatchDisjoint);
+        Check(areaDisjoint.has_value() && Near(*areaDisjoint, 80.0, 1e-3), "CAD-23: 两个独立外环 50 + 30 = 80");
+
+        // 5. 经 ExportSelectionJson 端到端校验带孔 Hatch 面积
+        Scene scene;
+        const Object::ObjectID hid = scene.NextObjectID();
+        scene.AddEntity(std::make_unique<HatchEntity>(hid, std::vector<Polyline>{
+            makeRect(0, 0, 10, 10), makeRect(2, 2, 4, 7)
+        }));
+        const std::string json = SaSelectionExport::ExportSelectionJson(scene, { hid }, nullptr, 20);
+        JsonSerializer js;
+        Check(js.Parse(json), "CAD-23: 带孔 Hatch ExportSelectionJson 合法 JSON");
+        std::size_t n = 0;
+        double exportedArea = 0.0;
+        if (js.BeginArray("items", n) && n == 1 && js.BeginElement(0))
+        {
+            js.Value("area", exportedArea);
+            js.EndElement();
+        }
+        js.EndArray();
+        Check(Near(exportedArea, 90.0, 1e-2), "CAD-23: ExportSelectionJson 输出带孔 Hatch 真实净面积 90");
+    }
+
+    // ── CAD-28 & CAD-29：大选区准确 count/scannedCount/statsTruncated 与严格 UTF-8 校验 ──
+    void TestLargeSelectionStatsAndStrictUtf8()
+    {
+        Scene scene;
+        std::unordered_set<Object::ObjectID> ids;
+        for (int i = 0; i < 120; ++i)
+        {
+            const Object::ObjectID id = scene.NextObjectID();
+            scene.AddEntity(std::make_unique<LineEntity>(
+                id, Math::Point3{ static_cast<double>(i), 0.0, 0.0 },
+                Math::Point3{ static_cast<double>(i + 1), 1.0, 0.0 }));
+            ids.insert(id);
+        }
+
+        // maxScan=50, maxItems=10 → count=120, scannedCount=50, statsTruncated=true, truncated=true
+        {
+            const std::string json = SaSelectionExport::ExportSelectionJson(scene, ids, nullptr, 10, nullptr, 50);
+            JsonSerializer js;
+            Check(js.Parse(json), "CAD-28(maxScan=50): 合法 JSON");
+            int32_t count = 0, scannedCount = 0;
+            bool truncated = false, statsTruncated = false;
+            js.Value("count", count);
+            js.Value("scannedCount", scannedCount);
+            js.Value("truncated", truncated);
+            js.Value("statsTruncated", statsTruncated);
+            std::size_t n = 0;
+            js.BeginArray("items", n);
+            js.EndArray();
+            int32_t lineTypeCount = 0;
+            if (js.BeginObject("typeCounts"))
+            {
+                js.Value("LINE", lineTypeCount);
+                js.EndObject();
+            }
+            Check(count == 120 && scannedCount == 50 && statsTruncated && truncated && n == 10 && lineTypeCount == 50,
+                  "CAD-28: count=120 精确总数, scannedCount=50, statsTruncated=true, truncated=true, items=10");
+        }
+
+        // 超 50000 默认扫描上限端到端测试
+        {
+            Scene bigScene;
+            std::unordered_set<Object::ObjectID> bigIds;
+            bigIds.reserve(50020);
+            for (int i = 0; i < 50020; ++i)
+            {
+                const Object::ObjectID id = bigScene.NextObjectID();
+                bigScene.AddEntity(std::make_unique<PointEntity>(id, Math::Point3{ static_cast<double>(i), 0.0, 0.0 }));
+                bigIds.insert(id);
+            }
+            const std::string json = SaSelectionExport::ExportSelectionJson(bigScene, bigIds, nullptr, 20);
+            JsonSerializer js;
+            Check(js.Parse(json), "CAD-28(>50000 默认上限): 合法 JSON");
+            int32_t count = 0, scannedCount = 0;
+            bool truncated = false, statsTruncated = false;
+            js.Value("count", count);
+            js.Value("scannedCount", scannedCount);
+            js.Value("truncated", truncated);
+            js.Value("statsTruncated", statsTruncated);
+            Check(count == 50020 && scannedCount == 50000 && statsTruncated && truncated,
+                  "CAD-28(>50000): 准确输出 count=50020, scannedCount=50000, statsTruncated=true");
+        }
+
+        // CAD-29：非法 UTF-8（过长编码、代理项、超 U+10FFFF、截断序列、孤立续字节）在图层名/块名/文字中全部替换为 U+FFFD
+        {
+            Scene badScene;
+            const std::string overlong2("\xC0\xAF", 2);       // 过长 '/'
+            const std::string overlong3("\xE0\x80\xAF", 3);   // 3 字节过长
+            const std::string surrogate("\xED\xA0\x80", 3);   // UTF-16 U+D800
+            const std::string tooHigh("\xF4\x90\x80\x80", 4); // U+110000
+            const std::string trunc3("\xE4\xB8", 2);          // 残缺 3 字节中文
+            const std::string badLayer = "L_" + overlong2 + "_" + surrogate;
+            const std::string badText  = "前" + overlong3 + tooHigh + trunc3 + "后";
+            const LayerID lid = badScene.GetLayerManager().AddLayer(badLayer);
+            const Object::ObjectID tid = badScene.NextObjectID();
+            auto te = std::make_unique<TextEntity>(tid, Math::Point3{ 0, 0, 0 }, badText, 10.0f);
+            te->SetLayerId(lid);
+            badScene.AddEntity(std::move(te));
+
+            const std::string json = SaSelectionExport::ExportSelectionJson(badScene, { tid }, nullptr, 20);
+            Check(IsValidUtf8(json), "CAD-29: 含过长编码/代理项/越界码点/残缺字节的 JSON 严格合法 UTF-8");
+            Check(json.find("\xEF\xBF\xBD") != std::string::npos, "CAD-29: 非法字节序列被替换为 U+FFFD");
+            JsonSerializer js;
+            Check(js.Parse(json), "CAD-29: JsonSerializer 解析替换后的 JSON 通过");
+            std::size_t n = 0;
+            std::string outText;
+            if (js.BeginArray("items", n) && n == 1 && js.BeginElement(0))
+            {
+                js.Value("text", outText);
+                js.EndElement();
+            }
+            js.EndArray();
+            Check(outText.find("前") != std::string::npos && outText.find("后") != std::string::npos,
+                  "CAD-29: 非法序列前后的合法中文字符完整保留");
+        }
+    }
+
+    // ── CAD-24：SaTextExport MINSERT 行列阵列展开 + 世界字高换算 + ATTRIB 不重复套矩阵 ──
+    void TestSaTextExportArrayAndHeight()
+    {
+        Scene scene;
+        auto blk = std::make_unique<BlockEntity>(scene.NextObjectID(), "TITLE_BLK");
+        blk->AddEntity(std::make_unique<TextEntity>(scene.NextObjectID(), Math::Point3{ 10, 20, 0 }, "ROOM", 100.0f, 0.0f));
+        blk->AddEntity(std::make_unique<MTextEntity>(
+            scene.NextObjectID(), 0, "VERTICAL", Math::Point3{ 0, 0, 0 }, 50.0, Math::HalfPI, 500.0));
+        const BlockID blkId = scene.GetBlockTable().Add(std::move(blk));
+
+        auto ins = std::make_unique<InsertEntity>(scene.NextObjectID(), blkId, "TITLE_BLK", Math::Point3{ 100, 200, 0 });
+        ins->SetScale({ 2.0, 3.0, 1.0 });
+        ins->SetArray(2, 3, 1000.0, 500.0); // 2 列 × 3 行 = 6 单元
+        ins->AddAttrib(std::make_unique<AttribEntity>(
+            scene.NextObjectID(), "NO", "A-01", Math::Point3{ 500, 600, 0 }, 80.0, 0.0));
+        scene.ResolveInsert(*ins);
+        scene.AddEntity(std::move(ins));
+
+        const std::string tsv = SaTextExport::ExportTsv(scene);
+        int textCount = 0, mtextCount = 0, attribCount = 0;
+        bool sawCell12 = false;
+        bool textHeightOk = true;
+        bool mtextHeightOk = true;
+        bool attribOk = false;
+
+        std::size_t pos = tsv.find('\n'); // 跳过表头
+        while (pos != std::string::npos && pos + 1 < tsv.size())
+        {
+            const std::size_t next = tsv.find('\n', pos + 1);
+            const std::string line = tsv.substr(pos + 1, next == std::string::npos ? std::string::npos : next - pos - 1);
+            pos = next;
+            if (line.empty()) continue;
+
+            std::vector<std::string> cols;
+            std::size_t cStart = 0;
+            while (true)
+            {
+                const std::size_t tab = line.find('\t', cStart);
+                cols.push_back(line.substr(cStart, tab == std::string::npos ? std::string::npos : tab - cStart));
+                if (tab == std::string::npos) break;
+                cStart = tab + 1;
+            }
+            if (cols.size() < 8) continue;
+            const double wx = std::stod(cols[1]);
+            const double wy = std::stod(cols[2]);
+            const double wh = std::stod(cols[3]);
+
+            if (cols[0] == "TEXT")
+            {
+                ++textCount;
+                // rot=0 字高沿局部 +Y，经 scale(2,3) 后世界字高为 100*3 = 300
+                if (!Near(wh, 300.0, 0.05))
+                    textHeightOk = false;
+                // 第 (col=1, row=2) 单元：pos=(100+1000, 200+1000)=(1100,1200)，局部 (10,20)*scale(2,3)=(20,60) → (1120,1260)
+                if (Near(wx, 1120.0, 0.1) && Near(wy, 1260.0, 0.1))
+                    sawCell12 = true;
+            }
+            else if (cols[0] == "MTEXT")
+            {
+                ++mtextCount;
+                // rot=pi/2 字高沿局部 -X，经 scale(2,3) 后世界字高为 50*2 = 100
+                if (!Near(wh, 100.0, 0.05))
+                    mtextHeightOk = false;
+            }
+            else if (cols[0] == "ATTRIB")
+            {
+                ++attribCount;
+                attribOk = Near(wx, 500.0, 0.1) && Near(wy, 600.0, 0.1) && Near(wh, 80.0, 0.05) && cols[6] == "NO" && cols[7] == "A-01";
+            }
+        }
+
+        Check(textCount == 6 && mtextCount == 6 && sawCell12, "CAD-24: MINSERT 2×3 阵列完整展开全部 6 单元");
+        Check(textHeightOk && mtextHeightOk, "CAD-24: 块内文字按变换矩阵和旋转方向准确换算世界字高");
+        Check(attribCount == 1 && attribOk, "CAD-24: ATTRIB 仅输出一次且保持世界坐标与字高不重复套本级矩阵");
+    }
+
+    // ── CAD-12 & CAD-13：纸张布局导出归属、退化批注框防 OOM、RAII 临时实体必清理 ────────
+    void TestMarkupExportPaperSpaceAndDegenerate()
+    {
+        // 1. 退化矩形与非有限坐标必须被拒绝
+        Check(!SaMarkupExport::BuildRevisionCloud(0, 0, 100, 0).has_value(), "CAD-13: 零高度退化框被拒绝");
+        Check(!SaMarkupExport::BuildRevisionCloud(0, 0, 0, 100).has_value(), "CAD-13: 零宽度退化框被拒绝");
+        Check(!SaMarkupExport::BuildRevisionCloud(10, 10, 0, 0).has_value(), "CAD-13: 反向矩形被拒绝");
+        Check(!SaMarkupExport::BuildRevisionCloud(std::numeric_limits<double>::quiet_NaN(), 0, 10, 10).has_value(), "CAD-13: NaN 坐标被拒绝");
+        Check(!SaMarkupExport::BuildRevisionCloud(0, 0, std::numeric_limits<double>::infinity(), 10).has_value(), "CAD-13: Inf 坐标被拒绝");
+
+        // 2. 极端狭长矩形云线顶点数严格受限（防 OOM / 整型溢出）
+        const auto skinny = SaMarkupExport::BuildRevisionCloud(0.0, 0.0, 1e6, 1e-3);
+        Check(skinny.has_value() && skinny->Points.size() <= static_cast<std::size_t>(SaMarkupExport::kMaxArcsPerEdge) * 4 + 1,
+              "CAD-13: 极端狭长矩形云线顶点数严格受 kMaxArcsPerEdge 上限约束");
+
+        // 3. 多纸张布局导出归属校验（CAD-12）与 RAII 清理校验（CAD-13）
+        Document doc;
+        Scene& scene = doc.GetScene();
+        DrawingLayout modelLayout;
+        modelLayout.Name  = "Model";
+        modelLayout.Model = true;
+        modelLayout.Order = 0;
+        DrawingLayout layoutA;
+        layoutA.Name     = "LayoutA";
+        layoutA.Model    = false;
+        layoutA.Order    = 1;
+        layoutA.OwnerKey = scene.NewLayoutKey();
+        DrawingLayout layoutB;
+        layoutB.Name     = "LayoutB";
+        layoutB.Model    = false;
+        layoutB.Order    = 2;
+        layoutB.OwnerKey = scene.NewLayoutKey();
+        scene.SetLayouts({ modelLayout, layoutA, layoutB });
+        scene.AddEntity(std::make_unique<LineEntity>(scene.NextObjectID(), Math::Point3{ 0, 0, 0 }, Math::Point3{ 100, 0, 0 }));
+
+        CameraState cam{};
+        Check(doc.SetActiveLayout(2, cam) && doc.ActiveLayoutIsPaper(), "CAD-12: 切换到第二个纸张布局 LayoutB");
+        const int beforeEntities = scene.EntityCount();
+        const std::size_t beforeLayers = scene.GetLayerManager().GetAllLayerIDs().size();
+
+        // 退化框导出失败且不污染场景
+        std::string err;
+        const auto badBytes = SaMarkupExport::ExportMarkupDwg(doc, { { 0, 0, 100, 0 } }, { "bad" }, err);
+        Check(badBytes.empty() && !err.empty() && scene.EntityCount() == beforeEntities,
+              "CAD-13: 退化框导出失败返回错误且不污染原场景");
+
+        // 正常框在 LayoutB 导出，验证 RAII 清理 + 读回后归属 LayoutB 而非模型空间
+        err.clear();
+        const auto dwgBytes = SaMarkupExport::ExportMarkupDwg(doc, { { 10, 20, 110, 80 } }, { "P1-NOTE" }, err);
+        Check(!dwgBytes.empty() && err.empty(), "CAD-12: 纸张布局导出批注 DWG 成功");
+        Check(scene.EntityCount() == beforeEntities && scene.GetLayerManager().GetAllLayerIDs().size() == beforeLayers,
+              "CAD-13: RAII 守卫在导出结束后完整清理临时实体与临时批注层");
+
+        Scene loaded;
+        std::string importErr;
+        Check(ImportCad(dwgBytes, loaded, &importErr), "CAD-12: 导出的批注 DWG 可正常读回");
+        uint64_t loadedLayoutBKey = 0;
+        for (const auto& l : loaded.Layouts())
+            if (!l.Model && l.Name == "LayoutB")
+                loadedLayoutBKey = l.OwnerKey;
+        Check(loadedLayoutBKey != 0, "CAD-12: 读回图纸保留目标布局 LayoutB");
+
+        bool foundCloudInLayoutB = false;
+        bool foundTextInLayoutB  = false;
+        bool anyMarkupInModel    = false;
+        loaded.ForEachObject([&](const Object& o) {
+            if (!o.IsKindOf<Entity>()) return;
+            const auto& e = static_cast<const Entity&>(o);
+            const Layer* lyr = loaded.GetLayerManager().GetLayer(e.GetLayerID());
+            if (!lyr || lyr->GetName() != SaMarkupExport::kMarkupLayerName) return;
+            if (!e.GetAttr().InPaperSpace)
+            {
+                anyMarkupInModel = true;
+                return;
+            }
+            if (e.GetAttr().LayoutKey == loadedLayoutBKey)
+            {
+                if (e.IsKindOf<PolylineEntity>()) foundCloudInLayoutB = true;
+                if (e.IsKindOf<TextEntity>() && static_cast<const TextEntity&>(e).GetText() == "P1-NOTE")
+                    foundTextInLayoutB = true;
+            }
+        });
+        Check(foundCloudInLayoutB && foundTextInLayoutB && !anyMarkupInModel,
+              "CAD-12: 导出云线与说明文字精确落入目标纸张布局 LayoutB，未掉入模型空间");
+    }
+
+    // ── CAD-02：PickPointTool 回调重入（立即重启工具 / 销毁 Editor）与取消回调重入保护 ──
+    void TestPickPointToolReentrancy()
+    {
+        // 1. onPicked 回调内立即启动第二次拾点（替换销毁第一个 PickPointTool）
+        {
+            Document doc;
+            Viewport vp(800.0f, 600.0f);
+            Editor ed;
+            ed.Bind(doc, vp);
+
+            int firstPicked = 0, secondPicked = 0;
+            ed.StartPickPointTool("p1", [&](const Math::Point3&) {
+                ++firstPicked;
+                ed.StartPickPointTool("p2", [&](const Math::Point3&) { ++secondPicked; });
+            });
+
+            InputEvent click{};
+            click.Type   = InputEventType::MouseButtonDown;
+            click.Button = MouseButton::Left;
+            click.MouseX = 100;
+            click.MouseY = 100;
+            ed.OnInput(click);
+            Check(firstPicked == 1 && ed.IsToolRunning(),
+                  "CAD-02: onPicked 重入启动新拾点工具时不崩溃且新工具保持活跃");
+
+            click.MouseX = 200;
+            ed.OnInput(click);
+            Check(secondPicked == 1 && !ed.IsToolRunning(),
+                  "CAD-02: 重入启动的第二个拾点工具可正常完成第二次拾点");
+        }
+
+        // 2. onPicked 回调内直接销毁 Editor（模拟回调里关闭对比底图）
+        {
+            Document doc;
+            Viewport vp(800.0f, 600.0f);
+            auto ed = std::make_unique<Editor>();
+            ed->Bind(doc, vp);
+
+            bool destroyed = false;
+            ed->StartPickPointTool("p1", [&](const Math::Point3&) {
+                ed->Unbind();
+                ed.reset();
+                destroyed = true;
+            });
+
+            InputEvent click{};
+            click.Type   = InputEventType::MouseButtonDown;
+            click.Button = MouseButton::Left;
+            click.MouseX = 120;
+            click.MouseY = 120;
+            ed->OnInput(click);
+            Check(destroyed && ed == nullptr, "CAD-02: onPicked 重入销毁 Editor 无 UAF 崩溃");
+        }
+
+        // 3. onCancelled 回调内重入启动新工具 / 销毁 Editor
+        {
+            Document doc;
+            Viewport vp(800.0f, 600.0f);
+            auto ed = std::make_unique<Editor>();
+            ed->Bind(doc, vp);
+
+            bool cancelRestarted = false;
+            ed->StartPickPointTool("p1", nullptr, [&]() {
+                cancelRestarted = true;
+                ed->StartPickPointTool("p2", nullptr, nullptr);
+            });
+
+            InputEvent esc{};
+            esc.Type = InputEventType::KeyDown;
+            esc.Key  = KeyCode::Escape;
+            ed->OnInput(esc);
+            Check(cancelRestarted && ed->IsToolRunning(),
+                  "CAD-02: onCancelled 重入启动新工具无 UAF 且新工具存活");
+
+            // 取消回调销毁 Editor
+            bool cancelDestroyed = false;
+            ed->StartPickPointTool("p3", nullptr, [&]() {
+                ed->Unbind();
+                ed.reset();
+                cancelDestroyed = true;
+            });
+            ed->OnInput(esc);
+            Check(cancelDestroyed && ed == nullptr, "CAD-02: onCancelled 重入销毁 Editor 无 UAF 崩溃");
+        }
+    }
+
+    // ── CAD-04：原图既有 SA-问题批注 层实体水位线保护 + 浏览态撤销/重做门禁 ─────────────
+    void TestMarkupProtectionAndUndoGate()
+    {
+        Document doc;
+        Viewport vp(800.0f, 600.0f);
+        Editor ed;
+        ed.Bind(doc, vp);
+        Scene& scene = doc.GetScene();
+
+        // 模拟原图本来就有 SA-问题批注 层及既有实体
+        const LayerID markupLayer = SaMarkupExport::EnsureMarkupLayer(scene);
+        const Object::ObjectID origId = scene.NextObjectID();
+        auto origLine = std::make_unique<LineEntity>(origId, Math::Point3{ 0, 0, 0 }, Math::Point3{ 100, 0, 0 });
+        origLine->SetLayerId(markupLayer);
+        scene.AddEntity(std::move(origLine));
+
+        // 记录既有实体水位线，启用批注保护（图层本身未锁，模拟批注态解锁 SA-问题批注 层）
+        scene.SyncNextObjectID();
+        scene.SetProtectedEntityWatermark(scene.PeekNextObjectID());
+
+        // 本会话新建批注实体（ID >= 水位线）
+        const Object::ObjectID newId = scene.NextObjectID();
+        auto newLine = std::make_unique<LineEntity>(newId, Math::Point3{ 0, 50, 0 }, Math::Point3{ 100, 50, 0 });
+        newLine->SetLayerId(markupLayer);
+        doc.GetCommandStack().Execute(std::make_unique<AddEntityCommand>(std::move(newLine)), scene);
+
+        Check(scene.IsEntityLocked(*scene.GetEntity(origId)),
+              "CAD-04: 原图既有 SA-问题批注 层实体受水位线保护被锁定");
+        Check(!scene.IsEntityLocked(*scene.GetEntity(newId)),
+              "CAD-04: 本会话新建批注实体不受水位线阻拦可编辑");
+
+        // 即使强行将两者放入选择集再 DeleteSelected，也只删除新建实体、原图既有实体完好无损
+        ed.SetSelection({ origId, newId });
+        ed.DeleteSelected();
+        Check(scene.Has(origId) && !scene.Has(newId),
+              "CAD-04: DeleteSelected 跳过原图既有 SA-问题批注 实体，仅删除新建批注");
+
+        // 浏览态撤销/重做门禁：拦截带额外修饰键的 Ctrl+Shift+Z / Ctrl+Shift+Y
+        struct GateReset { ~GateReset() { CommandStack::SetUndoRedoGate(nullptr); } } resetGate;
+        CommandStack::SetUndoRedoGate([](const ICommand&, bool) { return false; });
+        Check(!doc.CanUndo() && !doc.CanRedo(), "CAD-04: 浏览态 UndoRedoGate 拦截 CanUndo/CanRedo");
+
+        InputEvent ctrlShiftZ{};
+        ctrlShiftZ.Type      = InputEventType::KeyDown;
+        ctrlShiftZ.Key       = KeyCode::Z;
+        ctrlShiftZ.Modifiers = static_cast<uint8_t>(ModifierKey::Ctrl) | static_cast<uint8_t>(ModifierKey::Shift);
+        ed.OnInput(ctrlShiftZ);
+        Check(!scene.Has(newId), "CAD-04: 浏览态下 Ctrl+Shift+Z 无法绕过门禁撤销删除");
+
+        // 放开门禁后撤销生效
+        CommandStack::SetUndoRedoGate(nullptr);
+        Check(doc.CanUndo(), "CAD-04: 解除门禁后 CanUndo 恢复");
+        ed.OnInput(ctrlShiftZ);
+        Check(scene.Has(newId), "CAD-04: 解除门禁后撤销可正常恢复实体");
+    }
+
+    // ── CAD-07 / CAD-08 / CAD-27 / CAD-32：对比底片满覆盖、隐藏主图裁剪与拾取、显式释放与捕捉刷新 ──
+    void TestCompareViewportPickingAndSnapRefresh()
+    {
+        class MockTarget final : public IRenderTarget
+        {
+        public:
+            MockTarget(int w = 800, int h = 600) : m_w(w), m_h(h) {}
+            void  Create(int w, int h) override { m_w = w; m_h = h; }
+            void  Resize(int w, int h) override { m_w = w; m_h = h; }
+            void  Release() override { m_w = 0; m_h = 0; }
+            int   GetWidth() const override { return m_w; }
+            int   GetHeight() const override { return m_h; }
+            void* GetNativeHandle() const override { return nullptr; }
+            void* GetNativeShaderResource() const override { return nullptr; }
+        private:
+            int m_w = 0, m_h = 0;
+        };
+
+        class MockRenderer final : public IRenderer
+        {
+        public:
+            int  fullCoveragePasses   = 0;
+            int  selDraws             = 0;
+            bool selDrawHadSplitClip  = false;
+            int  splitClipMaxWidth    = 0;
+
+            void BeginFrame(IRenderTarget& target, const ViewportDesc&) override
+            {
+                m_curTarget  = &target;
+                m_paintStyle = {};
+                m_scissor    = {};
+            }
+            void EndFrame() override { m_curTarget = nullptr; }
+            void Submit(std::span<const Vertex_P3_C4> verts, const Math::Mat4&, PrimitiveType, bool, bool) override
+            {
+                if (!verts.empty() && m_paintStyle.FullCoverage)
+                    ++fullCoveragePasses;
+            }
+            void SubmitTextured(std::span<const Vertex_P3_C4_UV>, const Math::Mat4&, void*, bool, bool) override {}
+            void SubmitCached(uint32_t slot, uint64_t, std::span<const Vertex_P3_C4> verts, const Math::Mat4&, PrimitiveType, bool, bool) override
+            {
+                if (m_paintStyle.FullCoverage && !verts.empty())
+                    ++fullCoveragePasses;
+                // kSlotSelFill=3, kSlotSel=4, kSlotGripFill=15, kSlotGrip=16
+                if ((slot == 3 || slot == 4 || slot == 15 || slot == 16) && !verts.empty())
+                {
+                    ++selDraws;
+                    if (m_scissor.Enabled)
+                    {
+                        selDrawHadSplitClip = true;
+                        splitClipMaxWidth   = m_scissor.Width;
+                    }
+                }
+            }
+            std::unique_ptr<IRenderTarget> CreateLayerTarget() override { return std::make_unique<MockTarget>(800, 600); }
+            bool CompositeCompareLayers(IRenderTarget&, IRenderTarget&, const CompareCompositeStyle&) override { return true; }
+            void SetPaintStyle(const PaintStyle& s) override { m_paintStyle = s; }
+            void SetScissorRect(const ScissorRect& r) override { m_scissor = r; }
+            void* GetNativeDevice() override { return nullptr; }
+
+        private:
+            IRenderTarget* m_curTarget = nullptr;
+            PaintStyle     m_paintStyle{};
+            ScissorRect    m_scissor{};
+        };
+
+        MockRenderer renderer;
+        MockTarget   screenTarget(800, 600);
+        Viewport     vp(800.0f, 600.0f);
+
+        std::vector<Vertex_P3_C4> mainSceneVerts{
+            { { 0, 0, 0 }, { 1, 1, 1, 0.5f } },
+            { { 10, 0, 0 }, { 1, 1, 1, 0.5f } },
+        };
+        std::vector<Vertex_P3_C4> mainSelVerts{
+            { { 0, 0, 0 }, { 0, 0.5f, 1, 1 } },
+            { { 10, 0, 0 }, { 0, 0.5f, 1, 1 } },
+        };
+        std::vector<GripDraw> mainGrips{
+            { { 0, 0 }, GripDraw::Type::Start, false },
+        };
+        ViewState mainVs{};
+        mainVs.SceneVersion = 1;
+        mainVs.Scene        = mainSceneVerts;
+        mainVs.SelVersion   = 1;
+        mainVs.SelScene     = mainSelVerts;
+        mainVs.Grips        = mainGrips;
+
+        std::vector<Vertex_P3_C4> compSceneVerts{
+            { { 0, 0, 0 }, { 1, 1, 1, 1.0f } },
+            { { 10, 0, 0 }, { 1, 1, 1, 1.0f } },
+        };
+        ViewState compVs{};
+        compVs.SceneVersion = 2;
+        compVs.Scene        = compSceneVerts;
+
+        CompareRenderPass cp{};
+        cp.State = &compVs;
+        cp.Mode  = CompareDisplayMode::Blend;
+
+        // CAD-07 & CAD-27：Blend 绘制双底片启用 FullCoverage，且 ReleaseCompareLayers 立即释放双底片
+        vp.Render(renderer, screenTarget, mainVs, &cp);
+        Check(renderer.fullCoveragePasses >= 2, "CAD-07: 三态对比双底片渲染开启 PaintStyle::FullCoverage 抵消锁层淡显");
+        Check(vp.HasCompareLayers(), "CAD-27: 三态对比后双底片已按需创建");
+        vp.ReleaseCompareLayers();
+        Check(!vp.HasCompareLayers(), "CAD-27: ReleaseCompareLayers 显式释放双底片渲染目标");
+
+        // CAD-08：CompareOnly 隐藏主图时不绘制任何主图选中高亮/夹点
+        renderer.selDraws = 0;
+        cp.Mode = CompareDisplayMode::CompareOnly;
+        vp.Render(renderer, screenTarget, mainVs, &cp);
+        Check(renderer.selDraws == 0, "CAD-08: CompareOnly 模式隐藏主图选中高亮与夹点覆盖层");
+
+        // CAD-08：Split 模式下主图选中高亮/夹点被 ScissorRect 限制在 [0, SplitX)
+        renderer.selDraws            = 0;
+        renderer.selDrawHadSplitClip = false;
+        renderer.splitClipMaxWidth   = 0;
+        cp.Mode   = CompareDisplayMode::Split;
+        cp.SplitX = 320;
+        vp.Render(renderer, screenTarget, mainVs, &cp);
+        Check(renderer.selDraws > 0 && renderer.selDrawHadSplitClip && renderer.splitClipMaxWidth == 320,
+              "CAD-08: Split 模式将主图选中高亮与夹点裁剪到卷帘主图侧 [0, 320)");
+
+        // CAD-08 拾取与全视口平移缩放 + CAD-32 无溢出悬停刷新捕捉
+        Document doc;
+        Viewport pickVp(800.0f, 600.0f);
+        pickVp.GetCamera().SetState(CameraState{ { 0.0, 0.0, 0.0 }, 600.0, -90.0, 90.0 });
+        Editor ed;
+        ed.Bind(doc, pickVp);
+
+        // 左侧点（世界 x=-200 → 屏幕 x=200）和右侧点（世界 x=+200 → 屏幕 x=600）
+        const Object::ObjectID leftId  = doc.GetScene().NextObjectID();
+        const Object::ObjectID rightId = doc.GetScene().NextObjectID();
+        doc.GetScene().AddEntity(std::make_unique<PointEntity>(leftId,  Math::Point3{ -200.0, 0.0, 0.0 }));
+        doc.GetScene().AddEntity(std::make_unique<PointEntity>(rightId, Math::Point3{  200.0, 0.0, 0.0 }));
+
+        const Math::Point2 leftScr  = pickVp.GetCamera().WorldToScreen({ -200.0, 0.0, 0.0 });
+        const Math::Point2 rightScr = pickVp.GetCamera().WorldToScreen({  200.0, 0.0, 0.0 });
+        const int splitPx = static_cast<int>(std::round(0.5 * (leftScr.x + rightScr.x)));
+
+        ed.SetPickClipX(true, 0.0, static_cast<double>(splitPx));
+
+        auto clickAt = [&](int sx, int sy) {
+            InputEvent dn{};
+            dn.Type = InputEventType::MouseButtonDown; dn.Button = MouseButton::Left;
+            dn.MouseX = dn.PressMouseX = sx; dn.MouseY = dn.PressMouseY = sy;
+            ed.OnInput(dn);
+            InputEvent up = dn; up.Type = InputEventType::MouseButtonUp;
+            ed.OnInput(up);
+        };
+        clickAt(static_cast<int>(std::round(rightScr.x)), static_cast<int>(std::round(rightScr.y)));
+        Check(ed.GetSelection().empty(), "CAD-08: 卷帘副图侧点击不能选中隐藏的主图实体");
+
+        clickAt(static_cast<int>(std::round(leftScr.x)), static_cast<int>(std::round(leftScr.y)));
+        Check(ed.GetSelection().size() == 1 && ed.GetSelection().count(leftId) == 1,
+              "CAD-08: 卷帘主图侧点击可正常选中主图实体");
+
+        // 从主图侧拖框跨越卷帘到副图侧：只选中主图侧实体，不选中副图侧隐藏实体
+        ed.SetSelection({});
+        {
+            InputEvent dn{};
+            dn.Type = InputEventType::MouseButtonDown; dn.Button = MouseButton::Left;
+            dn.MouseX = dn.PressMouseX = static_cast<int>(leftScr.x) - 30;
+            dn.MouseY = dn.PressMouseY = static_cast<int>(leftScr.y) - 30;
+            ed.OnInput(dn);
+            InputEvent mv = dn;
+            mv.Type = InputEventType::MouseMove;
+            mv.MouseX = static_cast<int>(rightScr.x) + 30;
+            mv.MouseY = static_cast<int>(rightScr.y) + 30;
+            ed.OnInput(mv);
+            InputEvent up = mv;
+            up.Type = InputEventType::MouseButtonUp;
+            ed.OnInput(up);
+        }
+        Check(ed.GetSelection().size() == 1 && ed.GetSelection().count(leftId) == 1 && ed.GetSelection().count(rightId) == 0,
+              "CAD-08: 跨卷帘框选仅命中主图可见侧实体，不命中隐藏副图侧实体");
+
+        // CompareOnly（全隐藏）下仍允许全视口滚轮缩放与中键平移
+        ed.SetPickClipX(true, 0.0, 0.0);
+        const double zoomBefore = pickVp.GetCamera().GetState().Zoom;
+        InputEvent wheel{};
+        wheel.Type = InputEventType::MouseWheel;
+        wheel.MouseX = 600; wheel.MouseY = 300;
+        wheel.WheelDelta = 1.0f;
+        ed.OnInput(wheel);
+        Check(pickVp.GetCamera().GetState().Zoom != zoomBefore, "CAD-08: 隐藏主图时全视口滚轮缩放仍正常生效");
+
+        // CAD-32：RefreshHoverSnap 刷新捕捉且不改变相机状态
+        const CameraState camSnapBefore = pickVp.GetCamera().GetState();
+        ed.RefreshHoverSnap(static_cast<int>(std::round(leftScr.x)), static_cast<int>(std::round(leftScr.y)),
+                            static_cast<uint8_t>(ModifierKey::Shift));
+        const CameraState camSnapAfter = pickVp.GetCamera().GetState();
+        Check(Near(camSnapBefore.Target.x, camSnapAfter.Target.x, 1e-9)
+              && Near(camSnapBefore.Target.y, camSnapAfter.Target.y, 1e-9)
+              && Near(camSnapBefore.Zoom, camSnapAfter.Zoom, 1e-9),
+              "CAD-32: RefreshHoverSnap 刷新捕捉不污染相机且无 INT_MIN 溢出");
+    }
+
+    // ── CAD-09 & CAD-10：SnapEngine 密集块交点预算 + 斜切仿射正交性校验 ──────────────
+    void TestSnapBudgetAndShearOrthogonality()
+    {
+        // CAD-10：斜切等长基向量（lx == ly == 1 但不垂直）的嵌套块内圆，不能按等比圆误判捕捉
+        {
+            Scene scene;
+            auto innerBlk = std::make_unique<BlockEntity>(scene.NextObjectID(), "INNER_CIRCLE");
+            innerBlk->AddEntity(std::make_unique<CircleEntity>(scene.NextObjectID(), Math::Point3{ 0, 0, 0 }, 100.0));
+            const BlockID innerId = scene.GetBlockTable().Add(std::move(innerBlk));
+
+            auto outerBlk = std::make_unique<BlockEntity>(scene.NextObjectID(), "OUTER_ROT");
+            auto innerIns = std::make_unique<InsertEntity>(scene.NextObjectID(), innerId, "INNER_CIRCLE", Math::Point3{ 0, 0, 0 });
+            innerIns->SetRotation(Math::PI / 4.0); // 45° 旋转
+            innerIns->SetBlock(scene.GetBlockTable().Find(innerId));
+            outerBlk->AddEntity(std::move(innerIns));
+            const BlockID outerId = scene.GetBlockTable().Add(std::move(outerBlk));
+
+            // 外层非等比缩放 (2, 1) 套内层 45° 旋转：两个基向量等长 sqrt(2.5) 但夹角非 90°（斜切！）
+            auto outerIns = std::make_unique<InsertEntity>(scene.NextObjectID(), outerId, "OUTER_ROT", Math::Point3{ 0, 0, 0 });
+            outerIns->SetScale({ 2.0, 1.0, 1.0 });
+            scene.ResolveInsert(*outerIns);
+            scene.AddEntity(std::move(outerIns));
+
+            Camera cam(800.0f, 600.0f);
+            cam.SetState(CameraState{ { 0.0, 0.0, 0.0 }, 600.0, -90.0, 90.0 });
+            SnapEngine snap;
+            snap.SetEnableSnap(true);
+            snap.SetSnapModes(static_cast<uint32_t>(SnapMode::Quadrant));
+            snap.SetSnapRadiusPx(5.0);
+
+            // 若误判为等比圆，其半径会被算成 100*sqrt(2.5)≈158.11，导致象限点落到 (0, 158.11)；
+            // 实际椭圆在 y 轴上最高点仅为 (0, 100)！因此 (0, 158.11) 绝不应命中象限捕捉。
+            const Math::Point2 falseQuadSp = cam.WorldToScreen({ 0.0, 100.0 * std::sqrt(2.5), 0.0 });
+            const SnapResult r = snap.Query(falseQuadSp, scene, cam);
+            Check(!r.IsValid(), "CAD-10: 斜切等长基向量不被误判为等比圆，不会捕捉到图外假象限点");
+        }
+
+        // CAD-09：大型块含 1500 条交错线，交点捕捉受叶节点与 64 条最近曲线预算约束，不阻塞界面
+        {
+            Scene scene;
+            auto denseBlk = std::make_unique<BlockEntity>(scene.NextObjectID(), "DENSE_XREF");
+            for (int i = 0; i < 750; ++i)
+            {
+                const double d = static_cast<double>(i) * 0.01;
+                denseBlk->AddEntity(std::make_unique<LineEntity>(
+                    scene.NextObjectID(), Math::Point3{ -100.0, d, 0.0 }, Math::Point3{ 100.0, d, 0.0 }));
+                denseBlk->AddEntity(std::make_unique<LineEntity>(
+                    scene.NextObjectID(), Math::Point3{ d, -100.0, 0.0 }, Math::Point3{ d, 100.0, 0.0 }));
+            }
+            const BlockID blkId = scene.GetBlockTable().Add(std::move(denseBlk));
+            auto ins = std::make_unique<InsertEntity>(scene.NextObjectID(), blkId, "DENSE_XREF", Math::Point3{ 0, 0, 0 });
+            scene.ResolveInsert(*ins);
+            scene.AddEntity(std::move(ins));
+
+            Camera cam(800.0f, 600.0f);
+            cam.SetState(CameraState{ { 0.0, 0.0, 0.0 }, 600.0, -90.0, 90.0 });
+            SnapEngine snap;
+            snap.SetEnableSnap(true);
+            snap.SetSnapModes(static_cast<uint32_t>(SnapMode::Intersection));
+            snap.SetSnapRadiusPx(15.0);
+
+            const auto t0 = std::chrono::steady_clock::now();
+            const SnapResult r = snap.Query(cam.WorldToScreen({ 0.0, 0.0, 0.0 }), scene, cam);
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            Check(r.IsValid() && r.SnapType == SnapResult::Type::Intersection && ms < 2000,
+                  "CAD-09: 1500 线密集块交点捕捉在预算内快速收敛并命中有效交点");
+        }
+    }
 }
 
 int RunSaSelectionExportTests()
@@ -617,5 +1347,13 @@ int RunSaSelectionExportTests()
     TestTruncationAndClamping();
     TestUtf8AndJsonEscaping();
     TestSelectionVersionAndLayout();
+    TestHatchNetArea();
+    TestLargeSelectionStatsAndStrictUtf8();
+    TestSaTextExportArrayAndHeight();
+    TestMarkupExportPaperSpaceAndDegenerate();
+    TestPickPointToolReentrancy();
+    TestMarkupProtectionAndUndoGate();
+    TestCompareViewportPickingAndSnapRefresh();
+    TestSnapBudgetAndShearOrthogonality();
     return g_failures;
 }
