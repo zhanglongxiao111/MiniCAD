@@ -766,16 +766,39 @@ namespace MiniCAD
         return true;
     }
 
-    std::vector<std::uint8_t> MainFrame::EmbedExportMarkupDwg(const std::vector<std::array<double, 4>>& rects, const std::vector<std::string>& labels, std::string& error)
+    void MainFrame::EraseEmbedMarkupStateForDoc(uint64_t docId)
     {
-        Document* doc = m_docManager.GetActive();
+        m_embedSavedLocks.erase(docId);
+        m_embedDocWatermark.erase(docId);
+        m_embedMarkupCleanSnapshot.erase(docId);
+        std::erase_if(m_pendingEmbedMarkupSnapshots,
+            [docId](const PendingEmbedMarkupSnapshot& entry) { return entry.docId == docId; });
+        if (m_embedMarkupDirtyCache.docId == docId)
+            m_embedMarkupDirtyCache.valid = false;
+    }
+
+    std::vector<std::uint8_t> MainFrame::EmbedExportMarkupDwg(const std::vector<std::array<double, 4>>& rects, const std::vector<std::string>& labels, std::string& error, std::uint32_t* outToken)
+    {
+        if (outToken)
+            *outToken = 0;
+        Document* doc = m_docManager.GetMainDocument();
         if (!doc)
         {
             error = Tr("没有打开的图纸");
             return {};
         }
+        // 导出前确保该文档的批注水位线已初始化（避免导出时首次落临时云线推移水位线）
+        const uint64_t docId = doc->InstanceID();
+        auto wmIt = m_embedDocWatermark.find(docId);
+        if (wmIt == m_embedDocWatermark.end())
+        {
+            doc->GetScene().SyncNextObjectID();
+            wmIt = m_embedDocWatermark.emplace(docId, doc->GetScene().PeekNextObjectID()).first;
+        }
+        const Object::ObjectID watermark = wmIt->second;
+
         // 导出时把锁定状态还原成原图配置，无论成功或异常均由作用域守卫恢复批注锁定与重绘
-        const bool relock = m_embedSavedLocks.count(doc->InstanceID()) > 0;
+        const bool relock = m_embedSavedLocks.count(docId) > 0;
         EmbedRestoreLocks(*doc);
         struct RelockGuard
         {
@@ -789,7 +812,24 @@ namespace MiniCAD
                 self.RequestRenderAll();
             }
         } relockGuard{ *this, *doc, relock };
-        return SaMarkupExport::ExportMarkupDwg(*doc, rects, labels, error);
+
+        std::vector<std::uint8_t> bytes = SaMarkupExport::ExportMarkupDwg(*doc, rects, labels, error);
+        if (bytes.empty())
+            return {};
+
+        // 临时云线已由 SaMarkupExport::ExportMarkupDwg 内部 RAII 清理，立即冻结当次入盘批注快照并签发正整数令牌
+        std::uint32_t token = m_nextEmbedMarkupToken;
+        if (token == 0)
+            token = 1;
+        m_nextEmbedMarkupToken = (token == std::numeric_limits<std::uint32_t>::max()) ? 1u : (token + 1u);
+        while (m_pendingEmbedMarkupSnapshots.size() >= kMaxPendingMarkupTokens)
+            m_pendingEmbedMarkupSnapshots.pop_front();
+        m_pendingEmbedMarkupSnapshots.push_back(PendingEmbedMarkupSnapshot{
+            token, docId, ComputeMarkupSnapshot(*doc, watermark)
+        });
+        if (outToken)
+            *outToken = token;
+        return bytes;
     }
 
     bool MainFrame::EmbedHasMarkupChanges() const
@@ -825,24 +865,26 @@ namespace MiniCAD
         return dirty;
     }
 
-    void MainFrame::EmbedMarkMarkupClean()
+    bool MainFrame::EmbedMarkMarkupClean(std::uint32_t token)
     {
+        if (token == 0)
+            return false;
         Document* doc = m_docManager.GetMainDocument();
         if (!doc)
-            return;
+            return false;
         const uint64_t docId = doc->InstanceID();
-        auto wmIt = m_embedDocWatermark.find(docId);
-        if (wmIt == m_embedDocWatermark.end())
-        {
-            doc->GetScene().SyncNextObjectID();
-            wmIt = m_embedDocWatermark.emplace(docId, doc->GetScene().PeekNextObjectID()).first;
-        }
-        m_embedMarkupCleanSnapshot[docId] = ComputeMarkupSnapshot(*doc, wmIt->second);
+        const auto it = std::find_if(
+            m_pendingEmbedMarkupSnapshots.begin(),
+            m_pendingEmbedMarkupSnapshots.end(),
+            [token](const PendingEmbedMarkupSnapshot& entry) { return entry.token == token; });
+        if (it == m_pendingEmbedMarkupSnapshots.end() || it->docId != docId)
+            return false;
+
+        m_embedMarkupCleanSnapshot[docId] = std::move(it->snapshot);
+        m_pendingEmbedMarkupSnapshots.erase(it);
         ++m_embedMarkupBaselineRev;
-        m_embedMarkupDirtyCache = EmbedMarkupDirtyCache{
-            docId, doc->GetScene().GeometryVersion(), doc->GetScene().DisplayVersion(),
-            wmIt->second, m_embedMarkupBaselineRev, false, true
-        };
+        m_embedMarkupDirtyCache.valid = false;
+        return true;
     }
 
     std::vector<std::pair<std::string, std::string>> MainFrame::EmbedListXrefs() const
@@ -1122,9 +1164,7 @@ namespace MiniCAD
             const uint64_t docId = doc->InstanceID();
             if (m_buildDoc == doc)
                 m_buildDoc = nullptr;
-            m_embedSavedLocks.erase(docId);
-            m_embedDocWatermark.erase(docId);
-            m_embedMarkupCleanSnapshot.erase(docId);
+            EraseEmbedMarkupStateForDoc(docId);
             m_knownDocIds.erase(docId);
             m_nodeHistory.erase(doc);
             m_xrefMissingDocs.erase(std::remove(m_xrefMissingDocs.begin(), m_xrefMissingDocs.end(), docId), m_xrefMissingDocs.end());
@@ -1422,6 +1462,18 @@ namespace MiniCAD
         editor.OnInput(esc);
     }
 
+    bool MainFrame::IsPickSessionCurrent(const PickPointSession& session) const
+    {
+        if (session.silentAbandon)
+            return false;
+        if (session.target != 0 && session.target != 1)
+            return false;
+        if (session.allGen != m_pickAllGen
+            || session.targetGen != m_pickTargetGen[static_cast<size_t>(session.target)])
+            return false;
+        return IsPickTargetAlive(session.target, session.docId);
+    }
+
     void MainFrame::SettlePickSession(const std::shared_ptr<PickPointSession>& session, bool picked, double wx, double wy)
     {
         if (!session || session->settled)
@@ -1442,7 +1494,7 @@ namespace MiniCAD
         session->onPicked    = nullptr;
         session->onCancelled = nullptr;
 
-        if (session->silentAbandon || !IsPickTargetAlive(session->target, session->docId))
+        if (!IsPickSessionCurrent(*session))
             return;
 
         if (picked)
@@ -1451,7 +1503,7 @@ namespace MiniCAD
             {
                 DispatchPickCallback([this, session, wx, wy, cb = std::move(onPicked)]()
                 {
-                    if (session->silentAbandon || !IsPickTargetAlive(session->target, session->docId))
+                    if (!IsPickSessionCurrent(*session))
                         return;
                     cb(session->seq, wx, wy);
                 });
@@ -1461,7 +1513,7 @@ namespace MiniCAD
         {
             DispatchPickCallback([this, session, cb = std::move(onCancelled)]()
             {
-                if (session->silentAbandon || !IsPickTargetAlive(session->target, session->docId))
+                if (!IsPickSessionCurrent(*session))
                     return;
                 cb(session->seq);
             });
@@ -1470,6 +1522,17 @@ namespace MiniCAD
 
     void MainFrame::AbandonPickPointSilently(int onlyTarget)
     {
+        if (onlyTarget < 0)
+        {
+            ++m_pickAllGen;
+            ++m_pickTargetGen[0];
+            ++m_pickTargetGen[1];
+        }
+        else if (onlyTarget == 0 || onlyTarget == 1)
+        {
+            ++m_pickTargetGen[static_cast<size_t>(onlyTarget)];
+        }
+
         auto session = m_activePickSession;
         if (!session)
             return;
@@ -1510,6 +1573,8 @@ namespace MiniCAD
         session->seq            = seq;
         session->target         = target;
         session->docId          = docId;
+        session->allGen         = m_pickAllGen;
+        session->targetGen      = m_pickTargetGen[static_cast<size_t>(target)];
         session->restoreSnapOff = !editor->IsSnapEnabled();
         session->onPicked       = std::move(onPicked);
         session->onCancelled    = std::move(onCancelled);
@@ -2543,9 +2608,7 @@ namespace MiniCAD
                     if (i >= 0 && n > 1)
                         m_docManager.SetActive(reinterpret_cast<Document*>(tabs->GetTabData(i + 1 < n ? i + 1 : i - 1)));
                 }
-            m_embedSavedLocks.erase(closedId);
-            m_embedDocWatermark.erase(closedId);
-            m_embedMarkupCleanSnapshot.erase(closedId);
+            EraseEmbedMarkupStateForDoc(closedId);
             m_knownDocIds.erase(closedId);
             m_xrefMissingDocs.erase(std::remove(m_xrefMissingDocs.begin(), m_xrefMissingDocs.end(), closedId), m_xrefMissingDocs.end());
             m_docManager.Close(doc);            // 文档窗口的窗格空了就删掉，窗口在 SyncDocuments 里关掉（推迟到下一帧销毁）

@@ -120,6 +120,11 @@ namespace MiniCAD::SaTool
         {
             if (mtimeOk) *mtimeOk = false;
             const std::filesystem::path p = Utf8ToPath(utf8Path);
+            if (TryStatFileVersion(p, sizeBytes, mtimeMs))
+            {
+                if (mtimeOk) *mtimeOk = true;
+                return true;
+            }
             std::error_code ec;
             if (!std::filesystem::exists(p, ec) || ec)
             {
@@ -137,15 +142,7 @@ namespace MiniCAD::SaTool
                 if (error) *error = "无法读取源文件大小：" + utf8Path;
                 return false;
             }
-            const auto ftime = std::filesystem::last_write_time(p, ec);
-            if (ec)
-            {
-                mtimeMs = 0;
-                return true;
-            }
-            const auto sysTime = std::chrono::clock_cast<std::chrono::system_clock>(ftime);
-            mtimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(sysTime.time_since_epoch()).count();
-            if (mtimeOk) *mtimeOk = true;
+            mtimeMs = 0;
             return true;
         }
 
@@ -354,16 +351,12 @@ namespace MiniCAD::SaTool
                 {
                 case CadSemanticSnapshot::XrefLoadStatus::Loaded:
                 {
-                    uint64_t sz = 0;
-                    int64_t  mt = 0;
-                    bool     mtOk = false;
-                    // 仅当导入器成功加载且块非未解析状态、且取得有效文件大小与时间戳时才标记 resolved
-                    if (!b.Unresolved && !lr.ResolvedPath.empty()
-                        && GetFileStats(lr.ResolvedPath, sz, mt, nullptr, &mtOk) && mtOk)
+                    // 直接消费导入器读取窗口前后双 stat 核验后的版本指纹（CAD-R3-04），严禁事后重探磁盘
+                    if (!b.Unresolved && !lr.ResolvedPath.empty() && lr.VersionVerified)
                     {
                         rec.Status    = "resolved";
-                        rec.SizeBytes = sz;
-                        rec.MtimeMs   = mt;
+                        rec.SizeBytes = lr.SizeBytes;
+                        rec.MtimeMs   = lr.MtimeMs;
                     }
                     else
                     {
@@ -388,9 +381,9 @@ namespace MiniCAD::SaTool
             return deps;
         }
 
-        std::string SerializeXrefDepsV1(const std::vector<XrefDepRecord>& deps)
+        std::string SerializeXrefDepsV2(const std::vector<XrefDepRecord>& deps)
         {
-            std::string out = "v1:" + std::to_string(deps.size());
+            std::string out = "v2:" + std::to_string(deps.size());
             for (const auto& d : deps)
             {
                 out.push_back('\n');
@@ -427,9 +420,9 @@ namespace MiniCAD::SaTool
             return jw.Take();
         }
 
-        bool ParseAndVerifyXrefDepsV1(const std::string& encoded, const std::filesystem::path& currentHostDir)
+        bool ParseAndVerifyXrefDepsV2(const std::string& encoded, const std::filesystem::path& currentHostDir)
         {
-            if (encoded.rfind("v1:", 0) != 0)
+            if (encoded.rfind("v2:", 0) != 0)
                 return false;
 
             std::vector<std::string> lines;
@@ -535,8 +528,7 @@ namespace MiniCAD::SaTool
 
                     uint64_t curSize = 0;
                     int64_t  curMtime = 0;
-                    bool curMtimeOk = false;
-                    if (!GetFileStats(nowUtf8, curSize, curMtime, nullptr, &curMtimeOk) || !curMtimeOk)
+                    if (!TryStatFileVersion(nowFound, curSize, curMtime))
                         return false;
                     if (curSize != expectedSize || curMtime != expectedMtime)
                         return false;
@@ -1423,7 +1415,7 @@ CREATE INDEX idx_tch_axes_label ON tch_axes(label);
                 getStr("source_size_bytes") == std::to_string(sourceSizeBytes) &&
                 getStr("source_mtime_ms") == std::to_string(sourceMtimeMs) &&
                 sourcePathMatch &&
-                ParseAndVerifyXrefDepsV1(getStr("xref_deps_v1"), currentHostDir);
+                ParseAndVerifyXrefDepsV2(getStr("xref_deps_v2"), currentHostDir);
 
             if (!match)
                 return false;
@@ -2498,9 +2490,9 @@ CREATE INDEX idx_tch_axes_label ON tch_axes(label);
             skippedJw.EndArray();
             xrefJw.EndArray();
 
-            // 10. 写入 meta 键值表（含 CAD-21 / CAD-R2-08 导出选项与导入器单趟外参依赖指纹）
+            // 10. 写入 meta 键值表（含 CAD-21 / CAD-R2-08 / CAD-R3-04 导出选项与导入窗口外参依赖指纹 v2）
             const std::vector<XrefDepRecord> xrefDeps = CollectXrefDependencies(scene, snap);
-            const std::string xrefDepsV1   = SerializeXrefDepsV1(xrefDeps);
+            const std::string xrefDepsV2   = SerializeXrefDepsV2(xrefDeps);
             const std::string xrefDepsJson = FormatXrefDepsJson(xrefDeps);
 
             const bool isNativeTch = snap.TchObjectCount > 0 ||
@@ -2529,7 +2521,7 @@ CREATE INDEX idx_tch_axes_label ON tch_axes(label);
                 ok = ok && put("source_size_bytes", std::to_string(sourceSizeBytes));
                 ok = ok && put("source_mtime_ms", std::to_string(sourceMtimeMs));
                 ok = ok && put("include_block_entities", includeBlockEntities ? "1" : "0");
-                ok = ok && put("xref_deps_v1", xrefDepsV1);
+                ok = ok && put("xref_deps_v2", xrefDepsV2);
                 ok = ok && put("xref_deps_json", xrefDepsJson);
                 ok = ok && put("exported_at_utc", CurrentUtcIso8601());
                 ok = ok && put("format", result.Format);
@@ -2621,15 +2613,55 @@ CREATE INDEX idx_tch_axes_label ON tch_axes(label);
             }
         }
 
-        Scene scene;
+        // CAD-R3-04：加载宿主图纸前后复核 (size, mtime)，避免加载窗口内宿主文件变更导致旧几何签上新指纹
+        std::unique_ptr<Scene> scene;
         CadSemanticSnapshot snap;
-        if (!LoadCadFileWithSemantics(opts.InputPath, scene, snap, error))
+        bool hostStable = false;
+        const std::filesystem::path inputFs = Utf8ToPath(opts.InputPath);
+        for (int attempt = 0; attempt < 2; ++attempt)
         {
+            if (attempt > 0)
+            {
+                if (!GetFileStats(opts.InputPath, sizeBytes, mtimeMs, error, &mtimeOk))
+                {
+                    if (errorCode) *errorCode = "LOAD_FAILED";
+                    return false;
+                }
+            }
+            scene = std::make_unique<Scene>();
+            snap  = CadSemanticSnapshot{};
+            if (!LoadCadFileWithSemantics(opts.InputPath, *scene, snap, error))
+            {
+                if (errorCode) *errorCode = "LOAD_FAILED";
+                return false;
+            }
+            uint64_t postSize = 0;
+            int64_t  postMtime = 0;
+            const bool postOk = TryStatFileVersion(inputFs, postSize, postMtime);
+            if (mtimeOk && postOk && postSize == sizeBytes && postMtime == mtimeMs)
+            {
+                hostStable = true;
+                break;
+            }
+            if (!mtimeOk && !postOk)
+            {
+                std::error_code szEc;
+                const auto curSz = std::filesystem::file_size(inputFs, szEc);
+                if (!szEc && curSz == sizeBytes)
+                {
+                    hostStable = true;
+                    break;
+                }
+            }
+        }
+        if (!hostStable)
+        {
+            if (error) *error = "源图纸在加载期间被修改，已拒绝写出不一致缓存：" + opts.InputPath;
             if (errorCode) *errorCode = "LOAD_FAILED";
             return false;
         }
 
-        if (!ExportSceneToSqlite(scene, snap, opts.InputPath, sizeBytes, mtimeMs,
+        if (!ExportSceneToSqlite(*scene, snap, opts.InputPath, sizeBytes, mtimeMs,
                                  opts.OutputDbPath, includeBlockEntities, result, error))
         {
             if (errorCode) *errorCode = "EXPORT_DB_FAILED";

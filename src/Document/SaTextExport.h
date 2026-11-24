@@ -4,6 +4,7 @@
 //   kind \t x \t y \t h \t layer \t block \t tag \t text   （首行是表头；kind = TEXT / MTEXT / ATTRIB；块路径用 / 连接）
 // 对横向展开施加三重硬预算（访问阵列单元数、文字行数、输出字节数），防止嵌套 MINSERT 爆炸导致卡死或 OOM。
 #include "Scene/Scene.h"
+#include "Core/Entity/BlockEntity.hpp"
 #include "Core/Entity/InsertEntity.hpp"
 #include "Core/Entity/TextEntity.hpp"
 #include "Core/Entity/MTextEntity.hpp"
@@ -11,9 +12,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace MiniCAD::SaTextExport
 {
@@ -58,6 +61,46 @@ namespace MiniCAD::SaTextExport
         Budget       budget;
         Result       result{};
         std::string  lineBuf;
+        // 块可导出文字剪枝缓存：1 = 访中防环，2 = 无可导出文字，3 = 含可导出文字（遇环保守视作有字，不写入无字缓存）
+        std::unordered_map<const BlockEntity*, std::uint8_t> blockHasTextCache;
+
+        bool BlockHasText(const BlockEntity* blk)
+        {
+            if (!blk)
+                return false;
+            if (const auto it = blockHasTextCache.find(blk); it != blockHasTextCache.end())
+                return it->second != 2u;
+            blockHasTextCache[blk] = 1u;
+            for (const auto& child : blk->GetEntities())
+            {
+                if (!child)
+                    continue;
+                if (child->IsKindOf<TextEntity>() || child->IsKindOf<MTextEntity>())
+                {
+                    blockHasTextCache[blk] = 3u;
+                    return true;
+                }
+                if (child->IsKindOf<InsertEntity>())
+                {
+                    const auto& childIns = static_cast<const InsertEntity&>(*child);
+                    for (const auto& a : childIns.GetAttribs())
+                    {
+                        if (a)
+                        {
+                            blockHasTextCache[blk] = 3u;
+                            return true;
+                        }
+                    }
+                    if (const auto* sub = childIns.GetBlock(); sub && BlockHasText(sub))
+                    {
+                        blockHasTextCache[blk] = 3u;
+                        return true;
+                    }
+                }
+            }
+            blockHasTextCache[blk] = 2u;
+            return false;
+        }
 
         std::string LayerName(const Entity& e) const
         {
@@ -133,7 +176,7 @@ namespace MiniCAD::SaTextExport
             {
                 const auto& ins = static_cast<const InsertEntity&>(e);
                 const std::string p = path.empty() ? ins.GetBlockName() : path + "/" + ins.GetBlockName();
-                if (const auto* b = ins.GetBlock())
+                if (const auto* b = ins.GetBlock(); b && BlockHasText(b))
                 {
                     const int rows = std::max(1, ins.GetRowCount());
                     const int cols = std::max(1, ins.GetColumnCount());
@@ -174,7 +217,7 @@ namespace MiniCAD::SaTextExport
     template <typename LineSink>
     inline Result ExportTsvStream(const Scene& scene, LineSink&& lineSink, const Budget& budget = {})
     {
-        StreamWriter<LineSink> w{ scene, lineSink, budget, {}, {} };
+        StreamWriter<LineSink> w{ scene, lineSink, budget, {}, {}, {} };
         w.lineBuf.reserve(256);
         constexpr std::string_view kHeader = "kind\tx\ty\th\tlayer\tblock\ttag\ttext\n";
         if (!w.WriteChunk(kHeader))

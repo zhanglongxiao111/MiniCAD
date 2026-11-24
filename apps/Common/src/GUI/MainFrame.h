@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -144,12 +145,14 @@ namespace MiniCAD
         bool EmbedGetViewWorld(double out[4]);
         // 世界坐标 → 窗口逻辑坐标（画布 CSS 像素）
         bool EmbedWorldToWindow(double worldX, double worldY, float& x, float& y);
-        // 在当前图纸上加云线批注（图层 SA-问题批注，红色），按原版本导出 DWG 字节，再撤掉批注；失败返回空并写 error
-        std::vector<std::uint8_t> EmbedExportMarkupDwg(const std::vector<std::array<double, 4>>& rects, const std::vector<std::string>& labels, std::string& error);
-        // 相对打开或上次 EmbedMarkMarkupClean 基线是否存在批注修改（撤销回基线返回 false）
+        // 在当前图纸上加云线批注（图层 SA-问题批注，红色），按原版本导出 DWG 字节，再撤掉临时云线；
+        // 成功时冻结当次入盘的批注快照并签发正整数令牌（outToken）；失败返回空并写 error（outToken 置 0）
+        std::vector<std::uint8_t> EmbedExportMarkupDwg(const std::vector<std::array<double, 4>>& rects, const std::vector<std::string>& labels, std::string& error, std::uint32_t* outToken = nullptr);
+        // 相对打开或上次 EmbedMarkMarkupClean(token) 基线是否存在批注修改（撤销回基线返回 false）
         bool EmbedHasMarkupChanges() const;
-        // 将当前主文档批注态设为干净基线（供宿主导出云线 DWG 真正落盘成功后调用）
-        void EmbedMarkMarkupClean();
+        // 凭 EmbedExportMarkupDwg 签发的快照令牌将导出瞬间批注态记为干净基线（供宿主异步落盘成功后调用）；
+        // 令牌无效、已消费或与当前主文档不匹配时返回 false 且不污染基线
+        bool EmbedMarkMarkupClean(std::uint32_t token);
         // 当前图纸没读进来的外部参照（嵌入模式只喂字节、不给路径，所以全部外部参照都在这里）：块名、图内保存的路径
         std::vector<std::pair<std::string, std::string>> EmbedListXrefs() const;
         // 在 searchRoot（虚拟文件系统目录）里按文件名查找并读入外部参照，返回读入个数
@@ -558,6 +561,15 @@ namespace MiniCAD
         std::unordered_map<uint64_t, std::vector<std::pair<LayerID, bool>>> m_embedSavedLocks;   // 批注模式锁图层前的原锁定状态（按 Document::InstanceID）
         std::unordered_map<uint64_t, Object::ObjectID>                      m_embedDocWatermark; // 每个文档进入批注保护前既有实体的 ID 水位线（防止误改原图 SA-问题批注 层实体）
         std::unordered_map<uint64_t, std::string>                           m_embedMarkupCleanSnapshot; // 每个文档上次 MarkMarkupClean 时的批注实体快照（空=无批注基线）
+        struct PendingEmbedMarkupSnapshot
+        {
+            std::uint32_t token = 0;
+            uint64_t      docId = 0;
+            std::string   snapshot;
+        };
+        static constexpr std::size_t                                        kMaxPendingMarkupTokens = 8;
+        std::uint32_t                                                       m_nextEmbedMarkupToken = 1; // 导出快照令牌单调序号（溢出回 0 跳 1）
+        std::deque<PendingEmbedMarkupSnapshot>                              m_pendingEmbedMarkupSnapshots; // 待宿主落盘确认的导出瞬间快照队列（上限 8）
         uint64_t                                                            m_embedMarkupBaselineRev = 0; // 基线变更序号（驱动 O(1) 脏态缓存失效）
         struct EmbedMarkupDirtyCache
         {
@@ -570,6 +582,7 @@ namespace MiniCAD
             bool             valid          = false;
         };
         mutable EmbedMarkupDirtyCache                                       m_embedMarkupDirtyCache;
+        void    EraseEmbedMarkupStateForDoc(uint64_t docId);
         LayerID EmbedEnsureMarkupLayer(Document& doc);
         void    EmbedApplyMarkupLocks(Document& doc);
         void    EmbedRestoreLocks(Document& doc);
@@ -685,12 +698,15 @@ namespace MiniCAD
             int      seq            = 0;
             int      target         = -1;   // 0 = 主图，1 = 底图
             uint64_t docId          = 0;
+            uint64_t allGen         = 0;    // 创建时的全局拾点代次（拦截已入队但被新拾点顶替的过期回调）
+            uint64_t targetGen      = 0;    // 创建时的目标端拾点代次
             bool     restoreSnapOff = false;
             bool     settled        = false;
             bool     silentAbandon  = false;
             std::function<void(int, double, double)> onPicked;
             std::function<void(int)>                 onCancelled;
         };
+        bool IsPickSessionCurrent(const PickPointSession& session) const;
         void SettlePickSession(const std::shared_ptr<PickPointSession>& session, bool picked, double wx, double wy);
 
         std::shared_ptr<bool>      m_alive = std::make_shared<bool>(true); // 供异步回调感知 MainFrame 存活
@@ -717,6 +733,8 @@ namespace MiniCAD
         bool                       m_compareShowCompare    = true;
         int                        m_compareLayoutIndex    = -1;   // -1 = 自动跟随主图布局，>= 0 = 手动指定对比图布局
         std::shared_ptr<PickPointSession> m_activePickSession;     // 当前活跃的拾点会话（拆分显式取消与静默作废）
+        uint64_t                          m_pickAllGen = 0;        // 拾点全局代次（AbandonPickPointSilently(-1) 推进）
+        std::array<uint64_t, 2>           m_pickTargetGen{ 0, 0 }; // 拾点分端代次（0 = 主图，1 = 底图）
 
         // ── 视口指针状态（物理像素，视口内坐标）──────────────────
         ViewInput m_mainInput;      // 主视口的鼠标状态（光标是否在视口里：m_main.hovered）

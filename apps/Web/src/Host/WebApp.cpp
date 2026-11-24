@@ -501,7 +501,10 @@ namespace MiniCAD
         EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_OpenDrawing(const char* fsPath)
         {
             if (IsEmbedReady() && fsPath && *fsPath)
+            {
                 g_app->GetFrame().EmbedOpenMainDrawing(fsPath);
+                g_app->PruneStaleRemoteRequests();
+            }
         }
 
         EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_IsOpening()
@@ -534,7 +537,10 @@ namespace MiniCAD
         EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_CloseAllDocuments()
         {
             if (IsEmbedReady())
+            {
                 g_app->GetFrame().EmbedCloseAllDocuments();
+                g_app->PruneStaleRemoteRequests();
+            }
         }
 
         EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_HasCompareDocument()
@@ -601,13 +607,12 @@ namespace MiniCAD
             return IsEmbedReady() && g_app->GetFrame().EmbedHasMarkupChanges() ? 1 : 0;
         }
 
-        EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_MarkMarkupClean()
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_MarkMarkupClean(unsigned int token)
         {
-            if (IsEmbedReady())
-                g_app->GetFrame().EmbedMarkMarkupClean();
+            return IsEmbedReady() && g_app->GetFrame().EmbedMarkMarkupClean(static_cast<std::uint32_t>(token)) ? 1 : 0;
         }
 
-        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_ExportMarkupDwg(const double* rects, int count, const char* labels, const char* outPath, const char* errPath)
+        EMSCRIPTEN_KEEPALIVE unsigned int MiniCADEmbed_ExportMarkupDwg(const double* rects, int count, const char* labels, const char* outPath, const char* errPath)
         {
             std::string error;
             auto writeErr = [&]()
@@ -619,19 +624,19 @@ namespace MiniCAD
             {
                 error = Tr("MiniCAD 尚未就绪");
                 writeErr();
-                return 0;
+                return 0u;
             }
             if (!outPath || !*outPath)
             {
                 error = Tr("导出路径无效");
                 writeErr();
-                return 0;
+                return 0u;
             }
             if (count < 0 || static_cast<std::size_t>(count) > SaMarkupExport::kMaxMarkupRects || (count > 0 && !rects))
             {
                 error = Tr("批注框参数无效");
                 writeErr();
-                return 0;
+                return 0u;
             }
 
             std::vector<std::array<double, 4>> list;
@@ -645,7 +650,7 @@ namespace MiniCAD
                 {
                     error = Tr("批注框坐标无效或尺寸过小");
                     writeErr();
-                    return 0;
+                    return 0u;
                 }
                 list.push_back(rect);
             }
@@ -664,19 +669,20 @@ namespace MiniCAD
                 }
             }
 
-            std::vector<std::uint8_t> bytes = g_app->GetFrame().EmbedExportMarkupDwg(list, labelList, error);
-            if (bytes.empty())
+            std::uint32_t token = 0;
+            std::vector<std::uint8_t> bytes = g_app->GetFrame().EmbedExportMarkupDwg(list, labelList, error, &token);
+            if (bytes.empty() || token == 0)
             {
                 writeErr();
-                return 0;
+                return 0u;
             }
             if (!WriteFileAll(outPath, bytes.data(), bytes.size()))
             {
                 error = Tr("写入导出文件失败");
                 writeErr();
-                return 0;
+                return 0u;
             }
-            return 1;
+            return static_cast<unsigned int>(token);
         }
 
         EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_ListXrefs(const char* outPath)
@@ -878,7 +884,11 @@ namespace MiniCAD
             m_graphics->Resize(m_host.GetFramebufferWidth(), m_host.GetFramebufferHeight());
             m_main.OnResize(w, h, scale);
         });
-        m_host.SetOnFrame ([this] { m_main.RenderFrame(); });
+        m_host.SetOnFrame ([this]
+        {
+            PruneStaleRemoteRequests();
+            m_main.RenderFrame();
+        });
         MiniCADWeb_InstallUnloadGuard();
         m_uiReady = true;
         m_host.RequestFrame();
@@ -1100,6 +1110,21 @@ namespace MiniCAD
         }
         std::error_code ec;
         std::filesystem::remove_all("/remote/" + std::to_string(requestId), ec);
+    }
+
+    void WebApp::PruneStaleRemoteRequests()
+    {
+        if (m_remoteRequests.empty())
+            return;
+        const uint64_t currentIntent = m_main.MainDocumentIntentVersion();
+        std::vector<int> staleIds;
+        for (const auto& [id, req] : m_remoteRequests)
+        {
+            if (req.intentVersion != currentIntent)
+                staleIds.push_back(id);
+        }
+        for (int id : staleIds)
+            DiscardRemoteRequest(id);
     }
 
     bool WebApp::IsRemoteRequestActive(int requestId)

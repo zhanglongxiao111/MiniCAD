@@ -31,7 +31,7 @@
      - 单实体字段：`objectId`、`handle`（大写无 `0x` 前缀十六进制，经 `LookupCadEntityHandle` 查询并与 `SaDwgTool` SQLite `entities.handle` 一致）、`type`、`layer`、`blockName`、`text`、`length`、`area`（带孔 `HATCH` 按边界环包含关系/奇偶规则计算真实净面积）、`radius`、`bounds`。
 3. **WASM 就绪、回调与 VFS 文件寿命约定**
    - **初始化就绪与错误契约**：WebGPU 适配器/设备创建为异步流程，所有依赖 UI/平台的 `MiniCADEmbed_*` 导出入口均统一校验 `IsUiReady()`；宿主必须在轮询到 `MiniCADEmbed_IsReady() === 1` 后再调用业务接口。错误回传按接口区分：
-     - **仅** `MiniCADEmbed_ExportMarkupDwg(rects, count, labels, outPath, errPath)` 接受 `errPath` 参数，失败或未就绪时返回 `0` 并在 `errPath` 写入 UTF-8 原因；
+     - **仅** `MiniCADEmbed_ExportMarkupDwg(rects, count, labels, outPath, errPath)` 接受 `errPath` 参数，成功写出后返回正整数批注快照令牌（`>= 1`，供落盘成功后传给 `MiniCADEmbed_MarkMarkupClean(token)` 确认基线），失败或未就绪时返回 `0` 并在 `errPath` 写入 UTF-8 原因；
      - 异步开图失败原因经 `MiniCADEmbed_GetMainError(outPath)` / `MiniCADEmbed_GetCompareError(outPath)` 查询（有错误时写入 `outPath` 并返回 `1`，无错误返回 `0`）；
      - 其余返回整型状态或计数的接口在未就绪或失败时统一返回 `0`（不接受 `errPath`），返回 `void` 的接口在未就绪时静默忽略。
    - **宿主 `Module` 回调**（在调用 `MiniCADEmbed_SetMode` / `MiniCADEmbed_StartPickPoint` 前挂载到 Emscripten `Module`）：
@@ -44,14 +44,15 @@
      - 图纸与对比图生命周期：`MiniCADEmbed_OpenDrawing`、`MiniCADEmbed_IsOpening`、`MiniCADEmbed_GetMainError`、`MiniCADEmbed_OpenCompareDrawing`、`MiniCADEmbed_IsOpeningCompare`、`MiniCADEmbed_GetCompareError`、`MiniCADEmbed_CloseCompareDrawing`、`MiniCADEmbed_HasCompareDocument`、`MiniCADEmbed_CloseOtherDocuments`、`MiniCADEmbed_CloseAllDocuments`
      - 叠图与布局控制：`MiniCADEmbed_SetCompareState`、`MiniCADEmbed_GetMainLayout`、`MiniCADEmbed_ListCompareLayouts`、`MiniCADEmbed_ZoomAll`、`MiniCADEmbed_ZoomCompareAll`、`MiniCADEmbed_ZoomToWorld`、`MiniCADEmbed_GetViewWorld`、`MiniCADEmbed_WindowToWorld`、`MiniCADEmbed_WorldToWindow`
      - 拾点与外参：`MiniCADEmbed_StartPickPoint`、`MiniCADEmbed_CancelPickPoint`、`MiniCADEmbed_ListXrefs`、`MiniCADEmbed_ReloadXrefs`、`MiniCADEmbed_ListCompareXrefs`、`MiniCADEmbed_ReloadCompareXrefs`
-     - 批注脏态与基线：`MiniCADEmbed_HasMarkupChanges`（相对打开或上次 `MiniCADEmbed_MarkMarkupClean` 基线是否存在批注修改，撤销回基线返回 `0`，有真实新增/删除/修改返回 `1`）、`MiniCADEmbed_MarkMarkupClean`（将当前主文档批注态记为干净基线，供宿主导出云线 DWG 落盘成功后调用）
-     - 数据与批注导出：`MiniCADEmbed_ExportText`、`MiniCADEmbed_GetSelectionVersion`、`MiniCADEmbed_GetSelection`、`MiniCADEmbed_ExportMarkupDwg`
+     - 批注脏态与基线：`MiniCADEmbed_HasMarkupChanges`（相对打开或上次 `MiniCADEmbed_MarkMarkupClean(token)` 基线是否存在批注修改，撤销回基线返回 `0`，有真实新增/删除/修改返回 `1`）、`MiniCADEmbed_MarkMarkupClean(token)`（凭 `MiniCADEmbed_ExportMarkupDwg` 签发的正整数快照令牌将导出瞬间的批注快照记为干净基线，校验令牌与当前主文档匹配后消费令牌并返回 `1`，无效/已消费/跨文档令牌返回 `0`；异步写盘期间新增的笔迹保持脏态）
+     - 数据与批注导出：`MiniCADEmbed_ExportText`、`MiniCADEmbed_GetSelectionVersion`、`MiniCADEmbed_GetSelection`、`MiniCADEmbed_ExportMarkupDwg`（成功返回快照令牌 `>= 1`，失败返回 `0`）
    - **VFS 文件寿命约定**：
      - 宿主写入 Emscripten 内存文件系统（`FS.writeFile`）并传给 `MiniCADEmbed_OpenDrawing(fsPath)` / `MiniCADEmbed_OpenCompareDrawing(fsPath)` 的图纸文件，必须保持有效直至 `MiniCADEmbed_IsOpening()` / `MiniCADEmbed_IsOpeningCompare()` 返回 `0`（读取完成）；关闭全部或换图时在途异步加载会被代次机制自动作废。
      - 传给 `MiniCADEmbed_ReloadXrefs(searchRoot)` / `MiniCADEmbed_ReloadCompareXrefs(searchRoot)` 的外参目录文件需在该同步调用返回前保持可读，返回后宿主可自行回收。
      - 传给 `MiniCADEmbed_ExportText` / `MiniCADEmbed_GetSelection` / `MiniCADEmbed_ExportMarkupDwg` / `MiniCADEmbed_List*` / `MiniCADEmbed_Get*Error` 的 `outPath` / `errPath` 均由 WASM 完整写出并校验短写后返回，文件所有权与读后删除（`FS.unlink`）由宿主负责。
 4. **无界面 DWG 文字提取工具（`SaDwgText`）**
-   - Node 版 WASM 命令行工具（`apps/SaDwgText/main.cpp` + `src/Document/SaTextExport.h`），只读解析 DWG 中的 `TEXT` / `MTEXT` / `ATTRIB`（遍历全部 `MINSERT` 行列阵列单元、按变换矩阵换算真实世界字高、保留 `ATTRIB` 不重复套本级矩阵语义），输出标准 TSV。
+   - Node 版 WASM 命令行工具（`apps/SaDwgText/main.cpp` + `src/Document/SaTextExport.h`），只读解析 DWG 中的 `TEXT` / `MTEXT` / `ATTRIB`（遍历含可导出文字的 `MINSERT` 行列阵列单元、对无字块做防环递归剪枝缓存以跳过无字大阵列展开、按变换矩阵换算真实世界字高、保留外层及嵌套 `ATTRIB` 不重复套本级矩阵语义），流式输出标准 TSV 到 `stdout`。
+   - **三项硬预算与退出码契约**：默认单次导出施加三项硬预算——最多展开 `250,000` 个阵列单元（`MaxArrayCells`）、最多输出 `100,000` 行文字（`MaxRows`）、最多输出 `16 MiB` 字节（`MaxBytes`）。因采用流式写 `stdout`，当触发任一硬预算（退出码 `3`）、读图失败或写 `stdout` 失败（退出码 `1`，参数错误退出码 `2`）时，`stdout` 可能已包含已刷出的部分 TSV；调用方**必须校验进程退出码为 `0`** 后再消费完整 TSV 输出（错误原因见 `stderr`）。
 5. **通用修复**
    - 修复 `SnapEngine` 节点捕捉 `y1 = x1` 笔误、块交点捕捉叶节点与最近曲线预算上限（64 条）以及斜切仿射正交性校验。
 

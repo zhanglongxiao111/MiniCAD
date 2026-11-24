@@ -956,7 +956,7 @@ namespace
                   "CAD-R2-09: ExportTsvStream 在 sink 失败时立即中止");
         }
 
-        // 无文字的双层 50×50 嵌套 MINSERT 触发阵列单元预算
+        // CAD-R3-07：无文字的双层 50×50 嵌套 MINSERT 经无字块缓存剪枝零单元快速通过
         {
             Scene emptyBomb;
             auto emptyBlk = std::make_unique<BlockEntity>(emptyBomb.NextObjectID(), "EMPTY_LEAF");
@@ -978,8 +978,50 @@ namespace
 
             SaTextExport::Result cellRes{};
             const std::string cellTsv = SaTextExport::ExportTsv(emptyBomb, SaTextExport::Budget{}, &cellRes);
+            Check(!cellTsv.empty() && cellRes.Ok() && cellRes.ArrayCells == 0 && cellRes.Rows == 0,
+                  "CAD-R3-07: 无文字嵌套 MINSERT 经无字块缓存直接剪枝跳过且不耗阵列预算");
+        }
+
+        // CAD-R2-09：含文字深层嵌套 MINSERT（每条文字伴随 3+ 单元访问）在触及行数上限前优先触发 250,000 阵列单元硬预算
+        {
+            Scene arrayCellBomb;
+            auto leafTxt = std::make_unique<BlockEntity>(arrayCellBomb.NextObjectID(), "LEAF_CELL_TXT");
+            leafTxt->AddEntity(std::make_unique<TextEntity>(
+                arrayCellBomb.NextObjectID(), Math::Point3{ 0, 0, 0 }, "T", 10.0f));
+            const BlockID leafId = arrayCellBomb.GetBlockTable().Add(std::move(leafTxt));
+
+            auto wrap1 = std::make_unique<BlockEntity>(arrayCellBomb.NextObjectID(), "WRAP_1");
+            auto ins1 = std::make_unique<InsertEntity>(
+                arrayCellBomb.NextObjectID(), leafId, "LEAF_CELL_TXT", Math::Point3{ 0, 0, 0 });
+            ins1->SetBlock(arrayCellBomb.GetBlockTable().Find(leafId));
+            wrap1->AddEntity(std::move(ins1));
+            const BlockID wrap1Id = arrayCellBomb.GetBlockTable().Add(std::move(wrap1));
+
+            auto wrap2 = std::make_unique<BlockEntity>(arrayCellBomb.NextObjectID(), "WRAP_2");
+            auto ins2 = std::make_unique<InsertEntity>(
+                arrayCellBomb.NextObjectID(), wrap1Id, "WRAP_1", Math::Point3{ 0, 0, 0 });
+            ins2->SetBlock(arrayCellBomb.GetBlockTable().Find(wrap1Id));
+            wrap2->AddEntity(std::move(ins2));
+            const BlockID wrap2Id = arrayCellBomb.GetBlockTable().Add(std::move(wrap2));
+
+            auto midArr = std::make_unique<BlockEntity>(arrayCellBomb.NextObjectID(), "MID_CELL_ARR");
+            auto innerIns = std::make_unique<InsertEntity>(
+                arrayCellBomb.NextObjectID(), wrap2Id, "WRAP_2", Math::Point3{ 0, 0, 0 });
+            innerIns->SetArray(50, 50, 10.0, 10.0);
+            innerIns->SetBlock(arrayCellBomb.GetBlockTable().Find(wrap2Id));
+            midArr->AddEntity(std::move(innerIns));
+            const BlockID midId = arrayCellBomb.GetBlockTable().Add(std::move(midArr));
+
+            auto outerIns = std::make_unique<InsertEntity>(
+                arrayCellBomb.NextObjectID(), midId, "MID_CELL_ARR", Math::Point3{ 0, 0, 0 });
+            outerIns->SetArray(50, 50, 600.0, 600.0);
+            arrayCellBomb.ResolveInsert(*outerIns);
+            arrayCellBomb.AddEntity(std::move(outerIns));
+
+            SaTextExport::Result cellRes{};
+            const std::string cellTsv = SaTextExport::ExportTsv(arrayCellBomb, SaTextExport::Budget{}, &cellRes);
             Check(cellTsv.empty() && cellRes.Code == SaTextExport::Status::ArrayCellBudgetExceeded,
-                  "CAD-R2-09: 无文字嵌套 MINSERT 同样受 250,000 阵列单元预算硬约束");
+                  "CAD-R2-09: 含文字深层嵌套 MINSERT 严格受 250,000 阵列单元预算硬约束");
         }
     }
 

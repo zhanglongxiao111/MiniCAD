@@ -2100,10 +2100,10 @@ namespace
                       "CAD-R2-08: 打开损坏外参导出的 SQLite");
                 if (db)
                 {
-                    const std::string depsV1 = SqlText(db, "SELECT value FROM meta WHERE key='xref_deps_v1';");
-                    Check(depsV1.find("\nunverifiable\t") != std::string::npos
-                              && depsV1.find("\nresolved\t") == std::string::npos,
-                          "CAD-R2-08: 磁盘存在但导入失败的外参在 xref_deps_v1 中严格标为 unverifiable");
+                    const std::string depsV2 = SqlText(db, "SELECT value FROM meta WHERE key='xref_deps_v2';");
+                    Check(depsV2.find("\nunverifiable\t") != std::string::npos
+                              && depsV2.find("\nresolved\t") == std::string::npos,
+                          "CAD-R2-08: 磁盘存在但导入失败的外参在 xref_deps_v2 中严格标为 unverifiable");
                     sqlite3_close(db);
                 }
             }
@@ -2179,6 +2179,169 @@ namespace
                   "CAD-R2-08: 换 proj_b 同文件身份宿主调用复用时不串库，重算相对外参链并读入 4 条线");
             Check(RunExportDbCommand(optsB, rB2, &err) && rB2.Reused && rB2.Counts.BlockEntities == 4,
                   "CAD-R2-08: proj_b 再次调用复用稳定命中缓存");
+        }
+
+        // 5. CAD-R3-04：外参读取窗口前后双 stat 指纹消费 + VersionVerified=false 落 unverifiable + 旧 xref_deps_v1 自动失效升级
+        {
+            const fs::path winDir = MiniCAD::Utf8ToPath(workDir) / "xref_r3_04_test";
+            std::error_code ec;
+            fs::create_directories(winDir, ec);
+            const fs::path childFs   = winDir / "sub_xref.dwg";
+            const fs::path hostFs    = winDir / "host.dwg";
+            const std::string childP = PathToUtf8(childFs);
+            const std::string hostP  = PathToUtf8(hostFs);
+            const std::string dbP    = PathToUtf8(winDir / "host.sqlite");
+
+            auto writeChildLines = [&](int lineCount) -> bool {
+                MiniCAD::Scene cs;
+                for (int i = 0; i < lineCount; ++i)
+                {
+                    cs.AddEntity(std::make_unique<MiniCAD::LineEntity>(
+                        cs.NextObjectID(),
+                        MiniCAD::Math::Point3{ 0.0, i * 100.0, 0.0 },
+                        MiniCAD::Math::Point3{ 600.0, i * 100.0, 0.0 }));
+                }
+                const auto bytes = MiniCAD::ExportCad(cs, MiniCAD::CadFileKind::Dwg, MiniCAD::CadSaveVersion::R2018);
+                return !bytes.empty() && WriteBytesToUtf8Path(childP, bytes);
+            };
+            {
+                MiniCAD::Scene hs;
+                MiniCAD::BlockTable& tbl = hs.GetBlockTable();
+                const MiniCAD::BlockID bid = tbl.Create("窗口外参", { 0, 0, 0 });
+                MiniCAD::BlockEntity* blk  = tbl.Find(bid);
+                blk->SetFlags(MiniCAD::BlockEntity::XRef);
+                blk->SetXRefPath("sub_xref.dwg");
+                auto ins = std::make_unique<MiniCAD::InsertEntity>(
+                    hs.NextObjectID(), bid, "窗口外参", MiniCAD::Math::Point3{ 0, 0, 0 });
+                ins->SetBlock(blk);
+                hs.AddEntity(std::move(ins));
+                const auto hostBytes = MiniCAD::ExportCad(hs, MiniCAD::CadFileKind::Dwg, MiniCAD::CadSaveVersion::R2018);
+                Check(writeChildLines(1) && !hostBytes.empty() && WriteBytesToUtf8Path(hostP, hostBytes),
+                      "CAD-R3-04: 生成读取窗口测试宿主图与 1 线外参");
+            }
+
+            // 5a. 加载后、SQLite 写盘前篡改磁盘外参：ExportSceneToSqlite 必须消费加载瞬间的 XrefLoadRecord 指纹，
+            //     严禁事后重探把旧几何签成新外参版本，从而保证后续 --reuse-if-fresh 必失效重建
+            uint64_t hostSize = 0;
+            int64_t  hostMtime = 0;
+            Check(MiniCAD::TryStatFileVersion(hostFs, hostSize, hostMtime), "CAD-R3-04: 采集宿主版本成功");
+
+            MiniCAD::Scene loadedScene;
+            MiniCAD::CadSemanticSnapshot loadedSnap;
+            std::string err;
+            Check(MiniCAD::LoadCadFileWithSemantics(hostP, loadedScene, loadedSnap, &err),
+                  "CAD-R3-04: LoadCadFileWithSemantics 成功加载宿主与外参");
+            Check(loadedSnap.XrefLoads.size() == 1
+                      && loadedSnap.XrefLoads[0].Status == MiniCAD::CadSemanticSnapshot::XrefLoadStatus::Loaded
+                      && loadedSnap.XrefLoads[0].VersionVerified
+                      && loadedSnap.XrefLoads[0].SizeBytes > 0,
+                  "CAD-R3-04: 导入器读取窗口双 stat 校验通过并记录 VersionVerified/SizeBytes/MtimeMs");
+
+            const uint64_t origXrefSize  = loadedSnap.XrefLoads[0].SizeBytes;
+            const int64_t  origXrefMtime = loadedSnap.XrefLoads[0].MtimeMs;
+
+            // 在写入 SQLite 前立即将磁盘外参替换为 5 线版本并推进 mtime
+            Check(writeChildLines(5), "CAD-R3-04: 加载后写库前篡改磁盘外参为 5 线版本");
+            const auto curChildTime = fs::last_write_time(childFs, ec);
+            if (!ec)
+                fs::last_write_time(childFs, curChildTime + std::chrono::seconds(5), ec);
+            uint64_t tamperedSize = 0;
+            int64_t  tamperedMtime = 0;
+            Check(MiniCAD::TryStatFileVersion(childFs, tamperedSize, tamperedMtime)
+                      && (tamperedSize != origXrefSize || tamperedMtime != origXrefMtime),
+                  "CAD-R3-04: 篡改后磁盘外参指纹已与加载瞬间不同");
+
+            ExportDbResult expStale{};
+            Check(ExportSceneToSqlite(loadedScene, loadedSnap, hostP, hostSize, hostMtime,
+                                      dbP, true, expStale, &err)
+                      && expStale.Counts.BlockEntities == 1,
+                  "CAD-R3-04: ExportSceneToSqlite 写出加载瞬间旧几何（1 条外参线）");
+            {
+                sqlite3* db = nullptr;
+                Check(sqlite3_open_v2(dbP.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK,
+                      "CAD-R3-04: 打开写出的 SQLite 校验 xref_deps_v2");
+                if (db)
+                {
+                    const std::string depsV2 = SqlText(db, "SELECT value FROM meta WHERE key='xref_deps_v2';");
+                    const std::string expectTail = "\t" + std::to_string(origXrefSize) + "\t" + std::to_string(origXrefMtime);
+                    const std::string badTail    = "\t" + std::to_string(tamperedSize) + "\t" + std::to_string(tamperedMtime);
+                    Check(depsV2.rfind("v2:", 0) == 0
+                              && depsV2.find(expectTail) != std::string::npos
+                              && depsV2.find(badTail) == std::string::npos,
+                          "CAD-R3-04: xref_deps_v2 记录导入瞬间旧外参指纹而非写盘前篡改的新 stat");
+                    sqlite3_close(db);
+                }
+            }
+
+            ExportDbOptions opts;
+            opts.InputPath    = hostP;
+            opts.OutputDbPath = dbP;
+            opts.ReuseIfFresh = true;
+            ExportDbResult rebuilt{};
+            Check(RunExportDbCommand(opts, rebuilt, &err) && !rebuilt.Reused && rebuilt.Counts.BlockEntities == 5,
+                  "CAD-R3-04: 后续 --reuse-if-fresh 检出篡改后的外参变化，拒绝复用并重建读入 5 条线");
+
+            // 5b. 读前后双 stat 不一致（VersionVerified == false）：落 unverifiable 且禁止复用
+            {
+                const std::string dbUnverifP = PathToUtf8(winDir / "host_unverif.sqlite");
+                MiniCAD::CadSemanticSnapshot unverifiedSnap = loadedSnap;
+                unverifiedSnap.XrefLoads[0].VersionVerified = false;
+                ExportDbResult expUnverif{};
+                Check(ExportSceneToSqlite(loadedScene, unverifiedSnap, hostP, hostSize, hostMtime,
+                                          dbUnverifP, true, expUnverif, &err),
+                      "CAD-R3-04: 写出 VersionVerified=false 的缓存库");
+                {
+                    sqlite3* db = nullptr;
+                    Check(sqlite3_open_v2(dbUnverifP.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK,
+                          "CAD-R3-04: 打开 unverifiable 缓存库");
+                    if (db)
+                    {
+                        const std::string depsV2 = SqlText(db, "SELECT value FROM meta WHERE key='xref_deps_v2';");
+                        Check(depsV2.find("\nunverifiable\t") != std::string::npos
+                                  && depsV2.find("\nresolved\t") == std::string::npos,
+                              "CAD-R3-04: VersionVerified=false 在 xref_deps_v2 中落为 unverifiable");
+                        sqlite3_close(db);
+                    }
+                }
+                ExportDbOptions uOpts = opts;
+                uOpts.OutputDbPath = dbUnverifP;
+                ExportDbResult uRes{};
+                Check(RunExportDbCommand(uOpts, uRes, &err) && !uRes.Reused && uRes.Counts.BlockEntities == 5,
+                      "CAD-R3-04: unverifiable 缓存严禁复用，自动重建成功");
+            }
+
+            // 5c. 旧协议 xref_deps_v1 缓存库：--reuse-if-fresh 自动失效并升级重建为 xref_deps_v2
+            {
+                sqlite3* db = nullptr;
+                Check(sqlite3_open_v2(dbP.c_str(), &db, SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK,
+                      "CAD-R3-04: 以读写模式打开缓存库模拟旧版 xref_deps_v1");
+                if (db)
+                {
+                    const int rc = sqlite3_exec(
+                        db,
+                        "UPDATE meta SET key='xref_deps_v1', value='v1:' || substr(value, 4) WHERE key='xref_deps_v2';",
+                        nullptr, nullptr, nullptr);
+                    Check(rc == SQLITE_OK, "CAD-R3-04: 将缓存库降级为仅含旧键 xref_deps_v1");
+                    sqlite3_close(db);
+                }
+
+                ExportDbResult upgraded{};
+                Check(RunExportDbCommand(opts, upgraded, &err) && !upgraded.Reused,
+                      "CAD-R3-04: 仅含旧 xref_deps_v1 的缓存自动失效并重建");
+                {
+                    sqlite3* dbCheck = nullptr;
+                    Check(sqlite3_open_v2(dbP.c_str(), &dbCheck, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK,
+                          "CAD-R3-04: 打开升级后的缓存库");
+                    if (dbCheck)
+                    {
+                        const std::string v2Val = SqlText(dbCheck, "SELECT value FROM meta WHERE key='xref_deps_v2';");
+                        const int v1Cnt         = SqlInt(dbCheck, "SELECT COUNT(*) FROM meta WHERE key='xref_deps_v1';");
+                        Check(v2Val.rfind("v2:", 0) == 0 && v1Cnt == 0,
+                              "CAD-R3-04: 重建后仅保留 xref_deps_v2 (v2:) 且不含旧键 xref_deps_v1");
+                        sqlite3_close(dbCheck);
+                    }
+                }
+            }
         }
     }
 

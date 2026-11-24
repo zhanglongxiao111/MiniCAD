@@ -1,4 +1,6 @@
 #pragma once
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <string>
 
@@ -18,5 +20,34 @@ namespace MiniCAD
     inline std::filesystem::path Utf8ToPath(const std::string& utf8)
     {
         return std::filesystem::path(std::u8string(utf8.begin(), utf8.end()));
+    }
+
+    // 统一采集普通文件的字节大小与毫秒级修改时间戳（用于导入窗口双 stat 校验与 SQLite 缓存指纹）。
+    // 任一步失败均返回 false 并清零输出。
+    inline bool TryStatFileVersion(const std::filesystem::path& path,
+                                   std::uint64_t& sizeBytes,
+                                   std::int64_t& mtimeMs)
+    {
+        sizeBytes = 0;
+        mtimeMs   = 0;
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec) || ec)
+            return false;
+        if (!std::filesystem::is_regular_file(path, ec) || ec)
+            return false;
+        const auto sz = std::filesystem::file_size(path, ec);
+        if (ec)
+            return false;
+        const auto ftime = std::filesystem::last_write_time(path, ec);
+        if (ec)
+            return false;
+#if defined(_LIBCPP_VERSION)
+        mtimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(ftime.time_since_epoch()).count();
+#else
+        const auto sysTime = std::chrono::clock_cast<std::chrono::system_clock>(ftime);
+        mtimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(sysTime.time_since_epoch()).count();
+#endif
+        sizeBytes = static_cast<std::uint64_t>(sz);
+        return true;
     }
 }

@@ -50,10 +50,13 @@ namespace MiniCAD
         struct XrefLoadRecord
         {
             std::string    BlockName;
-            std::string    ParentDir;     // 本次解析使用的宿主/父外参所在目录（UTF-8）
-            std::string    RawPath;       // 图纸中保存的原始外参路径
-            std::string    ResolvedPath;  // 定位到的规范文件路径（UTF-8；Missing 时为空）
-            XrefLoadStatus Status = XrefLoadStatus::Missing;
+            std::string    ParentDir;      // 本次解析使用的宿主/父外参所在目录（UTF-8）
+            std::string    RawPath;        // 图纸中保存的原始外参路径
+            std::string    ResolvedPath;   // 定位到的规范文件路径（UTF-8；Missing 时为空）
+            XrefLoadStatus Status          = XrefLoadStatus::Missing;
+            bool           VersionVerified = false; // 读取窗口前后双 stat 与实际读出字节数完全一致
+            uint64_t       SizeBytes       = 0;
+            int64_t        MtimeMs         = 0;
         };
         std::vector<XrefLoadRecord> XrefLoads;
 

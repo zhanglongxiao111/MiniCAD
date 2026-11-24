@@ -36,6 +36,13 @@ jobs:
           version: ${{ env.EMSDK_VERSION }}
           actions-cache-folder: .emsdk-cache
 
+      - name: Run Web host JS regression tests
+        run: |
+          set -euo pipefail
+          node tests/Web/FilePickerTests.cjs
+          node tests/Web/FolderPickerTests.cjs
+          node tests/Web/RemoteOpenTests.cjs
+
       - name: Configure
         run: emcmake cmake -S . -B out/web -G Ninja -DCMAKE_BUILD_TYPE=Release
 
@@ -53,7 +60,7 @@ jobs:
           (cd "dist/${bundle}" && sha256sum web/index.js web/index.wasm web/index.data web/fonts/*.otf node/SaDwgText.js node/SaDwgText.wasm > SHA256SUMS)
           (cd dist && zip -r "${bundle}.zip" "${bundle}")
 
-      - name: Verify packaged embed bundle (SHA256 + Node SaDwgText)
+      - name: Verify packaged embed bundle (SHA256 + WASM exports + Node SaDwgText)
         run: |
           set -euo pipefail
           bundle="MiniCAD-embed-${PACKAGE_VERSION}"
@@ -62,6 +69,24 @@ jobs:
           mkdir -p "${verify_dir}/中文目录"
           unzip -q "dist/${bundle}.zip" -d "${verify_dir}"
           (cd "${verify_dir}/${bundle}" && sha256sum -c SHA256SUMS)
+          node - "${verify_dir}/${bundle}/web/index.js" <<'EOF'
+          const fs = require("node:fs");
+          const code = fs.readFileSync(process.argv[2], "utf8");
+          const required = [
+            "_MiniCADEmbed_HasMarkupChanges",
+            "_MiniCADEmbed_MarkMarkupClean",
+            "_MiniCADEmbed_ExportMarkupDwg",
+            "_MiniCADEmbed_GetSelectionVersion",
+            "_MiniCADEmbed_GetSelection",
+          ];
+          for (const sym of required) {
+            const re = new RegExp(`Module(?:\\["${sym}"\\]|\\['${sym}'\\]|\\.${sym}(?![A-Za-z0-9_$]))`);
+            if (!re.test(code)) {
+              console.error(`Missing required exported symbol in web/index.js: ${sym}`);
+              process.exit(1);
+            }
+          }
+          EOF
           cp "tests/Data/Dwg/sample_AC1027.dwg" "${verify_dir}/中文目录/测试图纸.dwg"
           node "${verify_dir}/${bundle}/node/SaDwgText.js" "${verify_dir}/中文目录/测试图纸.dwg" > "${verify_dir}/out.tsv"
           test -s "${verify_dir}/out.tsv"
@@ -93,11 +118,11 @@ jobs:
       - name: Configure
         run: cmake -S . -B out/tool-ci -DMINICAD_BUILD_DWG_TOOL=ON -DMINICAD_BUILD_TESTS=ON
 
-      - name: Build SaDwgTool and tests
-        run: cmake --build out/tool-ci --config Release --target SaDwgTool SaDwgToolTests --parallel
+      - name: Build SaDwgTool and regression tests
+        run: cmake --build out/tool-ci --config Release --target SaDwgTool SaDwgToolTests MiniCADEmbedHostTests MiniCADCadPreserveTests --parallel
 
-      - name: Run SaDwgToolTests
-        run: ctest --test-dir out/tool-ci -C Release -R "^SaDwgToolTests$" --output-on-failure
+      - name: Run SaDwgTool, embed host, and preserve tests
+        run: ctest --test-dir out/tool-ci -C Release -R "^(SaDwgToolTests|MiniCADEmbedHostTests|MiniCADCadPreserveTests)$" --output-on-failure
 
       - name: Package Win64 SaDwgTool bundle
         shell: pwsh

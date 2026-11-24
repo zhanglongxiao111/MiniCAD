@@ -8,8 +8,12 @@
 #include "Render/IRenderTarget.h"
 #include "Document/Document.h"
 #include "Document/SaMarkupExport.h"
+#include "Document/SaTextExport.h"
 #include "Document/Command/AddEntityCommand.h"
 #include "Document/Command/BatchDeleteCommand.h"
+#include "Core/Entity/AttribEntity.hpp"
+#include "Core/Entity/BlockEntity.hpp"
+#include "Core/Entity/InsertEntity.hpp"
 #include "Core/Entity/LineEntity.hpp"
 #include "Core/Entity/PointEntity.hpp"
 #include "Core/Entity/CircleEntity.hpp"
@@ -19,6 +23,7 @@
 #include "Viewport/Viewport.h"
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <deque>
@@ -257,6 +262,8 @@ namespace
             m_posted.push_back(std::move(fn));
         }
 
+        size_t PendingPostedCount() const { return m_posted.size(); }
+
         size_t DrainPosted()
         {
             size_t ran = 0;
@@ -463,6 +470,40 @@ namespace
         frame.EmbedCloseCompareDrawing();
         platform.DrainPosted();
         Check(cancelledSeqs.size() == 2, "CAD-R2-03: EmbedCloseCompareDrawing 静默作废 seq=5");
+
+        // 1e. CAD-R3-06：已 settled 入 Post 队列尚未派发时，同图启动新拾点按代次拦截旧通知
+        Editor& reopenedMainEd = frame.GetDocumentManager().GetMainEditor();
+        pickedSeqs.clear();
+        cancelledSeqs.clear();
+        platform.DrainPosted();
+        Check(frame.EmbedStartPickPoint(21, 0, onPicked, onCancelled), "CAD-R3-06: 启动主图拾点 seq=21");
+        ClickAt(reopenedMainEd, 200, 200); // seq=21 已 settled，回调在 Post 队列待执行
+        Check(pickedSeqs.empty() && platform.PendingPostedCount() > 0 && !reopenedMainEd.IsActiveTool(),
+              "CAD-R3-06: seq=21 已 settled 且回调暂存于 Post 队列尚未派发");
+        Check(frame.EmbedStartPickPoint(22, 0, onPicked, onCancelled), "CAD-R3-06: 派发前立即在同图启动新拾点 seq=22");
+        platform.DrainPosted();
+        Check(pickedSeqs.empty() && cancelledSeqs.empty(),
+              "CAD-R3-06: 队列中已 settled 的过期 seq=21 通知被代次校验拦截（零误派发）");
+        ClickAt(reopenedMainEd, 220, 220);
+        platform.DrainPosted();
+        Check(pickedSeqs.size() == 1 && pickedSeqs[0] == 22 && cancelledSeqs.empty(),
+              "CAD-R3-06: 新拾点 seq=22 正常完成并准确派发");
+
+        // 显式取消已入队但派发前被新拾点顶替时，旧取消通知同样被代次拦截
+        pickedSeqs.clear();
+        cancelledSeqs.clear();
+        Check(frame.EmbedStartPickPoint(23, 0, onPicked, onCancelled), "CAD-R3-06: 启动主图拾点 seq=23");
+        frame.EmbedCancelPickPoint(); // onCancelled(23) 已入 Post 队列
+        Check(cancelledSeqs.empty() && platform.PendingPostedCount() > 0,
+              "CAD-R3-06: seq=23 显式取消已入 Post 队列尚未派发");
+        Check(frame.EmbedStartPickPoint(24, 0, onPicked, onCancelled), "CAD-R3-06: 取消通知派发前启动新拾点 seq=24");
+        platform.DrainPosted();
+        Check(cancelledSeqs.empty() && pickedSeqs.empty(),
+              "CAD-R3-06: 已入队的旧取消通知 seq=23 被新拾点代次拦截");
+        ClickAt(reopenedMainEd, 240, 240);
+        platform.DrainPosted();
+        Check(pickedSeqs.size() == 1 && pickedSeqs[0] == 24 && cancelledSeqs.empty(),
+              "CAD-R3-06: seq=24 正常完成触发");
     }
 
     // =========================================================
@@ -883,16 +924,29 @@ namespace
         doc->Redo();
         Check(frame.EmbedHasMarkupChanges(), "MarkupDirty: 重做第一笔返回 true");
 
-        // 导出云线落盘成功后调 MarkMarkupClean → 干净
-        frame.EmbedMarkMarkupClean();
-        Check(!frame.EmbedHasMarkupChanges(), "MarkupDirty: MarkMarkupClean 后返回 false");
+        // 导出云线拿取快照令牌，模拟异步写盘期间继续画第二笔：确认 token1 后第二笔必须保持脏态，Undo 第二笔精准回到 token1 基线
+        std::string exportErr;
+        const std::vector<std::array<double, 4>> rects = { { 0.0, 0.0, 20.0, 20.0 } };
+        const std::vector<std::string> labels = { "P1" };
+        std::uint32_t token1 = 0;
+        const auto dwgBytes1 = frame.EmbedExportMarkupDwg(rects, labels, exportErr, &token1);
+        Check(!dwgBytes1.empty() && token1 >= 1u, "CAD-R3-01: EmbedExportMarkupDwg 成功并签发正整数快照令牌");
 
-        // 画第二笔 → 再变脏 → 撤销 → 回干净
+        // 模拟异步写盘未完成前用户继续画第二笔
         const Object::ObjectID stroke2 = addMarkupStroke(60.0);
         (void)stroke2;
-        Check(frame.EmbedHasMarkupChanges(), "MarkupDirty: 干净基线后再画第二笔返回 true");
+        Check(frame.EmbedMarkMarkupClean(token1), "CAD-R3-01: 写盘完成后用 token1 确认导出基线返回 true");
+        Check(frame.EmbedHasMarkupChanges(), "CAD-R3-01: 异步写盘期新增的第二笔在 MarkMarkupClean(token1) 后仍保持脏态");
+
+        // 重复消费同一个 token1 必须失败且不污染基线
+        Check(!frame.EmbedMarkMarkupClean(token1), "CAD-R3-01: 已消费的 token1 不可二次确认");
+        Check(!frame.EmbedMarkMarkupClean(0u), "CAD-R3-01: 0 令牌被拒绝");
+        Check(!frame.EmbedMarkMarkupClean(999999u), "CAD-R3-01: 无效令牌被拒绝");
+        Check(frame.EmbedHasMarkupChanges(), "CAD-R3-01: 无效令牌调用不破坏脏态");
+
+        // 撤回第二笔 → 精准回到 token1 导出瞬间基线，自动变干净
         doc->Undo();
-        Check(!frame.EmbedHasMarkupChanges(), "MarkupDirty: 撤销第二笔回到干净基线返回 false");
+        Check(!frame.EmbedHasMarkupChanges(), "CAD-R3-01: Undo 第二笔精准回到 token1 导出基线返回 false");
 
         // 在干净基线上删除已有批注第一笔 → 脏；撤销删除 → 回干净
         doc->GetCommandStack().Execute(
@@ -902,17 +956,122 @@ namespace
         Check(!frame.EmbedHasMarkupChanges(), "MarkupDirty: 撤销删除回到干净基线返回 false");
 
         // 导出临时云线批注 DWG（RAII 清理临时实体）不误污染干净基线
-        std::string exportErr;
-        const std::vector<std::array<double, 4>> rects = { { 0.0, 0.0, 20.0, 20.0 } };
-        const std::vector<std::string> labels = { "P1" };
-        const auto dwgBytes = frame.EmbedExportMarkupDwg(rects, labels, exportErr);
-        Check(!dwgBytes.empty(), "MarkupDirty: EmbedExportMarkupDwg 导出成功");
+        std::uint32_t token2 = 0;
+        const auto dwgBytes2 = frame.EmbedExportMarkupDwg(rects, labels, exportErr, &token2);
+        Check(!dwgBytes2.empty() && token2 > token1, "CAD-R3-01: 二次导出签发严格递增的新令牌");
         Check(!frame.EmbedHasMarkupChanges(), "MarkupDirty: 导出临时云线不污染干净基线");
 
-        // 切回浏览模式后未清理的新增批注仍准确报告为脏
-        addMarkupStroke(90.0);
-        frame.EmbedSetMode(0);
-        Check(frame.EmbedHasMarkupChanges(), "MarkupDirty: 切回浏览模式后未落盘批注仍准确返回 true");
+        // 跨文档令牌校验：为 doc1 签发 token2 后切到 doc2 并画新批注，拿 doc1 的 token2 确认必须失败且不污染 doc2 脏态
+        const std::string doc2Path = tmp.WriteDoc("markup_dirty_doc2.json", *MakeSimpleDoc(15.0));
+        frame.EmbedOpenMainDrawing(doc2Path);
+        platform.PumpOpen(frame);
+        frame.EmbedSetMode(1);
+        Document* doc2 = frame.GetDocumentManager().GetMainDocument();
+        Check(doc2 != nullptr && doc2 != doc, "CAD-R3-01: 切换到新主文档 doc2 成功");
+        if (doc2)
+        {
+            Scene& scene2 = doc2->GetScene();
+            const LayerID markupLayer2 = scene2.GetLayerManager().GetActiveLayerID();
+            auto e2 = std::make_unique<LineEntity>(scene2.NextObjectID(), Math::Point3{ 0, 12, 0 }, Math::Point3{ 30, 12, 0 });
+            EntityAttr attr2;
+            attr2.LayerId = markupLayer2;
+            e2->SetAttr(attr2);
+            doc2->GetCommandStack().Execute(std::make_unique<AddEntityCommand>(std::move(e2)), scene2);
+            Check(frame.EmbedHasMarkupChanges(), "CAD-R3-01: doc2 画新批注后为脏态");
+            Check(!frame.EmbedMarkMarkupClean(token2), "CAD-R3-01: 跨文档使用 doc1 的 token2 被拒绝");
+            Check(frame.EmbedHasMarkupChanges(), "CAD-R3-01: 跨文档令牌拒绝后 doc2 保持脏态不被污染");
+
+            // 切回浏览模式后未清理的新增批注仍准确报告为脏
+            frame.EmbedSetMode(0);
+            Check(frame.EmbedHasMarkupChanges(), "MarkupDirty: 切回浏览模式后未落盘批注仍准确返回 true");
+
+            // 关文档同步按 docId 清理待确认快照令牌：关闭 doc1 后 token2 失效
+            Check(frame.EmbedCloseOtherDocuments(doc2Path), "CAD-R3-01: 关闭旧文档 doc1");
+            Check(!frame.EmbedMarkMarkupClean(token2), "CAD-R3-01: 关闭 doc1 后其待确认令牌已被清理");
+        }
+    }
+
+    // =========================================================
+    // 7. CAD-R3-07：SaTextExport 无字复杂块 200x200 阵列零耗时剪枝 + 保留外层与嵌套 ATTRIB
+    // =========================================================
+    void TestSaTextExportNonTextBlockPruning()
+    {
+        Scene scene;
+
+        // 含 120 个非文字几何图元的复杂无字块
+        auto heavyNoText = std::make_unique<BlockEntity>(scene.NextObjectID(), "HEAVY_NO_TEXT");
+        for (int i = 0; i < 100; ++i)
+        {
+            heavyNoText->AddEntity(std::make_unique<LineEntity>(
+                scene.NextObjectID(),
+                Math::Point3{ static_cast<double>(i), 0.0, 0.0 },
+                Math::Point3{ static_cast<double>(i), 50.0, 0.0 }));
+        }
+        for (int i = 0; i < 20; ++i)
+        {
+            heavyNoText->AddEntity(std::make_unique<CircleEntity>(
+                scene.NextObjectID(),
+                Math::Point3{ static_cast<double>(i) * 5.0, 25.0, 0.0 }, 2.0));
+        }
+        const BlockID heavyId = scene.GetBlockTable().Add(std::move(heavyNoText));
+
+        // 200x200（40,000 单元）无字复杂块 MINSERT + 外层挂 1 个 ATTRIB
+        auto hugeIns = std::make_unique<InsertEntity>(
+            scene.NextObjectID(), heavyId, "HEAVY_NO_TEXT", Math::Point3{ 0.0, 0.0, 0.0 });
+        hugeIns->SetArray(200, 200, 100.0, 100.0);
+        hugeIns->AddAttrib(std::make_unique<AttribEntity>(
+            scene.NextObjectID(), "OUTER_TAG", "OUTER_VALUE", Math::Point3{ 10.0, 20.0, 0.0 }, 5.0f));
+        scene.ResolveInsert(*hugeIns);
+        scene.AddEntity(std::move(hugeIns));
+
+        // 对照：外层块内含嵌套无字子块插入，但该嵌套插入挂有 1 个 ATTRIB（必须不能被剪枝漏掉）
+        auto nestedOwner = std::make_unique<BlockEntity>(scene.NextObjectID(), "WRAP_NESTED_ATTRIB");
+        for (int i = 0; i < 30; ++i)
+        {
+            nestedOwner->AddEntity(std::make_unique<LineEntity>(
+                scene.NextObjectID(),
+                Math::Point3{ 0.0, static_cast<double>(i), 0.0 },
+                Math::Point3{ 10.0, static_cast<double>(i), 0.0 }));
+        }
+        auto innerIns = std::make_unique<InsertEntity>(
+            scene.NextObjectID(), heavyId, "HEAVY_NO_TEXT", Math::Point3{ 0.0, 0.0, 0.0 });
+        innerIns->SetArray(100, 100, 10.0, 10.0); // 子块无字应被跳过，但其挂载的 ATTRIB 必保留
+        innerIns->SetBlock(scene.GetBlockTable().Find(heavyId));
+        innerIns->AddAttrib(std::make_unique<AttribEntity>(
+            scene.NextObjectID(), "NESTED_TAG", "NESTED_VALUE", Math::Point3{ 30.0, 40.0, 0.0 }, 4.0f));
+        nestedOwner->AddEntity(std::move(innerIns));
+        const BlockID nestedOwnerId = scene.GetBlockTable().Add(std::move(nestedOwner));
+
+        auto wrapIns = std::make_unique<InsertEntity>(
+            scene.NextObjectID(), nestedOwnerId, "WRAP_NESTED_ATTRIB", Math::Point3{ 500.0, 500.0, 0.0 });
+        wrapIns->SetArray(2, 2, 100.0, 100.0); // 4 个单元，每单元产出 1 条嵌套 ATTRIB
+        scene.ResolveInsert(*wrapIns);
+        scene.AddEntity(std::move(wrapIns));
+
+        const auto t0 = std::chrono::steady_clock::now();
+        SaTextExport::Result res{};
+        const std::string tsv = SaTextExport::ExportTsv(scene, SaTextExport::Budget{}, &res);
+        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+
+        auto countSubstr = [](const std::string& haystack, const std::string& needle) -> int {
+            int count = 0;
+            std::size_t pos = 0;
+            while ((pos = haystack.find(needle, pos)) != std::string::npos)
+            {
+                ++count;
+                pos += needle.size();
+            }
+            return count;
+        };
+
+        Check(res.Ok() && elapsedMs < 500,
+              "CAD-R3-07: 200×200 无字复杂块 MINSERT 经缓存剪枝快速完成且不超时");
+        Check(res.ArrayCells == 4 && res.Rows == 5,
+              "CAD-R3-07: 跳过 40,000+10,000 无字阵列单元（仅展开含嵌套 ATTRIB 的 2×2=4 单元，总计 5 行 ATTRIB）");
+        Check(countSubstr(tsv, "\tOUTER_TAG\tOUTER_VALUE\n") == 1
+                  && countSubstr(tsv, "\tNESTED_TAG\tNESTED_VALUE\n") == 4,
+              "CAD-R3-07: 外层与嵌套 ATTRIB 一字不漏准确导出");
     }
 }
 
@@ -925,6 +1084,7 @@ int main()
     TestCompareResourceLifecycle();
     TestEditorToolCancelReentrancy();
     TestEmbedMarkupDirtyState();
+    TestSaTextExportNonTextBlockPruning();
     std::printf("MiniCADEmbedHostTests: %d failure(s)\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

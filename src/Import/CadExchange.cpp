@@ -1171,16 +1171,23 @@ namespace MiniCAD
                                  const std::string& xrefPath, BlockEntity& target)
             {
                 namespace fs = std::filesystem;
-                auto record = [&](CadSemanticSnapshot::XrefLoadStatus status, const std::string& resolvedUtf8 = {})
+                auto record = [&](CadSemanticSnapshot::XrefLoadStatus status,
+                                  const std::string& resolvedUtf8 = {},
+                                  bool versionVerified = false,
+                                  std::uint64_t sizeBytes = 0,
+                                  std::int64_t mtimeMs = 0)
                 {
                     if (parent.Records == nullptr)
                         return;
                     CadSemanticSnapshot::XrefLoadRecord rec;
-                    rec.BlockName    = name;
-                    rec.ParentDir    = parent.HostDir.empty() ? std::string() : PathToUtf8(parent.HostDir);
-                    rec.RawPath      = xrefPath;
-                    rec.ResolvedPath = resolvedUtf8;
-                    rec.Status       = status;
+                    rec.BlockName       = name;
+                    rec.ParentDir       = parent.HostDir.empty() ? std::string() : PathToUtf8(parent.HostDir);
+                    rec.RawPath         = xrefPath;
+                    rec.ResolvedPath    = resolvedUtf8;
+                    rec.Status          = status;
+                    rec.VersionVerified = versionVerified;
+                    rec.SizeBytes       = sizeBytes;
+                    rec.MtimeMs         = mtimeMs;
                     parent.Records->push_back(std::move(rec));
                 };
 
@@ -1209,6 +1216,10 @@ namespace MiniCAD
                     return false;
                 }
 
+                std::uint64_t preSize = 0;
+                std::int64_t  preMtime = 0;
+                const bool preOk = (parent.Records != nullptr) && TryStatFileVersion(file, preSize, preMtime);
+
                 std::ifstream in(file, std::ios::binary);
                 if (!in)
                 {
@@ -1223,6 +1234,16 @@ namespace MiniCAD
                     record(CadSemanticSnapshot::XrefLoadStatus::LoadFailed, resolvedUtf8);
                     return false;
                 }
+                in.close();
+
+                std::uint64_t postSize = 0;
+                std::int64_t  postMtime = 0;
+                const bool postOk = (parent.Records != nullptr) && TryStatFileVersion(file, postSize, postMtime);
+                const bool versionVerified = preOk && postOk
+                    && preSize == postSize
+                    && preMtime == postMtime
+                    && bytes.size() == preSize;
+
                 const Dwg::CadFileInfo info = Dwg::DetectFileFormat({ bytes.data(), std::min<size_t>(bytes.size(), 1024) });
                 if (info.format == Dwg::CadFileFormat::Unknown)
                 {
@@ -1239,7 +1260,10 @@ namespace MiniCAD
                     return false;
                 }
 
-                record(CadSemanticSnapshot::XrefLoadStatus::Loaded, resolvedUtf8);
+                record(CadSemanticSnapshot::XrefLoadStatus::Loaded, resolvedUtf8,
+                       versionVerified,
+                       versionVerified ? preSize : 0,
+                       versionVerified ? preMtime : 0);
 
                 auto ctx = std::make_shared<XrefContext>();
                 ctx->HostDir     = file.parent_path();
@@ -4854,6 +4878,7 @@ namespace MiniCAD
                 ExportLayers();
                 ExportTextStyles();
                 ExportBlocks();
+                BuildPaperSpaceLayoutMap();
 
                 if (m_source != nullptr)
                     PatchDrawingSpaces();
@@ -5012,7 +5037,7 @@ namespace MiniCAD
                         {
                             if (auto* rec = m_db.FindAs<Dwg::BlockRecord>(rh))
                             {
-                                if (Lower(rec->Name).rfind("*paper_space", 0) == 0)
+                                if (IsPaperSpaceRecord(*rec))
                                     std::erase_if(rec->Entities, [&](Dwg::Handle h) { return removed.count(h) != 0; });
                             }
                         }
@@ -5026,38 +5051,98 @@ namespace MiniCAD
                     LOG_WARN_TR("DWG/DXF 导出：{0} 个修改过的TCH对象写为普通几何", rewrittenTch);
             }
 
+            static bool IsPaperSpaceRecord(const Dwg::BlockRecord& rec)
+            {
+                return Lower(rec.Name).rfind("*paper_space", 0) == 0;
+            }
+
             // ── 布局导出 ──────────────────────────────────────────────────
             //
-            // 布局与图纸空间块记录的对应关系：
-            //   第 1 张布局 → *Paper_Space
-            //   第 2 张     → *Paper_Space0
-            //   第 3 张     → *Paper_Space1  …（AutoCAD 的命名约定）
-            // LAYOUT 对象的 AssociatedBlockHandle(330) 指向该块记录，TabOrder(71) 定顺序。
-            //
-            // 图纸空间实体按 LayoutKey 找到所属布局，挂到对应块记录上 ——
-            // 写出侧据所有者自动写组码 67，实体与布局的归属关系随之保留。
-            Dwg::BlockRecord* PaperSpaceRecordFor(uint64_t layoutKey)
+            // 写出实体与 LAYOUT 前先建立唯一双射 LayoutKey -> *Paper_Space* 块记录：
+            //   1. Pass 1 优先保留原图既有合法纸空间块所有者（LayoutKey == BlockRecord::ObjectHandle）；
+            //   2. 原图保留写出时，清理未被 Pass 1 认领的 *Paper_Space* 块（如已删布局遗留块）的旧实体；
+            //   3. Pass 2 为新布局顺序认领未被占用的 *Paper_Space / *Paper_Space0 / *Paper_Space1 ... 或新建块记录。
+            // TargetSpaceRecordFor / PaperSpaceRecordFor / ExportLayouts 共用该唯一映射，杜绝增删布局后串页。
+            void BuildPaperSpaceLayoutMap()
             {
-                // 先按 LayoutKey（= 导入时的块记录句柄）找已存在的记录
-                if (layoutKey != 0)
-                    if (auto* rec = m_db.FindAs<Dwg::BlockRecord>(static_cast<Dwg::Handle>(layoutKey)))
-                        return rec;
-
-                // 找不到（新建文档、或布局换了序号）：按布局名另建 / 复用一个
+                m_layoutRecords.clear();
+                std::set<Dwg::Handle> claimed;
                 const auto& layouts = m_scene.Layouts();
-                int paperIndex = 0;
-                for (size_t i = 0; i < layouts.size(); ++i)
+
+                // Pass 1：保留既有合法纸空间块所有者
+                for (const DrawingLayout& dl : layouts)
                 {
-                    if (layouts[i].Model) continue;
-                    if (layouts[i].OwnerKey == layoutKey)
-                        break;
-                    ++paperIndex;
+                    if (dl.Model || dl.OwnerKey == 0)
+                        continue;
+                    if (auto* rec = m_db.FindAs<Dwg::BlockRecord>(static_cast<Dwg::Handle>(dl.OwnerKey)))
+                    {
+                        if (IsPaperSpaceRecord(*rec) && claimed.insert(rec->ObjectHandle).second)
+                            m_layoutRecords[dl.OwnerKey] = rec;
+                    }
                 }
-                const std::string name = paperIndex == 0 ? "*Paper_Space"
-                                                         : "*Paper_Space" + std::to_string(paperIndex - 1);
-                if (auto* existing = m_db.FindTableEntry<Dwg::BlockRecord>(m_db.BlockRecords(), name))
-                    return existing;
-                return m_db.CreateBlockRecord(name);
+
+                // 清理未被 Pass 1 认领的既有 *Paper_Space* 块残留实体（同步移除归属它们的旧对象并清空 Entities）
+                if (m_source != nullptr)
+                {
+                    if (const Dwg::CadTable* recs = m_db.BlockRecords())
+                    {
+                        for (Dwg::Handle rh : recs->Entries)
+                        {
+                            auto* rec = m_db.FindAs<Dwg::BlockRecord>(rh);
+                            if (rec == nullptr || !IsPaperSpaceRecord(*rec) || claimed.count(rec->ObjectHandle) != 0)
+                                continue;
+                            for (Dwg::Handle eh : rec->Entities)
+                            {
+                                if (eh == rec->BlockEntityHandle || eh == rec->BlockEndHandle)
+                                    continue;
+                                if (const auto* obj = m_db.Find(eh); obj != nullptr && obj->OwnerHandle == rec->ObjectHandle)
+                                    m_db.RemoveObject(eh);
+                            }
+                            rec->Entities.clear();
+                        }
+                    }
+                }
+
+                // Pass 2：为新布局顺序认领未被 claimed 占用的纸空间块或新建块记录
+                int nextPaperIndex = 0;
+                for (const DrawingLayout& dl : layouts)
+                {
+                    if (dl.Model || m_layoutRecords.count(dl.OwnerKey) != 0)
+                        continue;
+
+                    Dwg::BlockRecord* assigned = nullptr;
+                    while (assigned == nullptr)
+                    {
+                        const std::string name = nextPaperIndex == 0
+                            ? "*Paper_Space"
+                            : "*Paper_Space" + std::to_string(nextPaperIndex - 1);
+                        ++nextPaperIndex;
+                        if (auto* existing = m_db.FindTableEntry<Dwg::BlockRecord>(m_db.BlockRecords(), name))
+                        {
+                            if (claimed.count(existing->ObjectHandle) != 0)
+                                continue;
+                            assigned = existing;
+                        }
+                        else
+                        {
+                            assigned = m_db.CreateBlockRecord(name);
+                            if (assigned == nullptr)
+                                break;
+                        }
+                    }
+                    if (assigned != nullptr)
+                    {
+                        claimed.insert(assigned->ObjectHandle);
+                        m_layoutRecords[dl.OwnerKey] = assigned;
+                    }
+                }
+            }
+
+            Dwg::BlockRecord* PaperSpaceRecordFor(uint64_t layoutKey) const
+            {
+                if (const auto it = m_layoutRecords.find(layoutKey); it != m_layoutRecords.end())
+                    return it->second;
+                return nullptr;
             }
 
             // 把 Scene 的布局表写成 LAYOUT 对象。
@@ -5136,6 +5221,8 @@ namespace MiniCAD
 
                     if (Dwg::Layout* added = m_db.Add(std::move(lay)))
                     {
+                        added->OwnerHandle = layoutDict->ObjectHandle;
+                        rec->LayoutHandle  = added->ObjectHandle;
                         layoutDict->EntryNames.push_back(dl.Name);
                         layoutDict->EntryHandles.push_back(added->ObjectHandle);
                     }
@@ -6711,6 +6798,7 @@ namespace MiniCAD
             int                                m_solidTooLarge = 0;
             std::map<std::string, int>         m_skipped;
             std::vector<PendingClip>           m_pendingClips;   // Convert 产生、待实体入库后挂接的裁剪边界
+            std::map<uint64_t, Dwg::BlockRecord*> m_layoutRecords; // DrawingLayout::OwnerKey -> 唯一 *Paper_Space* 块记录
         };
     }
 

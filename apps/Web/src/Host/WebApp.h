@@ -50,6 +50,7 @@ namespace MiniCAD
         bool OnRemoteFetched(int requestId, const char* path, const char* url);
         bool OnRemoteFailed(int requestId, const char* name, int status, const char* message);
         void OnRemoteCompleted(int requestId);
+        void PruneStaleRemoteRequests();
         void OnXrefsFetched(int requestId, const char* dir, const char* error);
         bool HasUnsavedDocuments() const;
         bool IsUiReady() const { return m_uiReady; }   // 嵌入模式：图形设备与界面都就绪后才接受打开图纸
