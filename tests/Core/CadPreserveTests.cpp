@@ -618,5 +618,157 @@ int main()
         }
     }
 
+    // 8. CAD-R4-01：只删除 LayoutA(*Paper_Space)、保留 LayoutB(*Paper_Space0)、不新增布局，
+    // 经 Document 原图保留保存 → 重读 → 再保存 → 再重读：布局表恒为 Model + LayoutB（读回时不得为孤立的
+    // *Paper_Space 补建幽灵 Layout1），LayoutB 的序号、原块句柄与原图元归属全程不变
+    {
+        CadDatabase db4;
+        db4.SetVersion(CadVersion::AC1027);
+        db4.CreateDefaults();
+        db4.Classes.push_back(Class("TCH_WALL", "TDbWall", 500));
+        const Handle wallH4 = db4.AddEntity(db4.ModelSpace(), Wall())->ObjectHandle;
+
+        // LayoutA 绑定 *Paper_Space（CreateDefaults 的 Layout1 改名而来）：放 1 条线
+        BlockRecord* psA4 = db4.PaperSpace();
+        if (CadDictionary* ld = db4.FindNamedDictionary("ACAD_LAYOUT"))
+        {
+            for (size_t i = 0; i < ld->EntryNames.size() && i < ld->EntryHandles.size(); ++i)
+            {
+                if (auto* lay = db4.FindAs<Layout>(ld->EntryHandles[i]); lay && lay->AssociatedBlockHandle == psA4->ObjectHandle)
+                {
+                    lay->Name = "LayoutA";
+                    ld->EntryNames[i] = "LayoutA";
+                }
+            }
+        }
+        auto laLine4 = std::make_unique<Line>();
+        laLine4->StartPoint = { 1, 1, 0 }; laLine4->EndPoint = { 11, 1, 0 };
+        const Handle laLineH4 = db4.AddEntity(psA4, std::move(laLine4))->ObjectHandle;
+
+        // LayoutB 绑定 *Paper_Space0：放 1 条线
+        BlockRecord* psB4 = db4.CreateBlockRecord("*Paper_Space0");
+        auto layB4 = std::make_unique<Layout>();
+        layB4->TabOrder              = 2;
+        layB4->AssociatedBlockHandle = psB4->ObjectHandle;
+        layB4->MaxExtents            = { 420, 297, 0 };
+        layB4->MaxLimits             = { 420, 297 };
+        if (CadDictionary* ld = db4.FindNamedDictionary("ACAD_LAYOUT"))
+            if (Layout* added = db4.AddDictionaryEntry(ld, "LayoutB", std::move(layB4)))
+                psB4->LayoutHandle = added->ObjectHandle;
+        auto lbLine4 = std::make_unique<Line>();
+        lbLine4->StartPoint = { 20, 20, 0 }; lbLine4->EndPoint = { 60, 20, 0 };
+        const Handle lbLineH4 = db4.AddEntity(psB4, std::move(lbLine4))->ObjectHandle;
+        const Handle psAH4 = psA4->ObjectHandle;
+        const Handle psBH4 = psB4->ObjectHandle;
+
+        DwgWriteOptions wopt4;
+        wopt4.Version = CadVersion::AC1027;
+        const auto srcBytes4 = WriteDwg(db4, wopt4);
+        const auto origDb4   = ReadDwg(srcBytes4, {});
+        Check(!srcBytes4.empty() && origDb4 != nullptr, "CAD-R4-01: LayoutA(*Paper_Space) + LayoutB(*Paper_Space0) fixture written");
+
+        // 经 Document 打开 → （第 1 轮）删除 LayoutA → 原图保留保存到同一路径，返回保存后的字节
+        auto saveViaDocument = [](const std::vector<std::uint8_t>& bytes, bool removeLayoutA, bool& ok)
+        {
+            const auto path = std::filesystem::temp_directory_path() / "MiniCADPreserveDeleteFirstLayout.dwg";
+            { std::ofstream out(path, std::ios::binary); out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size()); }
+            const auto u8 = path.u8string();
+            const std::string p(u8.begin(), u8.end());
+            MiniCAD::Document doc;
+            ok = doc.LoadFromFile(p) && doc.GetCadSource() != nullptr;
+            if (ok && removeLayoutA)
+            {
+                uint64_t keyA = 0;
+                for (const auto& l : doc.GetScene().Layouts())
+                    if (!l.Model && l.Name == "LayoutA") keyA = l.OwnerKey;
+                ok = keyA != 0 && doc.GetCommandStack().Execute(std::make_unique<MiniCAD::RemoveLayoutCommand>(keyA), doc.GetScene());
+            }
+            ok = ok && doc.SaveToFile(p);
+            std::ifstream in(path, std::ios::binary);
+            std::vector<std::uint8_t> saved{ std::istreambuf_iterator<char>(in), {} };
+            in.close();
+            std::filesystem::remove(path);
+            return saved;
+        };
+
+        // 读回校验：DWG 库层（LAYOUT 对象、ACAD_LAYOUT 字典、块归属）与场景层（布局表、图纸实体归属）
+        auto verifyRound = [&](const std::vector<std::uint8_t>& bytes, const std::string& round)
+        {
+            const auto db = ReadDwg(bytes, {});
+            Check(db != nullptr, (round + ": saved DWG re-reads").c_str());
+            if (!db)
+                return;
+
+            int paperLayouts = 0;
+            bool ghost = false;
+            const Layout* relB = nullptr;
+            for (const auto& [h, obj] : db->Objects())
+            {
+                const auto* lay = dynamic_cast<const Layout*>(obj.get());
+                if (lay == nullptr)
+                    continue;
+                if (lay->Name == "Layout1" || lay->Name == "LayoutA")
+                    ghost = true;
+                const auto* rec = db->FindAs<BlockRecord>(lay->AssociatedBlockHandle);
+                if (rec != nullptr && rec->Name.starts_with("*Paper_Space"))
+                {
+                    ++paperLayouts;
+                    if (lay->Name == "LayoutB") relB = lay;
+                }
+            }
+            Check(paperLayouts == 1 && !ghost && relB != nullptr,
+                  (round + ": exactly one paper layout LayoutB, no ghost Layout1 / LayoutA").c_str());
+            Check(relB && relB->AssociatedBlockHandle == psBH4 && relB->TabOrder == 1,
+                  (round + ": LayoutB keeps *Paper_Space0 block handle and tab order 1").c_str());
+
+            std::vector<std::string> dictPaper;
+            if (const CadDictionary* ld = db->FindNamedDictionary("ACAD_LAYOUT"))
+                for (const auto& name : ld->EntryNames)
+                    if (name != "Model") dictPaper.push_back(name);
+            Check(dictPaper == std::vector<std::string>{ "LayoutB" }, (round + ": ACAD_LAYOUT lists only Model + LayoutB").c_str());
+
+            const BlockRecord* recB = db->FindAs<BlockRecord>(psBH4);
+            const BlockRecord* recA = db->FindAs<BlockRecord>(psAH4);
+            const Line* lb = db->FindAs<Line>(lbLineH4);
+            Check(recB && recB->Name == "*Paper_Space0" && relB && recB->LayoutHandle == relB->ObjectHandle
+                      && lb && lb->OwnerHandle == psBH4 && recB->Entities == std::vector<Handle>{ lbLineH4 },
+                  (round + ": LayoutB original line keeps exact handle and sole *Paper_Space0 ownership").c_str());
+            Check(db->Find(laLineH4) == nullptr && (recA == nullptr || (recA->Entities.empty() && db->FindAs<Layout>(recA->LayoutHandle) == nullptr)),
+                  (round + ": deleted LayoutA leaves an empty, layout-less *Paper_Space").c_str());
+            Check(SameRaw(*origDb4, *db, wallH4), (round + ": model space TCH_WALL preserved bit-for-bit").c_str());
+
+            MiniCAD::Scene scene;
+            Check(MiniCAD::ImportCad(bytes, scene), (round + ": saved DWG re-imports").c_str());
+            std::vector<std::string> names;
+            int idxB = -1;
+            for (size_t i = 0; i < scene.Layouts().size(); ++i)
+            {
+                const auto& l = scene.Layouts()[i];
+                if (l.Model) continue;
+                names.push_back(l.Name);
+                if (l.Name == "LayoutB" && l.OwnerKey == static_cast<uint64_t>(psBH4)) idxB = static_cast<int>(i);
+            }
+            Check(names == std::vector<std::string>{ "LayoutB" } && idxB == 1 && scene.FindLayout(static_cast<uint64_t>(psBH4)) == 1,
+                  (round + ": re-imported layout list is Model + LayoutB(*Paper_Space0) at index 1").c_str());
+            int inB = 0, stray = 0;
+            scene.ForEachObject([&](const MiniCAD::Object& o) {
+                if (!o.IsKindOf<MiniCAD::Entity>()) return;
+                const auto& e = static_cast<const MiniCAD::Entity&>(o);
+                if (!e.GetAttr().InPaperSpace) return;
+                (e.GetAttr().LayoutKey == static_cast<uint64_t>(psBH4) ? inB : stray) += 1;
+            });
+            Check(inB == 1 && stray == 0, (round + ": paper entities belong only to LayoutB").c_str());
+        };
+
+        bool ok1 = false, ok2 = false;
+        const auto saved1 = saveViaDocument(srcBytes4, true, ok1);
+        Check(ok1 && !saved1.empty(), "CAD-R4-01: delete LayoutA only, keep LayoutB, save via Document");
+        verifyRound(saved1, "CAD-R4-01 round 1");
+
+        const auto saved2 = saveViaDocument(saved1, false, ok2);
+        Check(ok2 && !saved2.empty(), "CAD-R4-01: reopen and save again via Document");
+        verifyRound(saved2, "CAD-R4-01 round 2");
+    }
+
     return g_failed;
 }

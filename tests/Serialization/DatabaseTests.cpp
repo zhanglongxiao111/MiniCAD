@@ -148,3 +148,62 @@ TEST(Database_AddEntity_DefaultsLayerAndLineType)
     CHECK(added->LineTypeHandle == db.FindTableEntry(db.LineTypes(), "ByLayer")->ObjectHandle);
     CHECK(db.ModelSpace()->Entities.size() == 1);
 }
+
+TEST(Database_CreateDefaults_SkipsLayout1WhenOtherPaperLayoutExists)
+{
+    // CAD-R4-01：删掉 *Paper_Space 上的布局、保留 *Paper_Space0 上的布局后，
+    // CreateDefaults() 不得为孤立的 *Paper_Space 补建用户可见的空 Layout1 与整页视口
+    CadDatabase db;
+    db.CreateDefaults();
+
+    BlockRecord* paper0 = db.PaperSpace();
+    CHECK(paper0 != nullptr);
+    const Handle oldLayout1 = paper0 ? paper0->LayoutHandle : kNullHandle;
+    if (paper0)
+    {
+        for (Handle eh : paper0->Entities)
+            db.RemoveObject(eh);
+        paper0->Entities.clear();
+        paper0->LayoutHandle = kNullHandle;
+    }
+    if (oldLayout1 != kNullHandle)
+        db.RemoveObject(oldLayout1);
+    if (CadDictionary* layouts = db.FindNamedDictionary("ACAD_LAYOUT"))
+    {
+        for (std::size_t i = layouts->EntryHandles.size(); i-- > 0;)
+        {
+            if (layouts->EntryHandles[i] == oldLayout1)
+            {
+                layouts->EntryHandles.erase(layouts->EntryHandles.begin() + static_cast<std::ptrdiff_t>(i));
+                if (i < layouts->EntryNames.size())
+                    layouts->EntryNames.erase(layouts->EntryNames.begin() + static_cast<std::ptrdiff_t>(i));
+            }
+        }
+    }
+
+    BlockRecord* paperB = db.CreateBlockRecord("*Paper_Space0");
+    auto layB = std::make_unique<Layout>();
+    layB->TabOrder = 1;
+    layB->AssociatedBlockHandle = paperB->ObjectHandle;
+    Layout* addedB = db.AddDictionaryEntry(db.FindNamedDictionary("ACAD_LAYOUT"), "LayoutB", std::move(layB));
+    CHECK(addedB != nullptr);
+    paperB->LayoutHandle = addedB->ObjectHandle;
+
+    db.CreateDefaults();
+
+    CHECK(db.FindAs<Layout>(paper0->LayoutHandle) == nullptr);
+    CHECK(paper0->Entities.empty());
+    CHECK(db.FindDictionaryEntry(db.FindNamedDictionary("ACAD_LAYOUT"), "Layout1") == nullptr);
+    CHECK(db.FindDictionaryEntry(db.FindNamedDictionary("ACAD_LAYOUT"), "LayoutB") == addedB);
+    int paperLayoutCount = 0;
+    for (const auto& [h, obj] : db.Objects())
+    {
+        const auto* lay = dynamic_cast<const Layout*>(obj.get());
+        if (lay == nullptr)
+            continue;
+        const auto* rec = db.FindAs<BlockRecord>(lay->AssociatedBlockHandle);
+        if (rec != nullptr && rec->Name.starts_with("*Paper_Space"))
+            ++paperLayoutCount;
+    }
+    CHECK(paperLayoutCount == 1);
+}

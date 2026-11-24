@@ -49,6 +49,25 @@ namespace MiniDWG
             { "CVIEWDETAILSTYLE", "Metric50" },
             { "CVIEWSECTIONSTYLE", "Metric50" },
         };
+
+        bool IsPaperSpaceName(std::string_view name)
+        {
+            constexpr std::string_view prefix = "*Paper_Space";
+            return name.size() >= prefix.size() && EqualsIgnoreCase(name.substr(0, prefix.size()), prefix);
+        }
+
+        // 库内是否已有合法的图纸布局：LAYOUT 对象关联到存在的 *Paper_Space* 块记录（*Paper_Space、*Paper_Space0 …）。
+        // 判据与 CadExchange 读布局一致：遍历全部 LAYOUT 对象，按关联块记录区分模型页与图纸页
+        bool HasPaperSpaceLayout(const CadDatabase& db)
+        {
+            return std::any_of(db.Objects().begin(), db.Objects().end(), [&](const auto& item) {
+                const auto* layout = dynamic_cast<const Layout*>(item.second.get());
+                if (layout == nullptr)
+                    return false;
+                const auto* record = db.FindAs<BlockRecord>(layout->AssociatedBlockHandle);
+                return record != nullptr && IsPaperSpaceName(record->Name);
+            });
+        }
     }
 
     const DxfClassInfo& CadTable::GetClassInfo() const
@@ -394,7 +413,10 @@ namespace MiniDWG
         BlockRecord* paper = PaperSpace();
         if (paper == nullptr)
             paper = CreateBlockRecord("*Paper_Space");
-        if (FindAs<Layout>(paper->LayoutHandle) == nullptr)
+        // 只在库里没有任何图纸布局时（新建图纸、R12 文件）补默认 Layout1。
+        // 删掉 *Paper_Space 上的布局、保留 *Paper_Space0 上的布局后保存的文件，*Paper_Space 块记录仍在但没有布局：
+        // 这时它只是空块，补建 Layout1 会让读回的布局表凭空多出一页
+        if (FindAs<Layout>(paper->LayoutHandle) == nullptr && !HasPaperSpaceLayout(*this))
         {
             Layout* layout = CreateLayout(paper, "Layout1", 1);
             const bool hasViewport = std::any_of(paper->Entities.begin(), paper->Entities.end(),
