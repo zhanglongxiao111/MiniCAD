@@ -649,6 +649,14 @@ namespace MiniCAD
         return m_idleEditor;
     }
 
+    const Editor& DocumentManager::GetMainEditor() const
+    {
+        if (m_mainDoc)
+            if (auto it = m_editors.find(m_mainDoc); it != m_editors.end())
+                return *it->second;
+        return m_idleEditor;
+    }
+
     Editor& DocumentManager::GetEditor(Document& doc)
     {
         return EnsureEditor(doc, m_idleEditor);

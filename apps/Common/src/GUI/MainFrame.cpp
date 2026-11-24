@@ -19,6 +19,7 @@
 #include "Core/Entity/TextEntity.hpp"
 #include "Document/Command/AddEntityCommand.h"
 #include "Document/SaTextExport.h"
+#include "Document/SaSelectionExport.h"
 #include "Document/CommandStack/CommandStack.h"
 #include "Document/Command/LayoutCommands.h"
 #include "Import/CadExchange.h"
@@ -570,6 +571,25 @@ namespace MiniCAD
     {
         const Document* doc = m_docManager.GetActive();
         return doc ? SaTextExport::ExportTsv(doc->GetScene()) : std::string();
+    }
+
+    std::uint32_t MainFrame::EmbedSelectionVersion() const
+    {
+        const Document* doc = m_docManager.GetMainDocument();
+        if (!doc)
+            return 0u;
+        const Editor& editor = m_docManager.GetMainEditor();
+        return SaSelectionExport::ComputeEmbedSelectionVersion(doc, &editor);
+    }
+
+    std::string MainFrame::EmbedGetSelectionJson(int maxItems) const
+    {
+        const Document* doc = m_docManager.GetMainDocument();
+        if (!doc)
+            return SaSelectionExport::EmptySelectionJson();
+        const Editor& editor = m_docManager.GetMainEditor();
+        return SaSelectionExport::ExportSelectionJson(
+            doc->GetScene(), editor.GetSelection(), doc->GetCadSource(), maxItems, doc);
     }
 
     bool MainFrame::EmbedWindowToWorld(float x, float y, double& worldX, double& worldY)

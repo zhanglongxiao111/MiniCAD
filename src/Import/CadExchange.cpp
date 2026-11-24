@@ -6824,6 +6824,16 @@ namespace MiniCAD
         return source != nullptr ? source->TchCount : 0;
     }
 
+    std::uint64_t LookupCadEntityHandle(const CadSource* source, Object::ObjectID id)
+    {
+        if (source == nullptr || id == Object::InvalidID)
+            return 0;
+        const auto it = source->Links.find(id);
+        if (it == source->Links.end())
+            return 0;
+        return static_cast<std::uint64_t>(it->second.Handle);
+    }
+
     std::vector<std::uint8_t> ExportCad(const Scene& scene, CadFileKind kind, CadSaveVersion version, std::string* error,
                                         const CadSource* source)
     {

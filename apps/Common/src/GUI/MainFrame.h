@@ -126,6 +126,10 @@ namespace MiniCAD
         void EmbedSyncRibbonTab();     // 功能区选中与当前模式一致的选项卡，并挂上选项卡切换回调
         // 当前图纸全部文字（TEXT / MTEXT / ATTRIB）的 TSV（格式见 Document/SaTextExport.h）；没有文档返回空
         std::string EmbedExportTextTsv() const;
+        // 当前主文档选中状态版本号（无主文档返回 0；换主图 / 切换布局 / 改变选中集合时必变，静止时不变）
+        std::uint32_t EmbedSelectionVersion() const;
+        // 当前主文档选中图元摘要 JSON（格式见 Document/SaSelectionExport.h；maxItems 钳位在 [1, 50]）
+        std::string EmbedGetSelectionJson(int maxItems = 20) const;
         // 窗口逻辑坐标（画布 CSS 像素）→ 当前文档主视口的世界坐标；没有文档或点不在主视口内返回 false
         bool EmbedWindowToWorld(float x, float y, double& worldX, double& worldY);
         void EmbedZoomAll();

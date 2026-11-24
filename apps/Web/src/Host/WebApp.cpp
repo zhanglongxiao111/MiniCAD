@@ -460,6 +460,26 @@ namespace MiniCAD
             return 1;
         }
 
+        EMSCRIPTEN_KEEPALIVE unsigned int MiniCADEmbed_GetSelectionVersion()
+        {
+            return g_app ? static_cast<unsigned int>(g_app->GetFrame().EmbedSelectionVersion()) : 0u;
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_GetSelection(const char* outPath, int maxItems)
+        {
+            if (!g_app || !outPath || !*outPath)
+                return 0;
+            const std::string json = g_app->GetFrame().EmbedGetSelectionJson(maxItems);
+            if (json.empty())
+                return 0;
+            FILE* f = std::fopen(outPath, "wb");
+            if (!f)
+                return 0;
+            const std::size_t written = std::fwrite(json.data(), 1, json.size(), f);
+            const int closeOk = std::fclose(f);
+            return (written == json.size() && closeOk == 0) ? 1 : 0;
+        }
+
         EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_OpenDrawing(const char* fsPath)
         {
             if (g_app && fsPath && *fsPath)

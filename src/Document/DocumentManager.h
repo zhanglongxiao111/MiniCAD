@@ -86,8 +86,9 @@ namespace MiniCAD
         Document* GetMainDocument() const { return m_mainDoc; }
         // 主视口改显示 doc（主窗格里的文档；保存原文档的相机、恢复它的），不改当前文档。nullptr = 主视口空着
         void      SetMainDocument(Document* doc);
-        Editor&   GetMainEditor();              // 主视口文档的编辑器；没有时空闲编辑器
-        Editor&   GetEditor(Document& doc);     // 某个文档的编辑器（没有就建）
+        Editor&       GetMainEditor();              // 主视口文档的编辑器；没有时空闲编辑器
+        const Editor& GetMainEditor() const;
+        Editor&       GetEditor(Document& doc);     // 某个文档的编辑器（没有就建）
 
         // 把文档从主窗格拖出到自己的新窗格（CreatePane + MoveDocument）：返回那个窗格的视口，
         // 文档不存在、不在主窗格或视口还没建时 nullptr。当前文档不变

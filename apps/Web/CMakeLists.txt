@@ -11,13 +11,17 @@ target_link_libraries(MiniCADWebHost PRIVATE MiniI18n)     # 出错信息按界�
 
 set(MINICAD_WEB_SHELL "${CMAKE_CURRENT_SOURCE_DIR}/shell/minigui_shell.html")
 
-# 网页程序共用的链接选项
+# 网页程序共用的链接选项（可选第二参数：额外导出符号，逗号开头）
 function(minicad_web_executable target)
+    set(_exported "_main,_malloc,_free")
+    if(ARGC GREATER 1)
+        set(_exported "${_exported}${ARGV1}")
+    endif()
     target_link_options(${target} PRIVATE
         -sMIN_WEBGL_VERSION=2
         -sMAX_WEBGL_VERSION=2
         -sALLOW_MEMORY_GROWTH=1
-        -sEXPORTED_FUNCTIONS=_main,_malloc,_free
+        "-sEXPORTED_FUNCTIONS=${_exported}"
         -sENVIRONMENT=web
         "SHELL:--shell-file ${MINICAD_WEB_SHELL}"
     )
@@ -65,7 +69,7 @@ if(MINICAD_WITH_SOLID)
     # SMLib 的数值算法递归较深，emcc 默认 64 KB 的栈在建模时会溢出（表现为 call_indirect 报错），给 8 MB
     target_link_options(MiniCADWeb PRIVATE -sSTACK_SIZE=8388608)
 endif()
-minicad_web_executable(MiniCADWeb)
+minicad_web_executable(MiniCADWeb ",_MiniCADEmbed_GetSelectionVersion,_MiniCADEmbed_GetSelection")
 # 嵌入模式：宿主页要用虚拟文件系统写入图纸、读回坐标
 target_link_options(MiniCADWeb PRIVATE "-sEXPORTED_RUNTIME_METHODS=FS,stringToNewUTF8,HEAPF64")
 # 资源打包到虚拟文件系统根目录：/fonts（CAD 字体 + 界面字体）、/icons、/patterns、/ui、/nodes（示例节点图）、/samples（示例图纸）、/i18n（翻译文件）

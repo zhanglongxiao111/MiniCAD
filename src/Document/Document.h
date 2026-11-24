@@ -40,6 +40,7 @@ namespace MiniCAD
 		bool CanRedo() const { return m_cmdStack.CanRedo(); }
 
 		// ── 文档信息 ───────────────────────────────
+		uint64_t           InstanceID() const { return m_instanceId; }   // 进程内唯一实例编号（非 0）
 		const std::string& GetName() const { return m_name; }
 		const std::string& GetPath() const { return m_path; }
 
@@ -107,6 +108,7 @@ namespace MiniCAD
 		void Deserialize(ISerializer& s);
 
 	private:
+		uint64_t       m_instanceId = 0;
 		CadSaveVersion m_cadVersion = kDefaultCadSaveVersion;
 		std::shared_ptr<const CadSource> m_cadSource;   // 打开的 DWG / DXF 原图：另存为同格式同版本时据此原样保留未修改的对象
 		Scene          m_scene;

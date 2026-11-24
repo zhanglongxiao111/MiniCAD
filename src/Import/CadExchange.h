@@ -1,6 +1,7 @@
 #pragma once
 // DWG / DXF 文件交换：经 MiniDWG 的 CadDatabase 与 Scene 互相转换。
 // 公开头文件不暴露 MiniDWG 类型。
+#include "Core/Object/Object.hpp"
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -88,4 +89,7 @@ namespace MiniCAD
 
     // 原图中模型空间的TCH对象（TCH_*）个数；source 为空时为 0
     int CadSourceTchCount(const CadSource* source);
+
+    // 查询场景实体对应的原图 DWG/DXF 句柄；source 为空或找不到（如新建实体）返回 0
+    std::uint64_t LookupCadEntityHandle(const CadSource* source, Object::ObjectID id);
 }

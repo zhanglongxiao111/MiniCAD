@@ -9,6 +9,7 @@
 #include "Serialization/BinarySerializer.h"
 #include "Serialization/SerializeHelpers.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <filesystem>
 #include <fstream>
@@ -19,6 +20,8 @@ namespace MiniCAD
 {
     namespace
     {
+        std::atomic<uint64_t> g_nextDocumentInstanceId{ 1 };
+
         // std::string(UTF-8) → std::filesystem::path,中文路径在 Windows 下正确解码。
         std::filesystem::path Utf8Path(const std::string& utf8)
         {
@@ -41,7 +44,8 @@ namespace MiniCAD
     }
 
     Document::Document()
-        : m_scene()
+        : m_instanceId(g_nextDocumentInstanceId.fetch_add(1, std::memory_order_relaxed))
+        , m_scene()
         , m_cmdStack()
     {
         // 所有编辑都经由 CommandStack,在此统一标记未保存

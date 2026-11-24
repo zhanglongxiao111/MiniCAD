@@ -79,6 +79,7 @@ namespace MiniCAD
 
         // ── Picking / 选择 ────────────────────────────────────
         const std::unordered_set<Object::ObjectID>& GetSelection();
+        const std::unordered_set<Object::ObjectID>& GetSelection() const { return m_picking.GetSelection(); }
         void SetSelection(std::unordered_set<Object::ObjectID> ids);   // 整体替换选择集
         // 全选：选中所有可拾取的对象（可见、所在图层未关闭也未锁定），替换当前选择集；返回选中的个数。
         // 工具进行中不处理（返回 0），避免改动工具已经拿到的对象列表
@@ -100,6 +101,7 @@ namespace MiniCAD
 
         Object*              GetPrimarySelectedObject();
         std::vector<Object*> GetSelectedObjects();
+        uint64_t SelectionVersion()    const { return m_picking.SelectionVersion(); }   // 选择集每次变化加一
         uint64_t GetSelectionVersion() const { return m_picking.SelectionVersion(); }   // 选择集每次变化加一
         // 选择集里可以修改的对象（排除锁定图层上的）；announce 为真时在命令行说明跳过了几个。
         // 所有修改 / 删除已有对象的操作都从这里取对象；复制 / 偏移这类只读原对象的操作用 GetSelectedObjects

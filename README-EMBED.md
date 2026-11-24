@@ -24,6 +24,7 @@
 2. **宿主嵌入与浏览/批注双模式**
    - `?chrome=viewer|canvas` 嵌入外观与布局裁剪；浏览/批注双模式命令白名单与撤销栈否决钩子。
    - 导出红色云线批注 DWG、主图与对比图外部参照列举及按目录重载、容器隐藏时启停渲染轮询、嵌入态非阻塞报错回传。
+   - **选中图元摘要导出接口**：通过 `MiniCADEmbed_GetSelectionVersion()` 轻量轮询当前主图 / 活动布局 / 选中集合的稳定版本号（无主图返回 `0`），并通过 `MiniCADEmbed_GetSelection(outPath, maxItems)`（`MainFrame::EmbedGetSelectionJson` + `src/Document/SaSelectionExport.h`）将选中图元按 `ObjectID` 升序导出为结构化 UTF-8 JSON（含 `count`、`truncated`、`bounds`、`typeCounts` 与单实体 `objectId` / `handle`（大写无 `0x` 前缀十六进制，经 `LookupCadEntityHandle` 查询并与 `SaDwgTool` SQLite `entities.handle` 一致） / `type` / `layer` / `blockName` / `text` / `length` / `area` / `radius` / `bounds`）。
 3. **无界面 DWG 文字提取工具（`SaDwgText`）**
    - Node 版 WASM 命令行工具（`apps/SaDwgText/main.cpp` + `src/Document/SaTextExport.h`），只读解析 DWG 中的 `TEXT` / `MTEXT` / `ATTRIB`（含嵌套块路径、世界坐标、字高、图层），输出标准 TSV。
 4. **通用修复**
