@@ -214,6 +214,17 @@ endif()
 minicad_test_output(MiniCADDrawingOpenTests)
 add_test(NAME MiniCADDrawingOpenTests COMMAND MiniCADDrawingOpenTests)
 
+# ── 嵌入宿主（MainFrame）生命周期、叠图资源代次与拾取回归测试 ─────────
+add_executable(MiniCADEmbedHostTests "Core/EmbedHostLifecycleTests.cpp")
+target_link_libraries(MiniCADEmbedHostTests PRIVATE MiniCADApp)
+target_compile_definitions(MiniCADEmbedHostTests PRIVATE MINICAD_ASSET_DIR="${CMAKE_SOURCE_DIR}/assets")
+if(MSVC)
+    target_compile_options(MiniCADEmbedHostTests PRIVATE /utf-8)
+    target_compile_definitions(MiniCADEmbedHostTests PRIVATE UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+minicad_test_output(MiniCADEmbedHostTests)
+add_test(NAME MiniCADEmbedHostTests COMMAND MiniCADEmbedHostTests)
+
 # 本地诊断工具（wmain 入口，只在 Windows 上编译）：tools/ 下有源文件时才编译
 if(WIN32)
     if(EXISTS "${CMAKE_SOURCE_DIR}/tools/inspect_dwg.cpp")

@@ -1,4 +1,5 @@
 // ── 嵌入选中图元摘要导出、文字导出、批注导出、拾点重入、保护门禁、对比视口与捕捉回归测试 ──
+#include "Core/Entity/MLineEntity.hpp"
 #include "Document/SaSelectionExport.h"
 #include "Document/SaTextExport.h"
 #include "Document/SaMarkupExport.h"
@@ -15,6 +16,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <string>
@@ -666,6 +669,70 @@ namespace
         }
         js.EndArray();
         Check(Near(exportedArea, 90.0, 1e-2), "CAD-23: ExportSelectionJson 输出带孔 Hatch 真实净面积 90");
+
+        // 6. CAD-R2-12：大测绘坐标 (4e8, 3.5e9) 下的 50×50、带孔与相交环奇偶净面积精度校验
+        const double ox = 4.0e8;
+        const double oy = 3.5e9;
+        {
+            HatchEntity largeSquare(10, std::vector<Polyline>{
+                makeRect(ox, oy, ox + 50.0, oy + 50.0)
+            });
+            const auto aSq = ComputeHatchNetArea(largeSquare);
+            Check(aSq.has_value() && Near(*aSq, 2500.0, 1e-6),
+                  "CAD-R2-12: 大测绘坐标 (4e8, 3.5e9) 下 50×50 方形面积精确等于 2500（无 2560 有效位抵消）");
+
+            HatchEntity largeWithHole(11, std::vector<Polyline>{
+                makeRect(ox, oy, ox + 50.0, oy + 50.0),
+                makeRect(ox + 20.0, oy + 20.0, ox + 30.0, oy + 30.0)
+            });
+            const auto aHole = ComputeHatchNetArea(largeWithHole);
+            Check(aHole.has_value() && Near(*aHole, 2400.0, 1e-6),
+                  "CAD-R2-12: 大测绘坐标下 50×50 减 10×10 孔洞精确等于 2400");
+
+            // 部分相交的两个 10×10 方形（重叠 5×5=25）：奇偶净面积 = 100 + 100 - 2*25 = 150
+            HatchEntity overlapping(12, std::vector<Polyline>{
+                makeRect(ox, oy, ox + 10.0, oy + 10.0),
+                makeRect(ox + 5.0, oy + 5.0, ox + 15.0, oy + 15.0)
+            });
+            const auto aOverlap = ComputeHatchNetArea(overlapping);
+            Check(aOverlap.has_value() && Near(*aOverlap, 150.0, 1e-6),
+                  "CAD-R2-12: 大坐标下部分相交双方形精确输出奇偶净面积 150");
+
+            // 斜边内部相交（领结自交四边形）：(0,0)-(10,10)-(10,0)-(0,10) 交点 (5,5)，两三角形各 25，净面积 50
+            HatchEntity bowtie(13, std::vector<Polyline>{
+                Polyline(std::vector<Math::Point3>{
+                    { ox, oy, 0 }, { ox + 10.0, oy + 10.0, 0 },
+                    { ox + 10.0, oy, 0 }, { ox, oy + 10.0, 0 }, { ox, oy, 0 }
+                })
+            });
+            const auto aBowtie = ComputeHatchNetArea(bowtie);
+            Check(aBowtie.has_value() && Near(*aBowtie, 50.0, 1e-6),
+                  "CAD-R2-12: 严格内部边-边相交自交环按条带切分精确算出奇偶净面积 50");
+
+            // 超大边集（>2048 边）：无交叉凸多边形精确可算，带交叉边时诚实返回 nullopt
+            std::vector<Math::Point3> bigCirclePts;
+            constexpr int kN = 2400;
+            bigCirclePts.reserve(kN + 1);
+            for (int i = 0; i <= kN; ++i)
+            {
+                const double a = Math::TwoPI * i / static_cast<double>(kN);
+                bigCirclePts.push_back({ ox + 100.0 * std::cos(a), oy + 100.0 * std::sin(a), 0.0 });
+            }
+            const double expectedPolyArea = 0.5 * kN * 100.0 * 100.0 * std::sin(Math::TwoPI / static_cast<double>(kN));
+            HatchEntity bigNonCross(14, std::vector<Polyline>{ Polyline(bigCirclePts) });
+            const auto aBigOk = ComputeHatchNetArea(bigNonCross);
+            Check(aBigOk.has_value() && Near(*aBigOk, expectedPolyArea, 1e-3),
+                  "CAD-R2-12: 超过 2048 边的非相交大环仍精确计算净面积");
+
+            // 竖边 x = ox ± 61.3 在圆周斜段内部穿越（acos(0.613) 非 360°/2400 整数倍），触发条带内边序倒置
+            HatchEntity bigCross(15, std::vector<Polyline>{
+                Polyline(bigCirclePts),
+                makeRect(ox - 61.3, oy - 120.0, ox + 61.3, oy + 120.0)
+            });
+            const auto aBigCross = ComputeHatchNetArea(bigCross);
+            Check(!aBigCross.has_value(),
+                  "CAD-R2-12: 超过 2048 边且存在条带内边序倒置的相交环诚实返回 std::nullopt");
+        }
     }
 
     // ── CAD-28 & CAD-29：大选区准确 count/scannedCount/statsTruncated 与严格 UTF-8 校验 ──
@@ -838,6 +905,82 @@ namespace
         Check(textCount == 6 && mtextCount == 6 && sawCell12, "CAD-24: MINSERT 2×3 阵列完整展开全部 6 单元");
         Check(textHeightOk && mtextHeightOk, "CAD-24: 块内文字按变换矩阵和旋转方向准确换算世界字高");
         Check(attribCount == 1 && attribOk, "CAD-24: ATTRIB 仅输出一次且保持世界坐标与字高不重复套本级矩阵");
+
+        // CAD-R2-09：双层 50×50 嵌套 MINSERT 爆炸（理论 625 万行）快速触发硬预算并返回空串，不卡死不 OOM
+        {
+            Scene bombScene;
+            auto leafBlk = std::make_unique<BlockEntity>(bombScene.NextObjectID(), "LEAF_TXT");
+            leafBlk->AddEntity(std::make_unique<TextEntity>(
+                bombScene.NextObjectID(), Math::Point3{ 0, 0, 0 }, "CELL", 10.0f));
+            const BlockID leafId = bombScene.GetBlockTable().Add(std::move(leafBlk));
+
+            auto midBlk = std::make_unique<BlockEntity>(bombScene.NextObjectID(), "MID_ARR");
+            auto innerIns = std::make_unique<InsertEntity>(
+                bombScene.NextObjectID(), leafId, "LEAF_TXT", Math::Point3{ 0, 0, 0 });
+            innerIns->SetArray(50, 50, 10.0, 10.0);
+            innerIns->SetBlock(bombScene.GetBlockTable().Find(leafId));
+            midBlk->AddEntity(std::move(innerIns));
+            const BlockID midId = bombScene.GetBlockTable().Add(std::move(midBlk));
+
+            auto outerIns = std::make_unique<InsertEntity>(
+                bombScene.NextObjectID(), midId, "MID_ARR", Math::Point3{ 0, 0, 0 });
+            outerIns->SetArray(50, 50, 600.0, 600.0);
+            bombScene.ResolveInsert(*outerIns);
+            bombScene.AddEntity(std::move(outerIns));
+
+            const auto t0 = std::chrono::steady_clock::now();
+            SaTextExport::Result res{};
+            const std::string bombTsv = SaTextExport::ExportTsv(bombScene, SaTextExport::Budget{}, &res);
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            Check(bombTsv.empty() && !res.Ok() && res.Code == SaTextExport::Status::RowBudgetExceeded && ms < 2000,
+                  "CAD-R2-09: 双层 50×50 嵌套 MINSERT 触发默认行数预算快速中止并返回空串");
+
+            // 字节预算校验
+            SaTextExport::Budget tinyBytes{};
+            tinyBytes.MaxBytes = 128;
+            SaTextExport::Result byteRes{};
+            const std::string byteTsv = SaTextExport::ExportTsv(bombScene, tinyBytes, &byteRes);
+            Check(byteTsv.empty() && byteRes.Code == SaTextExport::Status::ByteBudgetExceeded,
+                  "CAD-R2-09: 输出字节超限时立即中止并返回 ByteBudgetExceeded");
+
+            // 流式下游写入失败校验
+            std::size_t chunksSeen = 0;
+            const SaTextExport::Result sinkRes = SaTextExport::ExportTsvStream(
+                bombScene,
+                [&](std::string_view) {
+                    ++chunksSeen;
+                    return chunksSeen < 3;
+                });
+            Check(sinkRes.Code == SaTextExport::Status::SinkError && chunksSeen == 3,
+                  "CAD-R2-09: ExportTsvStream 在 sink 失败时立即中止");
+        }
+
+        // 无文字的双层 50×50 嵌套 MINSERT 触发阵列单元预算
+        {
+            Scene emptyBomb;
+            auto emptyBlk = std::make_unique<BlockEntity>(emptyBomb.NextObjectID(), "EMPTY_LEAF");
+            const BlockID leafId = emptyBomb.GetBlockTable().Add(std::move(emptyBlk));
+
+            auto midBlk = std::make_unique<BlockEntity>(emptyBomb.NextObjectID(), "MID_EMPTY");
+            auto innerIns = std::make_unique<InsertEntity>(
+                emptyBomb.NextObjectID(), leafId, "EMPTY_LEAF", Math::Point3{ 0, 0, 0 });
+            innerIns->SetArray(50, 50, 10.0, 10.0);
+            innerIns->SetBlock(emptyBomb.GetBlockTable().Find(leafId));
+            midBlk->AddEntity(std::move(innerIns));
+            const BlockID midId = emptyBomb.GetBlockTable().Add(std::move(midBlk));
+
+            auto outerIns = std::make_unique<InsertEntity>(
+                emptyBomb.NextObjectID(), midId, "MID_EMPTY", Math::Point3{ 0, 0, 0 });
+            outerIns->SetArray(50, 50, 600.0, 600.0);
+            emptyBomb.ResolveInsert(*outerIns);
+            emptyBomb.AddEntity(std::move(outerIns));
+
+            SaTextExport::Result cellRes{};
+            const std::string cellTsv = SaTextExport::ExportTsv(emptyBomb, SaTextExport::Budget{}, &cellRes);
+            Check(cellTsv.empty() && cellRes.Code == SaTextExport::Status::ArrayCellBudgetExceeded,
+                  "CAD-R2-09: 无文字嵌套 MINSERT 同样受 250,000 阵列单元预算硬约束");
+        }
     }
 
     // ── CAD-12 & CAD-13：纸张布局导出归属、退化批注框防 OOM、RAII 临时实体必清理 ────────
@@ -924,6 +1067,120 @@ namespace
         });
         Check(foundCloudInLayoutB && foundTextInLayoutB && !anyMarkupInModel,
               "CAD-12: 导出云线与说明文字精确落入目标纸张布局 LayoutB，未掉入模型空间");
+
+        // 4. CAD-R2-02 真实生产路径：先写出多布局 DWG（含模型/LayoutA/LayoutB 既有实体），
+        // 经 Document::LoadFromFile 携带非空 CadSource 打开，切至 LayoutB 导出批注再重读验证
+        {
+            Scene srcScene;
+            DrawingLayout ml; ml.Name = "Model"; ml.Model = true; ml.Order = 0;
+            DrawingLayout la; la.Name = "LayoutA"; la.Model = false; la.Order = 1;
+            DrawingLayout lb; lb.Name = "LayoutB"; lb.Model = false; lb.Order = 2;
+            srcScene.SetLayouts({ ml, la, lb });
+            const uint64_t seedKeyA = srcScene.Layouts()[1].OwnerKey;
+            const uint64_t seedKeyB = srcScene.Layouts()[2].OwnerKey;
+
+            srcScene.AddEntity(std::make_unique<LineEntity>(
+                srcScene.NextObjectID(), Math::Point3{ 0, 0, 0 }, Math::Point3{ 500, 0, 0 }));
+            auto lineA = std::make_unique<LineEntity>(
+                srcScene.NextObjectID(), Math::Point3{ 0, 10, 0 }, Math::Point3{ 100, 10, 0 });
+            lineA->GetAttr().InPaperSpace = true;
+            lineA->GetAttr().LayoutKey    = seedKeyA;
+            srcScene.AddEntity(std::move(lineA));
+            auto lineB = std::make_unique<LineEntity>(
+                srcScene.NextObjectID(), Math::Point3{ 0, 20, 0 }, Math::Point3{ 120, 20, 0 });
+            lineB->GetAttr().InPaperSpace = true;
+            lineB->GetAttr().LayoutKey    = seedKeyB;
+            srcScene.AddEntity(std::move(lineB));
+
+            const auto seedDwg = ExportCad(srcScene, CadFileKind::Dwg, CadSaveVersion::R2013);
+            Check(!seedDwg.empty(), "CAD-R2-02: 生成含多布局与既有实体的种子 DWG 成功");
+
+            const auto tmpFile = std::filesystem::temp_directory_path() / "minicad_r2_02_markup_multilayout.dwg";
+            struct TmpFileCleaner {
+                std::filesystem::path p;
+                ~TmpFileCleaner() { std::error_code ec; std::filesystem::remove(p, ec); }
+            } cleaner{ tmpFile };
+            {
+                std::ofstream out(tmpFile, std::ios::binary | std::ios::trunc);
+                out.write(reinterpret_cast<const char*>(seedDwg.data()), static_cast<std::streamsize>(seedDwg.size()));
+            }
+            const auto u8Path = tmpFile.u8string();
+            const std::string utf8Tmp(reinterpret_cast<const char*>(u8Path.data()), u8Path.size());
+
+            Document openedDoc;
+            std::string openErr;
+            Check(openedDoc.LoadFromFile(utf8Tmp, &openErr) && openedDoc.GetCadSource() != nullptr,
+                  "CAD-R2-02: Document 打开真实多布局 DWG 并保留非空 CadSource");
+
+            int layoutBIndex = -1;
+            uint64_t origModelHandle = 0, origLayoutAHandle = 0, origLayoutBHandle = 0;
+            uint64_t origLayoutAKey = 0, origLayoutBKey = 0;
+            for (std::size_t i = 0; i < openedDoc.GetScene().Layouts().size(); ++i)
+            {
+                const auto& l = openedDoc.GetScene().Layouts()[i];
+                if (!l.Model && l.Name == "LayoutA") origLayoutAKey = l.OwnerKey;
+                if (!l.Model && l.Name == "LayoutB") { origLayoutBKey = l.OwnerKey; layoutBIndex = static_cast<int>(i); }
+            }
+            openedDoc.GetScene().ForEachObject([&](const Object& o) {
+                if (!o.IsKindOf<LineEntity>()) return;
+                const auto& e = static_cast<const LineEntity&>(o);
+                const uint64_t h = LookupCadEntityHandle(openedDoc.GetCadSource(), e.GetID());
+                if (!e.GetAttr().InPaperSpace) origModelHandle = h;
+                else if (e.GetAttr().LayoutKey == origLayoutAKey) origLayoutAHandle = h;
+                else if (e.GetAttr().LayoutKey == origLayoutBKey) origLayoutBHandle = h;
+            });
+            Check(layoutBIndex > 0 && origModelHandle != 0 && origLayoutAHandle != 0 && origLayoutBHandle != 0,
+                  "CAD-R2-02: 打开后模型与各纸张布局既有实体句柄均已关联 CadSource");
+
+            CameraState openedCam{};
+            Check(openedDoc.SetActiveLayout(layoutBIndex, openedCam) && openedDoc.ActiveLayoutIsPaper(),
+                  "CAD-R2-02: 切至真实打开图纸的 LayoutB");
+
+            std::string markupErr;
+            const auto exportedBytes = SaMarkupExport::ExportMarkupDwg(
+                openedDoc, { { 15, 25, 115, 85 } }, { "R2-02-NOTE" }, markupErr);
+            Check(!exportedBytes.empty() && markupErr.empty(),
+                  "CAD-R2-02: 携带非空 CadSource 在 LayoutB 导出批注 DWG 成功");
+
+            Scene reloaded;
+            std::shared_ptr<const CadSource> reloadedSrc;
+            Check(ImportCad(exportedBytes, reloaded, &importErr, nullptr, &reloadedSrc),
+                  "CAD-R2-02: 导出的保留式批注 DWG 可正常重读");
+
+            uint64_t reloadedAKey = 0, reloadedBKey = 0;
+            for (const auto& l : reloaded.Layouts())
+            {
+                if (!l.Model && l.Name == "LayoutA") reloadedAKey = l.OwnerKey;
+                if (!l.Model && l.Name == "LayoutB") reloadedBKey = l.OwnerKey;
+            }
+            bool gotCloudB = false, gotTextB = false, markupLeaked = false;
+            bool keptModel = false, keptA = false, keptB = false;
+            reloaded.ForEachObject([&](const Object& o) {
+                if (!o.IsKindOf<Entity>()) return;
+                const auto& e = static_cast<const Entity&>(o);
+                const uint64_t h = LookupCadEntityHandle(reloadedSrc.get(), e.GetID());
+                const Layer* lyr = reloaded.GetLayerManager().GetLayer(e.GetLayerID());
+                if (lyr && lyr->GetName() == SaMarkupExport::kMarkupLayerName)
+                {
+                    if (!e.GetAttr().InPaperSpace || e.GetAttr().LayoutKey != reloadedBKey)
+                    {
+                        markupLeaked = true;
+                        return;
+                    }
+                    if (e.IsKindOf<PolylineEntity>()) gotCloudB = true;
+                    if (e.IsKindOf<TextEntity>() && static_cast<const TextEntity&>(e).GetText() == "R2-02-NOTE")
+                        gotTextB = true;
+                    return;
+                }
+                if (!e.GetAttr().InPaperSpace && h == origModelHandle) keptModel = true;
+                if (e.GetAttr().InPaperSpace && e.GetAttr().LayoutKey == reloadedAKey && h == origLayoutAHandle) keptA = true;
+                if (e.GetAttr().InPaperSpace && e.GetAttr().LayoutKey == reloadedBKey && h == origLayoutBHandle) keptB = true;
+            });
+            Check(gotCloudB && gotTextB && !markupLeaked,
+                  "CAD-R2-02: 携带 CadSource 导出的纸张批注云线与文字精确落入 LayoutB，无模型空间或他页泄漏");
+            Check(keptModel && keptA && keptB,
+                  "CAD-R2-02: 原图模型空间与各纸张布局既有实体句柄全部完好保留");
+        }
     }
 
     // ── CAD-02：PickPointTool 回调重入（立即重启工具 / 销毁 Editor）与取消回调重入保护 ──
@@ -1296,11 +1553,52 @@ namespace
             snap.SetSnapModes(static_cast<uint32_t>(SnapMode::Quadrant));
             snap.SetSnapRadiusPx(5.0);
 
-            // 若误判为等比圆，其半径会被算成 100*sqrt(2.5)≈158.11，导致象限点落到 (0, 158.11)；
-            // 实际椭圆在 y 轴上最高点仅为 (0, 100)！因此 (0, 158.11) 绝不应命中象限捕捉。
-            const Math::Point2 falseQuadSp = cam.WorldToScreen({ 0.0, 100.0 * std::sqrt(2.5), 0.0 });
+            // 若误判为等比圆，其半径会被算成 100*sqrt(2.5)≈158.11，右象限点 (158.11, 0) 落在变换后包围盒
+            // [-282.84, 282.84]×[-141.42, 141.42] 内部（不会被 BoxHitsAperture 提前短路），旧实现会误吸附；
+            // 实际椭圆在 x 轴顶点位于 (200, 0)，因此 (158.11, 0) 绝不应命中象限捕捉（CAD-R2-11）。
+            const Math::Point2 falseQuadSp = cam.WorldToScreen({ 100.0 * std::sqrt(2.5), 0.0, 0.0 });
             const SnapResult r = snap.Query(falseQuadSp, scene, cam);
-            Check(!r.IsValid(), "CAD-10: 斜切等长基向量不被误判为等比圆，不会捕捉到图外假象限点");
+            Check(!r.IsValid(), "CAD-10/R2-11: 包围盒内假象限点 (158.11, 0) 不会被斜切圆误判吸附");
+        }
+
+        // CAD-R2-11：单个 MLineEntity 含 1200 条元素线时，EmitTransformedPrimitive 输出处严格截断在 1024 叶节点上限
+        {
+            Scene scene;
+            MLineStyleRecord style;
+            style.Name = "DENSE_1200";
+            for (int i = 0; i < 1200; ++i)
+                style.Elements.push_back({ static_cast<double>(i) * 10.0, false, {} });
+            style.Normalize(); // 偏移按降序排列：元素 0 在 y=11990，元素 1023 在 y=1760，元素 1199 在 y=0
+
+            auto blk = std::make_unique<BlockEntity>(scene.NextObjectID(), "MLINE_1200_BLK");
+            blk->AddEntity(std::make_unique<MLineEntity>(
+                scene.NextObjectID(),
+                std::vector<Math::Point3>{ { 0.0, 0.0, 0.0 }, { 100.0, 0.0, 0.0 } },
+                style,
+                MLineJustify::Zero,
+                1.0,
+                false));
+            const BlockID blkId = scene.GetBlockTable().Add(std::move(blk));
+            auto ins = std::make_unique<InsertEntity>(scene.NextObjectID(), blkId, "MLINE_1200_BLK", Math::Point3{ 0, 0, 0 });
+            scene.ResolveInsert(*ins);
+            scene.AddEntity(std::move(ins));
+
+            Camera cam(800.0f, 600.0f);
+            // 1 世界单位 ≈ 1 像素，两条元素线间距 10px > 4px 捕捉半径
+            cam.SetState(CameraState{ { 0.0, 11990.0, 0.0 }, 600.0, -90.0, 90.0 });
+            SnapEngine snap;
+            snap.SetEnableSnap(true);
+            snap.SetSnapModes(static_cast<uint32_t>(SnapMode::Endpoint));
+            snap.SetSnapRadiusPx(4.0);
+
+            const SnapResult rFirst = snap.Query(cam.WorldToScreen({ 0.0, 11990.0, 0.0 }), scene, cam);
+            Check(rFirst.IsValid() && rFirst.SnapType == SnapResult::Type::Endpoint,
+                  "CAD-R2-11: 单 MLine 前 1024 条元素线正常参与端点捕捉");
+
+            cam.SetState(CameraState{ { 0.0, 0.0, 0.0 }, 600.0, -90.0, 90.0 });
+            const SnapResult rOverflow = snap.Query(cam.WorldToScreen({ 0.0, 0.0, 0.0 }), scene, cam);
+            Check(!rOverflow.IsValid(),
+                  "CAD-R2-11: 单 MLine 第 1200 条元素线被 kMaxBlockLeaves=1024 严格截断，不再超额溢出");
         }
 
         // CAD-09：大型块含 1500 条交错线，交点捕捉受叶节点与 64 条最近曲线预算约束，不阻塞界面

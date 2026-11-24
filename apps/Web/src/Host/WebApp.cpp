@@ -225,33 +225,40 @@ namespace MiniCAD
             const n = Array.from(s, c => ("/:*?<>|".includes(c) || c === QUOTE || c === BACKSLASH ? "_" : c)).join("");
             return n && n !== "." && n !== ".." ? n : "drawing.dwg";
         };
+        const isActive = () => _MiniCADWeb_IsRemoteActive(requestId) !== 0;
         const fetched = (path, url) => {
             const p = stringToNewUTF8(path), u = stringToNewUTF8(url);
-            _MiniCADWeb_OnRemoteFetched(requestId, p, u);
+            const keep = _MiniCADWeb_OnRemoteFetched(requestId, p, u);
             _free(p); _free(u);
+            return keep !== 0;
         };
         const failed = (name, status, message) => {
             const n = stringToNewUTF8(name), m = stringToNewUTF8(message || "");
-            _MiniCADWeb_OnRemoteFailed(requestId, n, status, m);
+            const keep = _MiniCADWeb_OnRemoteFailed(requestId, n, status, m);
             _free(n); _free(m);
+            return keep !== 0;
         };
         (async () => {
             for (let i = 0; i < urls.length; ++i) {
+                if (!isActive()) break;
                 let url;
-                try { url = new URL(urls[i], location.href); } catch (e) { failed(urls[i], 0, String(e)); continue; }
+                try { url = new URL(urls[i], location.href); } catch (e) { if (!failed(urls[i], 0, String(e))) break; continue; }
                 const display = guessName(url) || url.href;
-                if (!hostFetch && url.origin !== location.origin) { failed(display, -1, ""); continue; }
+                if (!hostFetch && url.origin !== location.origin) { if (!failed(display, -1, "")) break; continue; }
                 try {
                     const response = hostFetch ? await host.fetch(url.href) : await fetch(url.href, { credentials: "same-origin" });
-                    if (!response.ok) { failed(display, response.status, response.statusText); continue; }
+                    if (!isActive()) break;
+                    if (!response.ok) { if (!failed(display, response.status, response.statusText)) break; continue; }
                     const buf = await response.arrayBuffer();
+                    if (!isActive()) break;
                     const directory = "/remote/" + requestId + "/" + i;
                     FS.mkdirTree(directory);
                     const path = directory + "/" + safeName(nameOf(url, response));
                     FS.writeFile(path, new Uint8Array(buf));
-                    fetched(path, url.href);
+                    if (!fetched(path, url.href)) break;
                 } catch (err) {
-                    failed(display, 0, String(err));
+                    if (!isActive()) break;
+                    if (!failed(display, 0, String(err))) break;
                 }
             }
             _MiniCADWeb_OnRemoteCompleted(requestId);
@@ -410,16 +417,19 @@ namespace MiniCAD
                 g_app->OnFontFetched(name);
         }
 
-        EMSCRIPTEN_KEEPALIVE void MiniCADWeb_OnRemoteFetched(int requestId, const char* path, const char* url)
+        EMSCRIPTEN_KEEPALIVE int MiniCADWeb_IsRemoteActive(int requestId)
         {
-            if (IsEmbedReady())
-                g_app->OnRemoteFetched(requestId, path, url);
+            return IsEmbedReady() && g_app->IsRemoteRequestActive(requestId) ? 1 : 0;
         }
 
-        EMSCRIPTEN_KEEPALIVE void MiniCADWeb_OnRemoteFailed(int requestId, const char* name, int status, const char* message)
+        EMSCRIPTEN_KEEPALIVE int MiniCADWeb_OnRemoteFetched(int requestId, const char* path, const char* url)
         {
-            if (IsEmbedReady())
-                g_app->OnRemoteFailed(requestId, name, status, message);
+            return IsEmbedReady() && g_app->OnRemoteFetched(requestId, path, url) ? 1 : 0;
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADWeb_OnRemoteFailed(int requestId, const char* name, int status, const char* message)
+        {
+            return IsEmbedReady() && g_app->OnRemoteFailed(requestId, name, status, message) ? 1 : 0;
         }
 
         EMSCRIPTEN_KEEPALIVE void MiniCADWeb_OnRemoteCompleted(int requestId)
@@ -584,6 +594,17 @@ namespace MiniCAD
             if (!IsEmbedReady() || !out || !g_app->GetFrame().EmbedWorldToWindow(wx, wy, x, y)) return 0;
             out[0] = x; out[1] = y;
             return 1;
+        }
+
+        EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_HasMarkupChanges()
+        {
+            return IsEmbedReady() && g_app->GetFrame().EmbedHasMarkupChanges() ? 1 : 0;
+        }
+
+        EMSCRIPTEN_KEEPALIVE void MiniCADEmbed_MarkMarkupClean()
+        {
+            if (IsEmbedReady())
+                g_app->GetFrame().EmbedMarkMarkupClean();
         }
 
         EMSCRIPTEN_KEEPALIVE int MiniCADEmbed_ExportMarkupDwg(const double* rects, int count, const char* labels, const char* outPath, const char* errPath)
@@ -1045,7 +1066,9 @@ namespace MiniCAD
     void WebApp::OpenStartupUrls()
     {
         const int id = m_nextPickId++;
-        m_remoteRequests[id] = {};
+        RemoteRequest req{};
+        req.intentVersion = m_main.MainDocumentIntentVersion();
+        m_remoteRequests[id] = std::move(req);
         if (MiniCADWeb_OpenUrls(id) == 0)
         {
             m_remoteRequests.erase(id);
@@ -1056,20 +1079,65 @@ namespace MiniCAD
             FetchLazyFont(name);
     }
 
-    void WebApp::OnRemoteFetched(int requestId, const char* path, const char* url)
+    void WebApp::DiscardRemoteRequest(int requestId, const char* extraPath)
     {
         auto it = m_remoteRequests.find(requestId);
-        if (it == m_remoteRequests.end() || !path || !*path)
-            return;
-        it->second.paths.emplace_back(path);
-        m_remoteSources[RemoteKey(path)] = url ? url : "";
+        if (it != m_remoteRequests.end())
+        {
+            for (const std::string& p : it->second.paths)
+                m_remoteSources.erase(RemoteKey(p));
+            m_remoteRequests.erase(it);
+        }
+        if (extraPath && *extraPath)
+            m_remoteSources.erase(RemoteKey(extraPath));
+        const std::string prefix = "/remote/" + std::to_string(requestId) + "/";
+        for (auto sit = m_remoteSources.begin(); sit != m_remoteSources.end();)
+        {
+            if (sit->first.rfind(prefix, 0) == 0)
+                sit = m_remoteSources.erase(sit);
+            else
+                ++sit;
+        }
+        std::error_code ec;
+        std::filesystem::remove_all("/remote/" + std::to_string(requestId), ec);
     }
 
-    void WebApp::OnRemoteFailed(int requestId, const char* name, int status, const char* message)
+    bool WebApp::IsRemoteRequestActive(int requestId)
     {
         auto it = m_remoteRequests.find(requestId);
         if (it == m_remoteRequests.end())
-            return;
+            return false;
+        if (it->second.intentVersion != m_main.MainDocumentIntentVersion())
+        {
+            DiscardRemoteRequest(requestId);
+            return false;
+        }
+        return true;
+    }
+
+    bool WebApp::OnRemoteFetched(int requestId, const char* path, const char* url)
+    {
+        auto it = m_remoteRequests.find(requestId);
+        if (it == m_remoteRequests.end() || it->second.intentVersion != m_main.MainDocumentIntentVersion())
+        {
+            DiscardRemoteRequest(requestId, path);
+            return false;
+        }
+        if (!path || !*path)
+            return true;
+        it->second.paths.emplace_back(path);
+        m_remoteSources[RemoteKey(path)] = url ? url : "";
+        return true;
+    }
+
+    bool WebApp::OnRemoteFailed(int requestId, const char* name, int status, const char* message)
+    {
+        auto it = m_remoteRequests.find(requestId);
+        if (it == m_remoteRequests.end() || it->second.intentVersion != m_main.MainDocumentIntentVersion())
+        {
+            DiscardRemoteRequest(requestId);
+            return false;
+        }
         std::string reason;
         switch (status)
         {
@@ -1083,13 +1151,22 @@ namespace MiniCAD
         std::string& errors = it->second.errors;
         if (!errors.empty()) errors += "\n\n";
         errors += std::string(name ? name : "") + "\n" + reason;
+        return true;
     }
 
     void WebApp::OnRemoteCompleted(int requestId)
     {
         auto it = m_remoteRequests.find(requestId);
         if (it == m_remoteRequests.end())
+        {
+            DiscardRemoteRequest(requestId);
             return;
+        }
+        if (it->second.intentVersion != m_main.MainDocumentIntentVersion())
+        {
+            DiscardRemoteRequest(requestId);
+            return;
+        }
         RemoteRequest request = std::move(it->second);
         m_remoteRequests.erase(it);
         if (!request.paths.empty())

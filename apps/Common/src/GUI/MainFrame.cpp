@@ -23,6 +23,8 @@
 #include "Document/SaSelectionExport.h"
 #include "Document/CommandStack/CommandStack.h"
 #include "Document/Command/LayoutCommands.h"
+#include "Serialization/BinarySerializer.h"
+#include "Serialization/EntityIO.h"
 #include "Import/CadExchange.h"
 #include "Core/Log.h"
 #include "Core/UIContext.h"
@@ -154,6 +156,46 @@ namespace MiniCAD
         {
             const char* what() const noexcept override { return "cancelled"; }      // 只在关闭程序时抛出，不显示
         };
+
+        // 确定性序列化当前文档中所有 ID >= watermark 的批注实体（按 ObjectID 升序），
+        // 作为 EmbedHasMarkupChanges / EmbedMarkMarkupClean 的精确真相快照（支持绘制、删除、编辑、撤销与重做）。
+        std::string ComputeMarkupSnapshot(const Document& doc, Object::ObjectID watermark)
+        {
+            const Scene& scene = doc.GetScene();
+            std::vector<const Entity*> markups;
+            scene.ForEachObject([watermark, &markups](const Object& obj)
+            {
+                if (obj.GetID() >= watermark && obj.IsKindOf<Entity>())
+                    markups.push_back(static_cast<const Entity*>(&obj));
+            });
+            if (markups.empty())
+                return {};
+            std::sort(markups.begin(), markups.end(), [](const Entity* a, const Entity* b)
+            {
+                return a->GetID() < b->GetID();
+            });
+            BinarySerializer s;
+            size_t n = markups.size();
+            if (s.BeginArray("entities", n))
+            {
+                for (const Entity* e : markups)
+                {
+                    if (s.BeginElement(0))
+                    {
+                        if (!EntityIO::Write(s, *e))
+                        {
+                            uint64_t id = e->GetID();
+                            std::string typeName = e->GetTypeInfo() ? e->GetTypeInfo()->Name : "";
+                            s.Value("id", id);
+                            s.Value("type", typeName);
+                        }
+                        s.EndElement();
+                    }
+                }
+                s.EndArray();
+            }
+            return s.Dump();
+        }
     }
 
     MainFrame::MainFrame() = default;
@@ -162,6 +204,11 @@ namespace MiniCAD
     {
         if (m_alive)
             *m_alive = false;
+        if (m_activePickSession)
+        {
+            m_activePickSession->silentAbandon = true;
+            m_activePickSession.reset();
+        }
         if (m_embedMode >= 0)
         {
             CommandStack::SetVetoHook(nullptr);
@@ -745,6 +792,59 @@ namespace MiniCAD
         return SaMarkupExport::ExportMarkupDwg(*doc, rects, labels, error);
     }
 
+    bool MainFrame::EmbedHasMarkupChanges() const
+    {
+        const Document* doc = m_docManager.GetMainDocument();
+        if (!doc)
+            return false;
+        const uint64_t docId = doc->InstanceID();
+        const auto wmIt = m_embedDocWatermark.find(docId);
+        if (wmIt == m_embedDocWatermark.end())
+            return false;
+        const Scene& scene = doc->GetScene();
+        const uint64_t geomVer = scene.GeometryVersion();
+        const uint64_t dispVer = scene.DisplayVersion();
+        const Object::ObjectID watermark = wmIt->second;
+        if (m_embedMarkupDirtyCache.valid
+            && m_embedMarkupDirtyCache.docId == docId
+            && m_embedMarkupDirtyCache.geomVersion == geomVer
+            && m_embedMarkupDirtyCache.displayVersion == dispVer
+            && m_embedMarkupDirtyCache.watermark == watermark
+            && m_embedMarkupDirtyCache.baselineRev == m_embedMarkupBaselineRev)
+        {
+            return m_embedMarkupDirtyCache.dirty;
+        }
+        const std::string current = ComputeMarkupSnapshot(*doc, watermark);
+        const auto cleanIt = m_embedMarkupCleanSnapshot.find(docId);
+        const bool dirty = (cleanIt == m_embedMarkupCleanSnapshot.end())
+            ? !current.empty()
+            : (current != cleanIt->second);
+        m_embedMarkupDirtyCache = EmbedMarkupDirtyCache{
+            docId, geomVer, dispVer, watermark, m_embedMarkupBaselineRev, dirty, true
+        };
+        return dirty;
+    }
+
+    void MainFrame::EmbedMarkMarkupClean()
+    {
+        Document* doc = m_docManager.GetMainDocument();
+        if (!doc)
+            return;
+        const uint64_t docId = doc->InstanceID();
+        auto wmIt = m_embedDocWatermark.find(docId);
+        if (wmIt == m_embedDocWatermark.end())
+        {
+            doc->GetScene().SyncNextObjectID();
+            wmIt = m_embedDocWatermark.emplace(docId, doc->GetScene().PeekNextObjectID()).first;
+        }
+        m_embedMarkupCleanSnapshot[docId] = ComputeMarkupSnapshot(*doc, wmIt->second);
+        ++m_embedMarkupBaselineRev;
+        m_embedMarkupDirtyCache = EmbedMarkupDirtyCache{
+            docId, doc->GetScene().GeometryVersion(), doc->GetScene().DisplayVersion(),
+            wmIt->second, m_embedMarkupBaselineRev, false, true
+        };
+    }
+
     std::vector<std::pair<std::string, std::string>> MainFrame::EmbedListXrefs() const
     {
         std::vector<std::pair<std::string, std::string>> out;
@@ -930,13 +1030,22 @@ namespace MiniCAD
                 pw = vpw;
         }
         const int splitX = static_cast<int>(std::lround(std::clamp(m_compareSplitRatio, 0.0f, 1.0f) * static_cast<float>(pw)));
-        const Viewport::MainVisibleClip clip = Viewport::ComputeMainVisibleClip(m_compareDisplayMode, m_compareSolo, splitX, pw);
+        const Viewport::MainVisibleClip clip = Viewport::ComputeMainVisibleClip(
+            m_compareDisplayMode, m_compareSolo, m_compareShowMain, m_compareOverlapOpacity, splitX, pw);
         m_docManager.GetMainEditor().SetPickClipX(clip.Constrained, static_cast<double>(clip.MinX), static_cast<double>(clip.MaxX));
+    }
+
+    void MainFrame::ReleaseCompareSurfaceResources()
+    {
+        if (m_platform)
+            m_platform->GetRenderer().ReleaseCompareResources();
+        m_docManager.GetMainViewport().ReleaseCompareLayers();
     }
 
     void MainFrame::CancelPendingMainOpens()
     {
         ++m_openGeneration;
+        ++m_mainDocIntentVersion;
         m_mainOpenError.clear();
         m_openFailures.clear();
         if (m_openJob)
@@ -961,7 +1070,7 @@ namespace MiniCAD
     {
         if (fsPath.empty())
             return;
-        EmbedCancelPickPoint();
+        AbandonPickPointSilently();
         CancelPendingMainOpens();
         OpenDrawings({ fsPath });
     }
@@ -977,18 +1086,22 @@ namespace MiniCAD
 
     void MainFrame::EmbedCloseAllDocuments()
     {
-        if (m_pickPointTarget == 0)
-            EmbedCancelPickPoint();
+        AbandonPickPointSilently(0);
         CancelPendingMainOpens();
         EmbedCloseDocumentsExcept(nullptr);
-        if (!m_compareDoc)
-            m_docManager.GetMainViewport().ReleaseCompareLayers();
+        if (!m_docManager.GetMainDocument() && m_docManager.GetMainViewport().HasCompareLayers())
+            ReleaseCompareSurfaceResources();
         RequestRenderAll();
         StateChanged();
     }
 
     void MainFrame::EmbedCloseDocumentsExcept(Document* keep)
     {
+        if (m_activePickSession && m_activePickSession->target == 0
+            && (!keep || keep->InstanceID() != m_activePickSession->docId))
+        {
+            AbandonPickPointSilently(0);
+        }
         std::vector<Document*> others;
         for (const auto& d : m_docManager.GetAll())
             if (d.get() != keep)
@@ -1011,10 +1124,14 @@ namespace MiniCAD
                 m_buildDoc = nullptr;
             m_embedSavedLocks.erase(docId);
             m_embedDocWatermark.erase(docId);
+            m_embedMarkupCleanSnapshot.erase(docId);
+            m_knownDocIds.erase(docId);
             m_nodeHistory.erase(doc);
             m_xrefMissingDocs.erase(std::remove(m_xrefMissingDocs.begin(), m_xrefMissingDocs.end(), docId), m_xrefMissingDocs.end());
             m_docManager.Close(doc);
         }
+        if (!m_docManager.GetMainDocument())
+            ReleaseCompareSurfaceResources();
         m_docManager.GetEditor().ClearImageCache();
         if (m_platform)
         {
@@ -1035,8 +1152,7 @@ namespace MiniCAD
     {
         ++m_compareOpenGeneration;
         m_compareOpenError.clear();
-        if (m_pickPointTarget == 1)
-            EmbedCancelPickPoint();
+        AbandonPickPointSilently(1);
         if (m_compareOpenJob)
         {
             m_compareOpenJob->cancel = true;
@@ -1056,14 +1172,14 @@ namespace MiniCAD
         m_compareInput       = {};
         if (m_platform)
         {
-            // 先释放对比槽位缓冲与合成绑定组，再显式释放双离屏对比底片渲染目标并归还内存
+            // 先释放合成绑定与对比槽位缓冲，再显式释放双离屏对比底片渲染目标并归还内存
+            ReleaseCompareSurfaceResources();
             m_platform->GetRenderer().ReleaseSlotRange(Viewport::kCompareSlotOffset, Viewport::kCompareSlotOffset * 2 - 1);
-            m_docManager.GetMainViewport().ReleaseCompareLayers();
             m_platform->ReleaseFreeMemory();
         }
         else
         {
-            m_docManager.GetMainViewport().ReleaseCompareLayers();
+            ReleaseCompareSurfaceResources();
         }
         SyncMainVisibleClip();
         RequestRenderAll();
@@ -1186,7 +1302,7 @@ namespace MiniCAD
         m_compareShowCompare    = showCompare;
         m_compareLayoutIndex    = compareLayoutIndex >= 0 ? compareLayoutIndex : -1;
         if (m_compareDisplayMode == CompareDisplayMode::Off)
-            m_docManager.GetMainViewport().ReleaseCompareLayers();
+            ReleaseCompareSurfaceResources();
         SyncCompareLayout();
         SyncCompareCamera();
         SyncMainVisibleClip();
@@ -1280,128 +1396,22 @@ namespace MiniCAD
         fn();
     }
 
-    bool MainFrame::EmbedStartPickPoint(int seq, int target, std::function<void(int, double, double)> onPicked, std::function<void(int)> onCancelled)
+    int MainFrame::ActivePickTarget() const
     {
-        EmbedCancelPickPoint();
-        const uint64_t session = ++m_pickPointSession;
-        if (target == 1)
-        {
-            if (!m_compareDoc || !m_compareEditor)
-                return false;
-            const uint64_t compDocId = m_compareDoc->InstanceID();
-            Editor& editor = *m_compareEditor;
-            const bool restoreSnapOff = !editor.IsSnapEnabled();
-            if (restoreSnapOff)
-                editor.SetSnapEnabled(true);
-            m_pickPointTarget = 1;
-            editor.StartPickPointTool(
-                N_("指定底图对齐基点:"),
-                [this, session, compDocId, seq, restoreSnapOff, onPicked = std::move(onPicked)](const Math::Point3& p) mutable
-                {
-                    if (m_pickPointTarget == 1)
-                        m_pickPointTarget = -1;
-                    if (restoreSnapOff && IsPickTargetAlive(1, compDocId) && m_compareEditor)
-                        m_compareEditor->SetSnapEnabled(false);
-                    RequestRenderAll();
-                    if (onPicked && m_pickPointSession == session && IsPickTargetAlive(1, compDocId))
-                    {
-                        DispatchPickCallback([this, session, compDocId, seq, px = p.x, py = p.y, cb = std::move(onPicked)]()
-                        {
-                            if (m_pickPointSession != session || !IsPickTargetAlive(1, compDocId))
-                                return;
-                            cb(seq, px, py);
-                        });
-                    }
-                },
-                [this, session, compDocId, seq, restoreSnapOff, onCancelled = std::move(onCancelled)]() mutable
-                {
-                    if (m_pickPointTarget == 1)
-                        m_pickPointTarget = -1;
-                    if (restoreSnapOff && IsPickTargetAlive(1, compDocId) && m_compareEditor)
-                        m_compareEditor->SetSnapEnabled(false);
-                    RequestRenderAll();
-                    if (onCancelled && m_pickPointSession == session && IsPickTargetAlive(1, compDocId))
-                    {
-                        DispatchPickCallback([this, session, compDocId, seq, cb = std::move(onCancelled)]()
-                        {
-                            if (m_pickPointSession != session || !IsPickTargetAlive(1, compDocId))
-                                return;
-                            cb(seq);
-                        });
-                    }
-                });
-            RequestRenderAll();
-            return true;
-        }
-
-        Document* doc = m_docManager.GetActive();
-        if (!doc)
-            return false;
-        const uint64_t docId = doc->InstanceID();
-        Editor& editor = m_docManager.GetEditor();
-        const bool restoreSnapOff = !editor.IsSnapEnabled();
-        if (restoreSnapOff)
-            editor.SetSnapEnabled(true);
-        m_pickPointTarget = 0;
-        editor.StartPickPointTool(
-            N_("指定对齐基点:"),
-            [this, session, docId, seq, restoreSnapOff, onPicked = std::move(onPicked)](const Math::Point3& p) mutable
-            {
-                if (m_pickPointTarget == 0)
-                    m_pickPointTarget = -1;
-                if (restoreSnapOff && IsPickTargetAlive(0, docId))
-                    m_docManager.GetEditor().SetSnapEnabled(false);
-                RequestRenderAll();
-                if (onPicked && m_pickPointSession == session && IsPickTargetAlive(0, docId))
-                {
-                    DispatchPickCallback([this, session, docId, seq, px = p.x, py = p.y, cb = std::move(onPicked)]()
-                    {
-                        if (m_pickPointSession != session || !IsPickTargetAlive(0, docId))
-                            return;
-                        cb(seq, px, py);
-                    });
-                }
-            },
-            [this, session, docId, seq, restoreSnapOff, onCancelled = std::move(onCancelled)]() mutable
-            {
-                if (m_pickPointTarget == 0)
-                    m_pickPointTarget = -1;
-                if (restoreSnapOff && IsPickTargetAlive(0, docId))
-                    m_docManager.GetEditor().SetSnapEnabled(false);
-                RequestRenderAll();
-                if (onCancelled && m_pickPointSession == session && IsPickTargetAlive(0, docId))
-                {
-                    DispatchPickCallback([this, session, docId, seq, cb = std::move(onCancelled)]()
-                    {
-                        if (m_pickPointSession != session || !IsPickTargetAlive(0, docId))
-                            return;
-                        cb(seq);
-                    });
-                }
-            });
-        RequestRenderAll();
-        return true;
+        return (m_activePickSession && !m_activePickSession->settled && !m_activePickSession->silentAbandon)
+            ? m_activePickSession->target
+            : -1;
     }
 
-    void MainFrame::EmbedCancelPickPoint()
+    Editor* MainFrame::PickEditorForTarget(int target)
     {
-        ++m_pickPointSession;
-        if (m_pickPointTarget == 1 && m_compareEditor && m_compareEditor->IsActiveTool())
-        {
-            InputEvent esc = {};
-            esc.Type = InputEventType::KeyDown;
-            esc.Key  = KeyCode::Escape;
-            m_compareEditor->OnInput(esc);
-            esc.Type = InputEventType::KeyUp;
-            m_compareEditor->OnInput(esc);
-            m_pickPointTarget = -1;
-            RequestRenderAll();
-            return;
-        }
-        m_pickPointTarget = -1;
-        if (!m_docManager.GetActive())
-            return;
-        Editor& editor = m_docManager.GetEditor();
+        if (target == 1)
+            return (m_compareDoc && m_compareEditor) ? m_compareEditor.get() : nullptr;
+        return m_docManager.GetActive() ? &m_docManager.GetEditor() : nullptr;
+    }
+
+    void MainFrame::SendEscapeToEditor(Editor& editor)
+    {
         if (!editor.IsActiveTool())
             return;
         InputEvent esc = {};
@@ -1410,6 +1420,142 @@ namespace MiniCAD
         editor.OnInput(esc);
         esc.Type = InputEventType::KeyUp;
         editor.OnInput(esc);
+    }
+
+    void MainFrame::SettlePickSession(const std::shared_ptr<PickPointSession>& session, bool picked, double wx, double wy)
+    {
+        if (!session || session->settled)
+            return;
+        session->settled = true;
+        if (m_activePickSession == session)
+            m_activePickSession.reset();
+
+        if (session->restoreSnapOff && IsPickTargetAlive(session->target, session->docId))
+        {
+            if (Editor* ed = PickEditorForTarget(session->target))
+                ed->SetSnapEnabled(false);
+        }
+        RequestRenderAll();
+
+        auto onPicked    = std::move(session->onPicked);
+        auto onCancelled = std::move(session->onCancelled);
+        session->onPicked    = nullptr;
+        session->onCancelled = nullptr;
+
+        if (session->silentAbandon || !IsPickTargetAlive(session->target, session->docId))
+            return;
+
+        if (picked)
+        {
+            if (onPicked)
+            {
+                DispatchPickCallback([this, session, wx, wy, cb = std::move(onPicked)]()
+                {
+                    if (session->silentAbandon || !IsPickTargetAlive(session->target, session->docId))
+                        return;
+                    cb(session->seq, wx, wy);
+                });
+            }
+        }
+        else if (onCancelled)
+        {
+            DispatchPickCallback([this, session, cb = std::move(onCancelled)]()
+            {
+                if (session->silentAbandon || !IsPickTargetAlive(session->target, session->docId))
+                    return;
+                cb(session->seq);
+            });
+        }
+    }
+
+    void MainFrame::AbandonPickPointSilently(int onlyTarget)
+    {
+        auto session = m_activePickSession;
+        if (!session)
+            return;
+        if (onlyTarget >= 0 && session->target != onlyTarget)
+            return;
+        session->silentAbandon = true;
+        m_activePickSession.reset();
+        if (Editor* ed = PickEditorForTarget(session->target); ed && ed->IsActiveTool())
+            SendEscapeToEditor(*ed);
+        if (!session->settled)
+            SettlePickSession(session, false, 0.0, 0.0);
+    }
+
+    bool MainFrame::EmbedStartPickPoint(int seq, int target, std::function<void(int, double, double)> onPicked, std::function<void(int)> onCancelled)
+    {
+        AbandonPickPointSilently();
+        target = (target == 1) ? 1 : 0;
+
+        uint64_t docId  = 0;
+        Editor*  editor = nullptr;
+        if (target == 1)
+        {
+            if (!m_compareDoc || !m_compareEditor)
+                return false;
+            docId  = m_compareDoc->InstanceID();
+            editor = m_compareEditor.get();
+        }
+        else
+        {
+            Document* doc = m_docManager.GetActive();
+            if (!doc)
+                return false;
+            docId  = doc->InstanceID();
+            editor = &m_docManager.GetEditor();
+        }
+
+        auto session            = std::make_shared<PickPointSession>();
+        session->seq            = seq;
+        session->target         = target;
+        session->docId          = docId;
+        session->restoreSnapOff = !editor->IsSnapEnabled();
+        session->onPicked       = std::move(onPicked);
+        session->onCancelled    = std::move(onCancelled);
+
+        if (session->restoreSnapOff)
+            editor->SetSnapEnabled(true);
+        m_activePickSession = session;
+
+        const char* prompt = (target == 1) ? N_("指定底图对齐基点:") : N_("指定对齐基点:");
+        editor->StartPickPointTool(
+            prompt,
+            [alive = m_alive, this, session](const Math::Point3& p)
+            {
+                if (*alive)
+                    SettlePickSession(session, true, p.x, p.y);
+            },
+            [alive = m_alive, this, session]()
+            {
+                if (*alive)
+                    SettlePickSession(session, false, 0.0, 0.0);
+            });
+        RequestRenderAll();
+        return true;
+    }
+
+    void MainFrame::EmbedCancelPickPoint()
+    {
+        auto session = m_activePickSession;
+        if (!session)
+        {
+            if (m_docManager.GetActive())
+            {
+                Editor& editor = m_docManager.GetEditor();
+                if (editor.IsActiveTool())
+                {
+                    SendEscapeToEditor(editor);
+                    RequestRenderAll();
+                }
+            }
+            return;
+        }
+        // 显式取消保持 silentAbandon = false，通过退出工具正常触发 onCancelled 异步派发一次 onSaEmbedPickCancelled(seq)
+        if (Editor* ed = PickEditorForTarget(session->target); ed && ed->IsActiveTool())
+            SendEscapeToEditor(*ed);
+        if (!session->settled)
+            SettlePickSession(session, false, 0.0, 0.0);
         RequestRenderAll();
     }
 
@@ -1512,6 +1658,9 @@ namespace MiniCAD
 
     void MainFrame::OpenDrawings(const std::vector<std::string>& paths)
     {
+        const bool anyNonEmpty = std::any_of(paths.begin(), paths.end(), [](const std::string& p) { return !p.empty(); });
+        if (anyNonEmpty)
+            ++m_mainDocIntentVersion;
         // 读完加进发起打开的窗口（后台读取期间用户可能点了别的窗口）
         m_openPane = m_docManager.GetNewDocumentPane();
         for (const auto& path : paths)
@@ -1639,6 +1788,8 @@ namespace MiniCAD
                 if (m_docManager.HasPane(m_openPane))
                     m_docManager.SetNewDocumentPane(m_openPane);
                 opened = m_docManager.Add(std::move(job->doc));
+                if (opened)
+                    m_knownDocIds.insert(opened->InstanceID());
                 // 示例随程序安装，不能被保存覆盖：加入（按扩展名全部显示）后当作没保存过的新图纸，保存时另存
                 if (opened && sample)
                 {
@@ -2078,6 +2229,22 @@ namespace MiniCAD
 
     void MainFrame::SyncDocuments()
     {
+        {
+            auto& allDocs = m_docManager.GetAll();
+            bool hasNewDoc = false;
+            std::unordered_set<uint64_t> currentIds;
+            currentIds.reserve(allDocs.size());
+            for (const auto& d : allDocs)
+            {
+                const uint64_t id = d->InstanceID();
+                currentIds.insert(id);
+                if (m_knownDocIds.find(id) == m_knownDocIds.end())
+                    hasNewDoc = true;
+            }
+            m_knownDocIds = std::move(currentIds);
+            if (hasNewDoc)
+                ++m_mainDocIntentVersion;
+        }
         if (!m_docTabs)
             return;
         auto& docs = m_docManager.GetAll();
@@ -2337,6 +2504,8 @@ namespace MiniCAD
         // 已是当前文档、窗口里也正显示着它：不用动
         if (!doc || (doc == m_docManager.GetActive() && m_docManager.GetShownDocument(m_docManager.PaneOf(doc)) == doc))
             return;
+        if (m_activePickSession && m_activePickSession->target == 0 && m_activePickSession->docId != doc->InstanceID())
+            AbandonPickPointSilently(0);
         m_docManager.SetActive(doc);           // 它成为所在窗口显示的文档（别的窗口不动）
         EmbedSyncActiveDocumentProtection();
         if (DocWindow* w = FindDocWindow(doc))
@@ -2361,6 +2530,9 @@ namespace MiniCAD
             if (!alive())
                 return;
             const uint64_t closedId = doc->InstanceID();
+            if (m_activePickSession && m_activePickSession->target == 0 && m_activePickSession->docId == closedId)
+                AbandonPickPointSilently(0);
+            ++m_mainDocIntentVersion;
             // 关闭当前文档：先切到同一窗口标签条上相邻的文档（同时恢复它的相机），再关闭；
             // 窗口里没有别的文档时由 DocumentManager::Close 挑（主视口里的文档）
             if (doc == m_docManager.GetActive())
@@ -2373,9 +2545,13 @@ namespace MiniCAD
                 }
             m_embedSavedLocks.erase(closedId);
             m_embedDocWatermark.erase(closedId);
+            m_embedMarkupCleanSnapshot.erase(closedId);
+            m_knownDocIds.erase(closedId);
             m_xrefMissingDocs.erase(std::remove(m_xrefMissingDocs.begin(), m_xrefMissingDocs.end(), closedId), m_xrefMissingDocs.end());
             m_docManager.Close(doc);            // 文档窗口的窗格空了就删掉，窗口在 SyncDocuments 里关掉（推迟到下一帧销毁）
             EmbedSyncActiveDocumentProtection();
+            if (!m_docManager.GetMainDocument())
+                ReleaseCompareSurfaceResources();
             // 归还关闭的文档占用的显示资源：图像缓存、渲染器的顶点缓冲与纹理（剩下的文档下一帧按需重建），
             // 再请平台把空闲的堆内存还给系统
             m_docManager.GetEditor().ClearImageCache();
@@ -2547,7 +2723,7 @@ namespace MiniCAD
         Document* mainDoc = m_docManager.GetMainDocument();
         if (!mainDoc)
             return;
-        if (m_pickPointTarget == 1 && m_compareDoc && m_compareEditor)
+        if (ActivePickTarget() == 1 && m_compareDoc && m_compareEditor)
         {
             const bool isMiddle =
                 ((e.type == T::Down || e.type == T::Up) && e.button == MiniGUI::MouseButton::Middle)
@@ -2737,7 +2913,7 @@ namespace MiniCAD
     bool MainFrame::OnViewportKey(const MiniGUI::KeyEvent& e)
     {
         const KeyCode code = ToKeyCode(e.key);
-        if (m_pickPointTarget == 1 && m_compareEditor && code == KeyCode::Escape)
+        if (ActivePickTarget() == 1 && m_compareEditor && code == KeyCode::Escape)
         {
             InputEvent ie = {};
             ie.Type         = e.type == MiniGUI::KeyEventType::Down ? InputEventType::KeyDown : InputEventType::KeyUp;
@@ -2805,14 +2981,16 @@ namespace MiniCAD
             IRenderer& renderer = m_platform->GetRenderer();
             const bool useCompare = m_compareDoc && m_compareEditor && m_compareDisplayMode != CompareDisplayMode::Off;
             const int splitX = static_cast<int>(std::lround(std::clamp(m_compareSplitRatio, 0.0f, 1.0f) * static_cast<float>(pixelWidth)));
-            const bool mainDrawn = !useCompare || (m_compareDisplayMode != CompareDisplayMode::CompareOnly
-                && !(m_compareDisplayMode == CompareDisplayMode::AlignPickBase && m_compareSolo)
-                && !(m_compareDisplayMode == CompareDisplayMode::Split && splitX <= 0));
+            const Viewport::MainVisibleClip mainClip = useCompare
+                ? Viewport::ComputeMainVisibleClip(m_compareDisplayMode, m_compareSolo, m_compareShowMain, m_compareOverlapOpacity, splitX, pixelWidth)
+                : Viewport::MainVisibleClip{};
+            const bool mainDrawn = !mainClip.IsHidden();
             const bool compDrawn = useCompare && m_compareDisplayMode != CompareDisplayMode::CurrentOnly
                 && !(m_compareDisplayMode == CompareDisplayMode::Split && splitX >= pixelWidth);
+            const bool pickingCompare = (ActivePickTarget() == 1);
 
             editor.EnsureSceneCached(renderer, 0);
-            editor.SetCursorHidden(m_compact || (useCompare && m_pickPointTarget == 1));
+            editor.SetCursorHidden(m_compact || (useCompare && pickingCompare));
             editor.Render();
             const ViewState vs = editor.BuildViewState();
 
@@ -2820,7 +2998,7 @@ namespace MiniCAD
             {
                 SyncCompareCamera();
                 m_compareEditor->SetThinLines(editor.IsThinLines());
-                m_compareEditor->SetCursorHidden(m_compact || m_pickPointTarget != 1);
+                m_compareEditor->SetCursorHidden(m_compact || !pickingCompare);
                 m_compareEditor->EnsureSceneCached(renderer, Viewport::kCompareSlotOffset);
                 m_compareEditor->Render();
                 const ViewState compVs = m_compareEditor->BuildViewState();
@@ -2833,7 +3011,7 @@ namespace MiniCAD
                 cp.OverlapOpacity = m_compareOverlapOpacity;
                 cp.SplitX         = splitX;
                 cp.SoloCompare    = m_compareSolo;
-                cp.PickCompare    = (m_pickPointTarget == 1);
+                cp.PickCompare    = pickingCompare;
                 cp.ShowMain       = m_compareShowMain;
                 cp.ShowCompare    = m_compareShowCompare;
                 cp.State          = &compVs;
@@ -2960,6 +3138,8 @@ namespace MiniCAD
     {
         if (!doc || (m_docManager.GetActive() == doc && m_docManager.GetShownDocument(m_docManager.PaneOf(doc)) == doc))
             return;
+        if (m_activePickSession && m_activePickSession->target == 0 && m_activePickSession->docId != doc->InstanceID())
+            AbandonPickPointSilently(0);
         m_docManager.SetActive(doc);
         EmbedSyncActiveDocumentProtection();
         StateChanged();         // 面板、菜单勾选随当前文档切换

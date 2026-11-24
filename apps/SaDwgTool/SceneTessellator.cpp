@@ -281,13 +281,16 @@ namespace MiniCAD::SaTool
             if (!filter.NeedsLayerCheck)
                 return true;
 
-            if (filter.ExcludeAnnotations && IsAnnotationEntity(e))
+            // 显式 --include-layers / --exclude-layers 对一切实体生效；
+            // 默认 ExcludeAnnotations 属于内容去噪，WipeoutEntity 作为几何擦除遮罩同时豁免实体类型与注记图层名拦截（CAD-R2-07）
+            const bool isWipeout = e.IsKindOf<WipeoutEntity>();
+            if (filter.ExcludeAnnotations && !isWipeout && IsAnnotationEntity(e))
             {
                 ++stats.EntitiesFiltered;
                 return false;
             }
             const CompiledFilter::LayerDecision d = filter.CheckLayer(lm, effectiveLayerId);
-            if ((filter.ExcludeAnnotations && d.AnnotationLayer)
+            if ((filter.ExcludeAnnotations && !isWipeout && d.AnnotationLayer)
                 || !d.IncludeOk
                 || d.ExcludeHit)
             {

@@ -327,6 +327,67 @@ namespace MiniCAD
     }
 
     // ───────────────── 查询接口 ─────────────────
+    bool Picking::ClipSegmentToClipX(const Math::Point2& a, const Math::Point2& b,
+                                     Math::Point2& outA, Math::Point2& outB) const
+    {
+        if (!m_clipEnabled)
+        {
+            outA = a;
+            outB = b;
+            return true;
+        }
+        if (m_clipMinX >= m_clipMaxX)
+            return false;
+
+        const double segMinX = std::min(a.x, b.x);
+        const double segMaxX = std::max(a.x, b.x);
+        if (segMaxX < m_clipMinX || segMinX >= m_clipMaxX)
+            return false;
+
+        const double dx = b.x - a.x;
+        if (std::abs(dx) < 1e-12)
+        {
+            if (!PointInClip(a.x))
+                return false;
+            outA = a;
+            outB = b;
+            return true;
+        }
+
+        double t0 = 0.0;
+        double t1 = 1.0;
+        const double tMin = (m_clipMinX - a.x) / dx;
+        const double tMax = (m_clipMaxX - a.x) / dx;
+        if (dx > 0.0)
+        {
+            t0 = std::max(t0, tMin);
+            t1 = std::min(t1, tMax);
+        }
+        else
+        {
+            t0 = std::max(t0, tMax);
+            t1 = std::min(t1, tMin);
+        }
+        if (t0 > t1)
+            return false;
+        if (t0 == t1 && !PointInClip(a.x + t0 * dx))
+            return false;
+
+        outA = { a.x + t0 * dx, a.y + t0 * (b.y - a.y) };
+        outB = { a.x + t1 * dx, a.y + t1 * (b.y - a.y) };
+        return true;
+    }
+
+    bool Picking::SegmentDistanceInClip(const Math::Point2& pt, const Math::Point2& a, const Math::Point2& b,
+                                        double& outDist) const
+    {
+        Math::Point2 ca{}, cb{};
+        if (!ClipSegmentToClipX(a, b, ca, cb))
+            return false;
+        outDist = Math::Distance(pt, Math::ClosestPointOnSegment(pt, ca, cb));
+        return true;
+    }
+
     // 点选命中测试：返回距离最近且在阈值内的对象 ID
     Picking::ObjectID Picking::HitTest(const Math::Point2& pt, double thresh)
     {
@@ -350,8 +411,8 @@ namespace MiniCAD
                     auto a = camera.WorldToScreen(line->GetLine().Start);
                     auto b = camera.WorldToScreen(line->GetLine().End);
 
-                    double d = Math::Distance(pt, Math::ClosestPointOnSegment(pt, a, b));
-                    if (d < thresh && d < bestDist)
+                    double d = 0.0;
+                    if (SegmentDistanceInClip(pt, a, b, d) && d < thresh && d < bestDist)
                     {
                         bestDist = d;
                         best = obj.GetID();
@@ -369,8 +430,8 @@ namespace MiniCAD
 
                     auto testEdge = [&](const Math::Point2& a, const Math::Point2& b)
                         {
-                            double d = Math::Distance(pt, Math::ClosestPointOnSegment(pt, a, b));
-                            if (d < thresh && d < bestDist)
+                            double d = 0.0;
+                            if (SegmentDistanceInClip(pt, a, b, d) && d < thresh && d < bestDist)
                             {
                                 bestDist = d;
                                 best = obj.GetID();
@@ -382,7 +443,7 @@ namespace MiniCAD
                     testEdge(p3, p4);
                     testEdge(p4, p1);
 
-                    // 二维填充是实心的：落在内部也算命中
+                    // 二维填充是实心的：落在内部也算命中（pt 本身已通过 PointInClip 校验）
                     if (obj.IsKindOf<SolidEntity>() && bestDist > 0.0
                         && (PointInTriangle2(pt, p1, p2, p3) || PointInTriangle2(pt, p1, p3, p4)))
                     {
@@ -403,9 +464,13 @@ namespace MiniCAD
                     Math::Point3 edgeWorld{ c.Center.x + c.Radius, c.Center.y, c.Center.z };
                     double screenRadius = Math::Distance(centerSS, camera.WorldToScreen(edgeWorld));
 
-                    // 点到圆环的距离 = |点到圆心距 − 屏幕半径|
-                    double d = std::abs(Math::Distance(pt, centerSS) - screenRadius);
-                    if (d < thresh && d < bestDist)
+                    // 点到圆环的距离 = |点到圆心距 − 屏幕半径|，并校验圆上最近点落在可见带内
+                    double distToCenter = Math::Distance(pt, centerSS);
+                    double d = std::abs(distToCenter - screenRadius);
+                    double hitX = centerSS.x;
+                    if (distToCenter > 1e-12)
+                        hitX = centerSS.x + (pt.x - centerSS.x) * (screenRadius / distToCenter);
+                    if (PointInClip(hitX) && d < thresh && d < bestDist)
                     {
                         bestDist = d;
                         best = obj.GetID();
@@ -417,11 +482,14 @@ namespace MiniCAD
                     auto point = static_cast<const PointEntity*>(&obj);
                     auto a = camera.WorldToScreen(point->GetPoint().Position);
 
-                    double d = Math::Distance(pt, a);
-                    if (d < thresh && d < bestDist)
+                    if (PointInClip(a.x))
                     {
-                        bestDist = d;
-                        best = obj.GetID();
+                        double d = Math::Distance(pt, a);
+                        if (d < thresh && d < bestDist)
+                        {
+                            bestDist = d;
+                            best = obj.GetID();
+                        }
                     }
                 }
 
@@ -471,8 +539,8 @@ namespace MiniCAD
 
                     if (arc.ContainsAngle(worldAngle))
                     {
-                        // 光标投影落在弧段范围内：径向距离即为命中距离
-                        if (radialDist < thresh && radialDist < bestDist)
+                        // 光标投影落在弧段范围内：径向距离即为命中距离，同时校验投影点可见
+                        if (PointInClip(circlePointSS.x) && radialDist < thresh && radialDist < bestDist)
                         {
                             bestDist = radialDist;
                             best = obj.GetID();
@@ -480,18 +548,20 @@ namespace MiniCAD
                     }
                     else
                     {
-                        // 光标投影落在弧段之外：检测是否在端点附近（沿弧线方向）
+                        // 光标投影落在弧段之外：检测是否在可见端点附近（沿弧线方向）
                         // 使用端点在屏幕上的位置，但只有径向距离也满足时才命中，
                         // 避免在端点"外侧"误选
                         auto startSS = camera.WorldToScreen(arc.StartPoint());
                         auto endSS = camera.WorldToScreen(arc.EndPoint());
 
-                        double dStart = Math::Distance(pt, startSS);
-                        double dEnd = Math::Distance(pt, endSS);
-                        double dNearest = std::min(dStart, dEnd);
+                        double dNearest = std::numeric_limits<double>::max();
+                        if (PointInClip(startSS.x))
+                            dNearest = std::min(dNearest, Math::Distance(pt, startSS));
+                        if (PointInClip(endSS.x))
+                            dNearest = std::min(dNearest, Math::Distance(pt, endSS));
 
                         // 端点命中：需要同时满足
-                        //   1. 距端点屏幕距离 < 阈值
+                        //   1. 距可见端点屏幕距离 < 阈值
                         //   2. 径向距离 < 阈值（确保是沿弧线方向靠近，而不是从外侧靠近）
                         if (dNearest < thresh && radialDist < thresh && dNearest < bestDist)
                         {
@@ -508,7 +578,7 @@ namespace MiniCAD
                     auto  ellEnt   = static_cast<const EllipseEntity*>(&obj);
                     const auto& el = ellEnt->GetEllipse();
 
-                    // 椭圆（弧）细分为折线后，逐段判断距离（屏幕空间）
+                    // 椭圆（弧）细分为折线后，逐段先裁到可见带再判断距离（屏幕空间）
                     constexpr int kSeg = 64;
                     const double tBeg  = el.IsFull() ? 0.0 : el.StartParam;
                     const double sweep = el.SweepParam();
@@ -522,8 +592,9 @@ namespace MiniCAD
                         auto a0 = camera.WorldToScreen(el.PointAt(t0));
                         auto a1 = camera.WorldToScreen(el.PointAt(t1));
 
-                        double d = Math::Distance(pt, Math::ClosestPointOnSegment(pt, a0, a1));
-                        minD = std::min(minD, d);
+                        double d = 0.0;
+                        if (SegmentDistanceInClip(pt, a0, a1, d))
+                            minD = std::min(minD, d);
                     }
 
                     if (minD < thresh && minD < bestDist)
@@ -539,7 +610,7 @@ namespace MiniCAD
                     auto  plEnt = static_cast<const PolylineEntity*>(&obj);
                     const auto& pl = plEnt->GetPolyline();
 
-                    // 使用 Polyline::Tessellate 细分（含弧段），逐段检测
+                    // 使用 Polyline::Tessellate 细分（含弧段），逐段先裁到可见带再检测
                     auto pts = pl.Tessellate();
                     double minD = std::numeric_limits<double>::max();
 
@@ -548,8 +619,9 @@ namespace MiniCAD
                         auto a0 = camera.WorldToScreen(pts[i]);
                         auto a1 = camera.WorldToScreen(pts[i + 1]);
 
-                        double d = Math::Distance(pt, Math::ClosestPointOnSegment(pt, a0, a1));
-                        minD = std::min(minD, d);
+                        double d = 0.0;
+                        if (SegmentDistanceInClip(pt, a0, a1, d))
+                            minD = std::min(minD, d);
                     }
 
                     if (minD < thresh && minD < bestDist)
@@ -567,7 +639,7 @@ namespace MiniCAD
 
                     if (sp.IsValid())
                     {
-                        // 细分后逐段检测
+                        // 细分后逐段先裁到可见带再检测
                         auto pts = sp.Tessellate(32);
                         double minD = std::numeric_limits<double>::max();
 
@@ -576,8 +648,9 @@ namespace MiniCAD
                             auto a0 = camera.WorldToScreen(pts[i]);
                             auto a1 = camera.WorldToScreen(pts[i + 1]);
 
-                            double d = Math::Distance(pt, Math::ClosestPointOnSegment(pt, a0, a1));
-                            minD = std::min(minD, d);
+                            double d = 0.0;
+                            if (SegmentDistanceInClip(pt, a0, a1, d))
+                                minD = std::min(minD, d);
                         }
 
                         if (minD < thresh && minD < bestDist)
@@ -589,12 +662,16 @@ namespace MiniCAD
                 }
 
                 // ── TextEntity / MTextEntity 点选 ────────────────────────────────────
-                // 区域型实体：点在文字外框的屏幕投影内（外扩 thresh 像素）即命中，用点到中心距离竞争
+                // 区域型实体：点在文字外框的屏幕投影内（或距可见边框 <= thresh 像素）即命中，用点到中心距离竞争
                 if (std::array<Math::Point2, 4> q; TextScreenQuad(obj, camera, q))
                 {
                     bool inside = PointInConvexQuad(pt, q);
                     for (size_t i = 0; i < 4 && !inside; ++i)
-                        inside = Math::Distance(pt, Math::ClosestPointOnSegment(pt, q[i], q[(i + 1) % 4])) <= thresh;
+                    {
+                        double edgeDist = 0.0;
+                        if (SegmentDistanceInClip(pt, q[i], q[(i + 1) % 4], edgeDist) && edgeDist <= thresh)
+                            inside = true;
+                    }
                     if (inside)
                     {
                         const Math::Point2 center = { (q[0].x + q[2].x) * 0.5, (q[0].y + q[2].y) * 0.5 };
@@ -608,9 +685,7 @@ namespace MiniCAD
                 }
 
                 // ── XLineEntity / RayEntity 点选 ─────────────────────────────────────
-                // 无限直线/射线:在屏幕空间求光标到直线(射线)的投影距离。
-                // 端点在 ±1e6 处,不能用 Draw() 折线近似(投影后坐标巨大、精度差),
-                // 故单独特化精确求距。
+                // 无限直线/射线:在屏幕空间先按可见带裁剪参数区间，再求光标到可见段的投影距离。
                 if (bool isRay = false; const XLine* geo = AsXLineGeometry(obj, isRay))
                 {
                     if (geo->IsValid())
@@ -622,15 +697,42 @@ namespace MiniCAD
                         double len2 = dSS.x * dSS.x + dSS.y * dSS.y;
                         if (len2 > 1e-18)
                         {
-                            double t = ((pt.x - oSS.x) * dSS.x + (pt.y - oSS.y) * dSS.y) / len2;
-                            if (isRay && t < 0.0) t = 0.0;   // 射线:投影不能落在起点之前
-                            Math::Point2 proj{ oSS.x + t * dSS.x, oSS.y + t * dSS.y };
-
-                            double d = Math::Distance(pt, proj);
-                            if (d < thresh && d < bestDist)
+                            constexpr double inf = std::numeric_limits<double>::infinity();
+                            double tMin = isRay ? 0.0 : -inf;
+                            double tMax = inf;
+                            bool visible = true;
+                            if (m_clipEnabled)
                             {
-                                bestDist = d;
-                                best     = obj.GetID();
+                                if (m_clipMinX >= m_clipMaxX)
+                                {
+                                    visible = false;
+                                }
+                                else if (std::abs(dSS.x) < 1e-12)
+                                {
+                                    visible = PointInClip(oSS.x);
+                                }
+                                else
+                                {
+                                    const double c0 = (m_clipMinX - oSS.x) / dSS.x;
+                                    const double c1 = (m_clipMaxX - oSS.x) / dSS.x;
+                                    tMin = std::max(tMin, std::min(c0, c1));
+                                    tMax = std::min(tMax, std::max(c0, c1));
+                                    if (tMin > tMax || (tMin == tMax && !PointInClip(oSS.x + tMin * dSS.x)))
+                                        visible = false;
+                                }
+                            }
+                            if (visible)
+                            {
+                                double t = ((pt.x - oSS.x) * dSS.x + (pt.y - oSS.y) * dSS.y) / len2;
+                                t = std::clamp(t, tMin, tMax);
+                                Math::Point2 proj{ oSS.x + t * dSS.x, oSS.y + t * dSS.y };
+
+                                double d = Math::Distance(pt, proj);
+                                if (d < thresh && d < bestDist)
+                                {
+                                    bestDist = d;
+                                    best     = obj.GetID();
+                                }
                             }
                         }
                     }
@@ -644,26 +746,53 @@ namespace MiniCAD
                 {
                     const PickGeometry& geom = GetPickGeometry(obj);
 
-                    if (!camera.IsPlanView())
+                    if (!camera.IsPlanView() || m_clipEnabled)
                     {
-                        // 三维视图：世界 XY 距离不再对应屏幕距离，逐点投影到屏幕求像素距离
+                        // 三维视图或启用水平可见带裁剪：先在俯视下做世界包围盒粗筛，再在屏幕空间按可见带求像素距离
+                        const bool planClip = camera.IsPlanView();
+                        const double wpp = planClip ? camera.GetWorldPerPixel() : 0.0;
+                        if (planClip && wpp <= 0.0) return;
+                        const Math::Point2 pw{ worldPt.x, worldPt.y };
+                        const double tw = thresh * wpp;
+                        auto outside = [&](const Math::Point3& a, const Math::Point3& b)
+                        {
+                            return planClip && (std::min(a.x, b.x) > pw.x + tw || std::max(a.x, b.x) < pw.x - tw
+                                || std::min(a.y, b.y) > pw.y + tw || std::max(a.y, b.y) < pw.y - tw);
+                        };
+
                         double minD = std::numeric_limits<double>::max();
                         for (const auto& seg : geom.Segments)
                         {
+                            if (outside(seg.first, seg.second)) continue;
                             const Math::Point2 a = camera.WorldToScreen(seg.first), b = camera.WorldToScreen(seg.second);
-                            minD = std::min(minD, Math::Distance(pt, Math::ClosestPointOnSegment(pt, a, b)));
+                            double d = 0.0;
+                            if (SegmentDistanceInClip(pt, a, b, d))
+                                minD = std::min(minD, d);
                         }
                         for (const auto& tri : geom.Triangles)
                         {
+                            if (planClip)
+                            {
+                                const double x0 = std::min({ tri[0].x, tri[1].x, tri[2].x }), x1 = std::max({ tri[0].x, tri[1].x, tri[2].x });
+                                const double y0 = std::min({ tri[0].y, tri[1].y, tri[2].y }), y1 = std::max({ tri[0].y, tri[1].y, tri[2].y });
+                                if (x0 > pw.x + tw || x1 < pw.x - tw || y0 > pw.y + tw || y1 < pw.y - tw) continue;
+                            }
                             const Math::Point2 a = camera.WorldToScreen(tri[0]), b = camera.WorldToScreen(tri[1]), c = camera.WorldToScreen(tri[2]);
                             if (PointInTriangle2(pt, a, b, c)) { minD = 0.0; break; }
-                            minD = std::min({ minD, Math::Distance(pt, Math::ClosestPointOnSegment(pt, a, b)),
-                                              Math::Distance(pt, Math::ClosestPointOnSegment(pt, b, c)),
-                                              Math::Distance(pt, Math::ClosestPointOnSegment(pt, c, a)) });
+                            double d = 0.0;
+                            if (SegmentDistanceInClip(pt, a, b, d)) minD = std::min(minD, d);
+                            if (SegmentDistanceInClip(pt, b, c, d)) minD = std::min(minD, d);
+                            if (SegmentDistanceInClip(pt, c, a, d)) minD = std::min(minD, d);
                         }
-                        // 点图元：屏幕 1 像素，投影后直接求像素距离
+                        // 点图元：屏幕 1 像素，投影后校验落在可见带内再求像素距离
                         for (const auto& p : geom.Points)
-                            minD = std::min(minD, Math::Distance(pt, camera.WorldToScreen(p)));
+                        {
+                            if (planClip && (p.x > pw.x + tw || p.x < pw.x - tw || p.y > pw.y + tw || p.y < pw.y - tw))
+                                continue;
+                            const Math::Point2 sp = camera.WorldToScreen(p);
+                            if (PointInClip(sp.x))
+                                minD = std::min(minD, Math::Distance(pt, sp));
+                        }
                         if (minD < thresh && minD < bestDist)
                         {
                             bestDist = minD;
@@ -730,10 +859,18 @@ namespace MiniCAD
 
             };
 
-        // 包围盒粗筛 + 空间索引：仅对世界查询窗口内的候选做精确测试
+        // 包围盒粗筛 + 空间索引：仅对可见带内的世界查询窗口候选做精确测试
         EnsureIndex();
-        AABB q = ScreenRectToWorldAABB(pt.x - thresh, pt.y - thresh,
-                                       pt.x + thresh, pt.y + thresh);
+        double qx0 = pt.x - thresh;
+        double qx1 = pt.x + thresh;
+        if (m_clipEnabled)
+        {
+            qx0 = std::max(qx0, m_clipMinX);
+            qx1 = std::min(qx1, m_clipMaxX);
+            if (qx0 > qx1)
+                return Object::InvalidID;
+        }
+        AABB q = ScreenRectToWorldAABB(qx0, pt.y - thresh, qx1, pt.y + thresh);
         m_index.Query(q, m_candidates);
         for (ObjectID id : m_candidates)
             if (const Object* o = m_scene->GetEntity(id))

@@ -583,6 +583,18 @@ namespace MiniCAD
         return wgpuDeviceCreateBindGroup(m_device, &desc);
     }
 
+    void WebGPURenderer::ReleaseCompareResources()
+    {
+        if (m_compareBindGroup)
+        {
+            if (m_encoder) m_retired.bindGroups.push_back(m_compareBindGroup);
+            else           wgpuBindGroupRelease(m_compareBindGroup);
+            m_compareBindGroup = nullptr;
+        }
+        m_compareMainGen  = 0;
+        m_compareOtherGen = 0;
+    }
+
     void WebGPURenderer::ReleaseCachedResources()
     {
         for (auto& [slot, gb] : m_cached)     Retire(gb.buffer);
@@ -600,26 +612,12 @@ namespace MiniCAD
         for (auto& [view, group] : m_textGroups)
             wgpuBindGroupRelease(group);
         m_textGroups.clear();
-        if (m_compareBindGroup)
-        {
-            if (m_encoder) m_retired.bindGroups.push_back(m_compareBindGroup);
-            else           wgpuBindGroupRelease(m_compareBindGroup);
-            m_compareBindGroup = nullptr;
-            m_compareMainView  = nullptr;
-            m_compareOtherView = nullptr;
-        }
+        ReleaseCompareResources();
     }
 
     void WebGPURenderer::ReleaseSlotRange(uint32_t firstSlot, uint32_t lastSlot)
     {
-        if (m_compareBindGroup)
-        {
-            if (m_encoder) m_retired.bindGroups.push_back(m_compareBindGroup);
-            else           wgpuBindGroupRelease(m_compareBindGroup);
-            m_compareBindGroup = nullptr;
-            m_compareMainView  = nullptr;
-            m_compareOtherView = nullptr;
-        }
+        ReleaseCompareResources();
         auto eraseBuffers = [&](std::unordered_map<uint32_t, GpuBuffer>& cache)
         {
             for (auto it = cache.begin(); it != cache.end();)
@@ -988,7 +986,9 @@ namespace MiniCAD
             return false;
         WGPUTextureView mainView = mainRt.GetColorView();
         WGPUTextureView compView = compRt.GetColorView();
-        if (!mainView || !compView)
+        const uint64_t mainGen = mainRt.GetGeneration();
+        const uint64_t compGen = compRt.GetGeneration();
+        if (!mainView || !compView || mainGen == 0 || compGen == 0)
             return false;
 
         EnsureComparePipeline();
@@ -1010,7 +1010,7 @@ namespace MiniCAD
         cu.overlapColor[3] = std::clamp(style.OverlapOpacity, 0.0f, 1.0f);
         wgpuQueueWriteBuffer(m_queue, m_compareUniformBuf, 0, &cu, sizeof(cu));
 
-        if (!m_compareBindGroup || m_compareMainView != mainView || m_compareOtherView != compView)
+        if (!m_compareBindGroup || m_compareMainGen != mainGen || m_compareOtherGen != compGen)
         {
             if (m_compareBindGroup)
                 m_retired.bindGroups.push_back(m_compareBindGroup);
@@ -1032,8 +1032,8 @@ namespace MiniCAD
             bd.entryCount = 3;
             bd.entries    = entries;
             m_compareBindGroup = wgpuDeviceCreateBindGroup(m_device, &bd);
-            m_compareMainView  = mainView;
-            m_compareOtherView = compView;
+            m_compareMainGen   = mainGen;
+            m_compareOtherGen  = compGen;
         }
 
         wgpuRenderPassEncoderSetPipeline(m_pass, m_comparePipeline);

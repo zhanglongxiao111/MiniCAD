@@ -246,6 +246,20 @@ namespace MiniCAD
         m_blockTessCache.SetUseCounter([this](std::unordered_map<const void*, int>& uses) { CountBlockUses(uses); });
     }
 
+    Editor::~Editor()
+    {
+        if (m_alive)
+            *m_alive = false;
+        if (m_tool)
+        {
+            auto old = std::move(m_tool);
+            m_toolSuspended    = false;
+            m_pendingToolReset = false;
+            old->OnFinished    = nullptr;
+            old->Cancel();
+        }
+    }
+
     uint64_t Editor::NextRenderVersion()
     {
         static std::atomic<uint64_t> counter{ 0 };
@@ -305,7 +319,10 @@ namespace MiniCAD
     // ─────────────────────────────────────────────────────────────
     void Editor::Bind(Document& doc, Viewport& viewport)
     {
+        const auto alive = m_alive;
         Unbind();
+        if (!*alive)
+            return;
         m_viewAnim.Active = false;
 
         m_doc      = &doc;
@@ -344,14 +361,7 @@ namespace MiniCAD
     {
         if (m_viewport == &viewport)
             return;
-        if (m_tool)
-        {
-            auto old = std::move(m_tool);
-            m_toolSuspended    = false;
-            m_pendingToolReset = false;
-            m_overlay.Clear();
-            old->Cancel();
-        }
+        auto old = std::move(m_tool);
         m_toolSuspended    = false;
         m_pendingToolReset = false;
         m_viewAnim.Active  = false;
@@ -367,6 +377,8 @@ namespace MiniCAD
         m_picking.SetViewport(viewport);
         m_gripEditor.SetViewport(viewport);
         // 新视口的缩放与原来的不同：Render 比较 worldPerPixel 时会重建动态流与随视图变化的选中流
+        if (old)
+            old->Cancel();
     }
 
     void Editor::EnsureSceneCached(const IRenderer& renderer, uint32_t slotOffset)
@@ -380,14 +392,7 @@ namespace MiniCAD
 
     void Editor::Unbind()
     {
-        if (m_tool)
-        {
-            auto old = std::move(m_tool);
-            m_toolSuspended    = false;
-            m_pendingToolReset = false;
-            m_overlay.Clear();
-            old->Cancel();
-        }
+        auto old = std::move(m_tool);
         m_toolSuspended    = false;
         m_pendingToolReset = false;
         m_overlay.Clear();
@@ -454,6 +459,9 @@ namespace MiniCAD
 
         m_doc      = nullptr;
         m_viewport = nullptr;
+
+        if (old)
+            old->Cancel();
     }
 
     void Editor::SetThinLines(bool thin)
@@ -1173,30 +1181,36 @@ namespace MiniCAD
     // ─────────────────────────────────────────────────────────────
     void Editor::ActivateTool(std::unique_ptr<ITool> tool)
     {
-        if (m_tool)
-        {
-            auto old = std::move(m_tool);
-            m_toolSuspended    = false;
-            m_pendingToolReset = false;
-            m_overlay.Clear();
-            old->Cancel();
-        }
+        const auto alive = m_alive;
+        auto old = std::move(m_tool);
 
-        m_toolSuspended = false;
+        m_toolSuspended    = false;
+        m_pendingToolReset = false;
         m_overlay.Clear();
         m_picking.ClearSelection();
         // 选中高亮已是独立顶点流（picking 脏标记驱动），清除选择无需场景全局标脏
         m_picking.MarkDirty();
         m_gripEditor.RebuildGrips();
 
+        ITool* const rawNewTool = tool.get();
         m_tool = std::move(tool);
-        m_pendingToolReset = false;
-        m_tool->OnFinished = [this]()
+        if (m_tool)
         {
-            m_toolSuspended    = false;
-            m_overlay.Clear();
-            m_pendingToolReset = true;
-        };
+            m_tool->OnFinished = [this, alive, rawNewTool]()
+            {
+                if (!*alive || m_tool.get() != rawNewTool)
+                    return;
+                m_toolSuspended    = false;
+                m_overlay.Clear();
+                m_pendingToolReset = true;
+            };
+        }
+
+        if (old)
+            old->Cancel();
+
+        if (!*alive || !m_tool || m_tool.get() != rawNewTool)
+            return;
 
         // 用最近的光标位置合成一次 MouseMove:跟随光标的工具(粘贴/移动/复制预览)
         // 激活当帧即可出现预览,不必等真实的鼠标移动事件
@@ -2159,12 +2173,17 @@ namespace MiniCAD
         // 都退出拾取态,让阵列对话框重新显示。
         if (m_tool)
         {
-            m_tool->OnFinished = [this]()
+            ITool* const rawPickTool = m_tool.get();
+            m_tool->OnFinished = [this, alive = m_alive, rawPickTool]()
             {
+                if (!*alive)
+                    return;
+                m_arrayRequest.PickingCenter = false;
+                if (m_tool.get() != rawPickTool)
+                    return;
                 m_toolSuspended    = false;
                 m_overlay.Clear();
                 m_pendingToolReset = true;
-                m_arrayRequest.PickingCenter = false;
             };
         }
     }
@@ -2538,7 +2557,10 @@ namespace MiniCAD
         {
             if (m_tool && !m_toolSuspended)
             {
+                const auto alive = m_alive;
                 if (m_tool->OnInput(ctx))
+                    return true;
+                if (!*alive)
                     return true;
             }
 

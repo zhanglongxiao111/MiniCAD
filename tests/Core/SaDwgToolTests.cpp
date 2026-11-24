@@ -1309,6 +1309,77 @@ namespace
         Check(RunDiffCommand(dop, rep, &code, &msg, &usageErr), "CAD-14: 默认注记过滤下 Wipeout diff 执行成功");
         Check(rep.AOnlyPixels == 0 && rep.BOnlyPixels == 0,
               "CAD-14: 默认注记过滤保留 Wipeout 遮挡语义，被遮挡差异不产生误报");
+
+        // 3. CAD-R2-07：Wipeout 位于命中注记正则的 "DIM" 与 "PUB_TEXT" 图层时，
+        // 默认 diff 仍保留遮罩零误报，而显式 --exclude-layers "^DIM$" 仍正常排除该层 Wipeout
+        auto buildAnnotatedLayerWipeoutDwg = [](const std::string& path, bool altHiddenLine, const char* wipeLayerName) -> bool {
+            MiniCAD::Scene s;
+            const MiniCAD::LayerID annLayerId = s.GetLayerManager().AddLayer(wipeLayerName);
+            s.AddEntity(std::make_unique<MiniCAD::LineEntity>(s.NextObjectID(), MiniCAD::Math::Point3{ 0, 0, 0 }, MiniCAD::Math::Point3{ 4000, 0, 0 }));
+            s.AddEntity(std::make_unique<MiniCAD::LineEntity>(s.NextObjectID(), MiniCAD::Math::Point3{ 4000, 0, 0 }, MiniCAD::Math::Point3{ 4000, 3000, 0 }));
+            s.AddEntity(std::make_unique<MiniCAD::LineEntity>(s.NextObjectID(), MiniCAD::Math::Point3{ 4000, 3000, 0 }, MiniCAD::Math::Point3{ 0, 3000, 0 }));
+            s.AddEntity(std::make_unique<MiniCAD::LineEntity>(s.NextObjectID(), MiniCAD::Math::Point3{ 0, 3000, 0 }, MiniCAD::Math::Point3{ 0, 0, 0 }));
+            if (!altHiddenLine)
+                s.AddEntity(std::make_unique<MiniCAD::LineEntity>(s.NextObjectID(), MiniCAD::Math::Point3{ 1200, 1500, 0 }, MiniCAD::Math::Point3{ 2800, 1500, 0 }));
+            else
+                s.AddEntity(std::make_unique<MiniCAD::LineEntity>(s.NextObjectID(), MiniCAD::Math::Point3{ 1200, 1200, 0 }, MiniCAD::Math::Point3{ 2800, 1800, 0 }));
+
+            auto wo = std::make_unique<MiniCAD::WipeoutEntity>(
+                s.NextObjectID(),
+                std::vector<MiniCAD::Math::Point3>{
+                    { 1000, 1000, 0 }, { 3000, 1000, 0 }, { 3000, 2000, 0 }, { 1000, 2000, 0 }
+                });
+            wo->SetShowFrame(false);
+            wo->SetLayerId(annLayerId);
+            s.AddEntity(std::move(wo));
+            const auto bytes = MiniCAD::ExportCad(s, MiniCAD::CadFileKind::Dwg, MiniCAD::CadSaveVersion::R2018);
+            return !bytes.empty() && WriteBytesToUtf8Path(path, bytes);
+        };
+
+        for (const char* layerName : { "DIM", "PUB_TEXT" })
+        {
+            const std::string aPath = workDir + "/wipeout_ann_" + layerName + "_a.dwg";
+            const std::string bPath = workDir + "/wipeout_ann_" + layerName + "_b.dwg";
+            Check(buildAnnotatedLayerWipeoutDwg(aPath, false, layerName)
+                      && buildAnnotatedLayerWipeoutDwg(bPath, true, layerName),
+                  "CAD-R2-07: 生成注记图层含 Wipeout 遮罩的测试 DWG");
+
+            DiffOptions dDef;
+            dDef.InputPathA          = aPath;
+            dDef.InputPathB          = bPath;
+            dDef.IncludeAnnotations  = false;
+            dDef.MmPerPx             = 10.0;
+            dDef.MmPerPxExplicit     = true;
+            dDef.ToleranceMm         = 0.0;
+            dDef.ToleranceMmExplicit = true;
+#ifdef MINICAD_TEST_FONTS_DIR
+            dDef.FontsDir            = MINICAD_TEST_FONTS_DIR;
+#endif
+            DiffReport rDef;
+            Check(RunDiffCommand(dDef, rDef, &code, &msg, &usageErr)
+                      && rDef.AOnlyPixels == 0 && rDef.BOnlyPixels == 0,
+                  "CAD-R2-07: 注记图层（DIM / PUB_TEXT）上的 Wipeout 在默认 diff 下保留遮挡零误报");
+        }
+
+        // 显式 --exclude-layers "^DIM$" 仍必须排除 DIM 图层上的 Wipeout，使背后差异暴露
+        {
+            DiffOptions dExcl;
+            dExcl.InputPathA          = workDir + "/wipeout_ann_DIM_a.dwg";
+            dExcl.InputPathB          = workDir + "/wipeout_ann_DIM_b.dwg";
+            dExcl.IncludeAnnotations  = false;
+            dExcl.ExcludeLayersRegex  = "^DIM$";
+            dExcl.MmPerPx             = 10.0;
+            dExcl.MmPerPxExplicit     = true;
+            dExcl.ToleranceMm         = 0.0;
+            dExcl.ToleranceMmExplicit = true;
+#ifdef MINICAD_TEST_FONTS_DIR
+            dExcl.FontsDir            = MINICAD_TEST_FONTS_DIR;
+#endif
+            DiffReport rExcl;
+            Check(RunDiffCommand(dExcl, rExcl, &code, &msg, &usageErr)
+                      && (rExcl.AOnlyPixels > 0 && rExcl.BOnlyPixels > 0),
+                  "CAD-R2-07: 显式 --exclude-layers \"^DIM$\" 仍正常拦截 DIM 层 Wipeout 并暴露背后差异");
+        }
     }
 
     // ── CAD-15：默认整图窗口取 A/B 并集 + 旧图空布局可正常检出新增 ───────────────
@@ -1468,6 +1539,62 @@ namespace
         else
         {
             Check(false, "CAD-16: 打开 paper_vp_diff.sqlite");
+        }
+
+        // CAD-R2-14：显式跨空间比较（A=Model，B=纸张布局 index:1）逐侧如实披露覆盖边界
+        {
+            DiffOptions dMix;
+            dMix.InputPathA  = dwgA;
+            dMix.InputPathB  = dwgB;
+            dMix.LayoutName  = "Model";
+            dMix.LayoutNameB = "index:1";
+            dMix.OutDbPath   = workDir + "/mixed_space_diff.sqlite";
+#ifdef MINICAD_TEST_FONTS_DIR
+            dMix.FontsDir    = MINICAD_TEST_FONTS_DIR;
+#endif
+            DiffReport mixRep;
+            Check(RunDiffCommand(dMix, mixRep, &code, &msg, &usageErr), "CAD-R2-14: 模型对纸张跨空间 diff 执行成功");
+            Check(mixRep.SideA.Layout == "Model" && mixRep.SideB.Layout != "Model"
+                      && mixRep.CoverageNote.find("跨空间比对") != std::string::npos
+                      && mixRep.CoverageNote.find("A 侧覆盖模型空间语义对象") != std::string::npos
+                      && mixRep.CoverageNote.find("B 侧覆盖纸面空间实体") != std::string::npos,
+                  "CAD-R2-14: 跨空间比对 CoverageNote 逐侧如实披露模型与纸张语义边界");
+
+            bool warnDescribesBothSides = false;
+            for (const auto& w : mixRep.Warnings)
+                if (w.find("跨空间比对") != std::string::npos
+                    && w.find("A 侧覆盖模型空间语义对象") != std::string::npos
+                    && w.find("B 侧覆盖纸面空间实体") != std::string::npos)
+                    warnDescribesBothSides = true;
+            Check(warnDescribesBothSides, "CAD-R2-14: 跨空间比对 Warnings 逐侧披露语义边界且不笼统宣称双侧仅纸面");
+
+            const std::string mixJson = FormatDiffReportJson(mixRep, false, false);
+            Check(mixJson.find("\"layout_space\":\"mixed\"") != std::string::npos
+                      && mixJson.find("\"layout_space_a\":\"model\"") != std::string::npos
+                      && mixJson.find("\"layout_space_b\":\"paper\"") != std::string::npos
+                      && mixJson.find("\"text_scope\":\"mixed\"") != std::string::npos
+                      && mixJson.find("\"text_scope_a\":\"model_space\"") != std::string::npos
+                      && mixJson.find("\"text_scope_b\":\"paper_space_only\"") != std::string::npos
+                      && mixJson.find("\"tch_scope\":\"mixed\"") != std::string::npos
+                      && mixJson.find("\"tch_scope_a\":\"model_space\"") != std::string::npos
+                      && mixJson.find("\"tch_scope_b\":\"paper_space_only\"") != std::string::npos,
+                  "CAD-R2-14: JSON coverage 字段逐侧输出 layout_space / text_scope / tch_scope");
+
+            sqlite3* mixDb = nullptr;
+            if (sqlite3_open_v2(dMix.OutDbPath.c_str(), &mixDb, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK)
+            {
+                Check(SqlText(mixDb, "SELECT value FROM diff_meta WHERE key='layout_space';") == "mixed"
+                          && SqlText(mixDb, "SELECT value FROM diff_meta WHERE key='layout_space_a';") == "model"
+                          && SqlText(mixDb, "SELECT value FROM diff_meta WHERE key='layout_space_b';") == "paper"
+                          && SqlText(mixDb, "SELECT value FROM diff_meta WHERE key='text_scope_a';") == "model_space"
+                          && SqlText(mixDb, "SELECT value FROM diff_meta WHERE key='text_scope_b';") == "paper_space_only",
+                      "CAD-R2-14: diff_meta 同步写入逐侧覆盖边界");
+                sqlite3_close(mixDb);
+            }
+            else
+            {
+                Check(false, "CAD-R2-14: 打开 mixed_space_diff.sqlite");
+            }
         }
     }
 
@@ -1915,6 +2042,144 @@ namespace
             Check(RunExportDbCommand(opts, r6, &err) && !r6.Reused,
                   "CAD-21: 缺失外部参照重新出现磁盘时缓存失效重建");
         }
+
+        // 3. CAD-R2-08 ①：外参磁盘可 stat 但内容损坏导致导入失败 -> 记 unverifiable，
+        // 事后修复为同字节大小且同 mtime 的合法 DWG 后再次导出绝不误复用旧库
+        {
+            const fs::path corruptDir = MiniCAD::Utf8ToPath(workDir) / "xref_corrupt_test";
+            std::error_code ec;
+            fs::create_directories(corruptDir, ec);
+            const fs::path childFs    = corruptDir / "sub_xref.dwg";
+            const std::string childP  = PathToUtf8(childFs);
+            const std::string hostP   = PathToUtf8(corruptDir / "host.dwg");
+            const std::string dbP     = PathToUtf8(corruptDir / "host.sqlite");
+
+            // 先在内存生成合法子外参字节，测出精确大小
+            std::vector<uint8_t> goodChildBytes;
+            {
+                MiniCAD::Scene cs;
+                cs.AddEntity(std::make_unique<MiniCAD::LineEntity>(
+                    cs.NextObjectID(), MiniCAD::Math::Point3{ 0, 0, 0 }, MiniCAD::Math::Point3{ 500, 0, 0 }));
+                goodChildBytes = MiniCAD::ExportCad(cs, MiniCAD::CadFileKind::Dwg, MiniCAD::CadSaveVersion::R2018);
+            }
+            // 构造同大小的损坏内容写盘（磁盘可 stat 但 Importer 解析失败）
+            const std::vector<uint8_t> badChildBytes(goodChildBytes.size(), static_cast<uint8_t>('X'));
+            Check(!goodChildBytes.empty() && WriteBytesToUtf8Path(childP, badChildBytes),
+                  "CAD-R2-08: 写出与合法外参同大小的损坏外参文件");
+            const auto frozenMtime = fs::last_write_time(childFs, ec);
+            Check(!ec, "CAD-R2-08: 获取损坏外参文件原始 mtime");
+
+            // 写出引用该外参的宿主图
+            {
+                MiniCAD::Scene hs;
+                MiniCAD::BlockTable& tbl = hs.GetBlockTable();
+                const MiniCAD::BlockID bid = tbl.Create("损坏参照", { 0, 0, 0 });
+                MiniCAD::BlockEntity* blk  = tbl.Find(bid);
+                blk->SetFlags(MiniCAD::BlockEntity::XRef);
+                blk->SetXRefPath("sub_xref.dwg");
+                auto ins = std::make_unique<MiniCAD::InsertEntity>(
+                    hs.NextObjectID(), bid, "损坏参照", MiniCAD::Math::Point3{ 0, 0, 0 });
+                ins->SetBlock(blk);
+                hs.AddEntity(std::move(ins));
+                const auto hostBytes = MiniCAD::ExportCad(hs, MiniCAD::CadFileKind::Dwg, MiniCAD::CadSaveVersion::R2018);
+                Check(!hostBytes.empty() && WriteBytesToUtf8Path(hostP, hostBytes), "CAD-R2-08: 写出宿主图纸");
+            }
+
+            ExportDbOptions opts;
+            opts.InputPath    = hostP;
+            opts.OutputDbPath = dbP;
+            opts.ReuseIfFresh = true;
+
+            ExportDbResult rBad{}, rFixed{}, rReuse{};
+            std::string err;
+            Check(RunExportDbCommand(opts, rBad, &err) && !rBad.Reused && rBad.Counts.BlockEntities == 0,
+                  "CAD-R2-08: 外参损坏时宿主导出完成且未解析块实体数为 0");
+            {
+                sqlite3* db = nullptr;
+                Check(sqlite3_open_v2(dbP.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK,
+                      "CAD-R2-08: 打开损坏外参导出的 SQLite");
+                if (db)
+                {
+                    const std::string depsV1 = SqlText(db, "SELECT value FROM meta WHERE key='xref_deps_v1';");
+                    Check(depsV1.find("\nunverifiable\t") != std::string::npos
+                              && depsV1.find("\nresolved\t") == std::string::npos,
+                          "CAD-R2-08: 磁盘存在但导入失败的外参在 xref_deps_v1 中严格标为 unverifiable");
+                    sqlite3_close(db);
+                }
+            }
+
+            // 修复外参文件并强行还原完全相同的 size 与 mtime
+            Check(WriteBytesToUtf8Path(childP, goodChildBytes), "CAD-R2-08: 替换为同大小合法外参 DWG");
+            fs::last_write_time(childFs, frozenMtime, ec);
+            Check(!ec, "CAD-R2-08: 还原外参文件至与损坏态完全相同的 mtime");
+
+            Check(RunExportDbCommand(opts, rFixed, &err) && !rFixed.Reused && rFixed.Counts.BlockEntities >= 1,
+                  "CAD-R2-08: 修复外参后即使 size/mtime 完全不变也绝不误复用旧库，成功重导读入外参实体");
+            Check(RunExportDbCommand(opts, rReuse, &err) && rReuse.Reused,
+                  "CAD-R2-08: 合法外参成功入库后，后续未变动时正常命中缓存复用");
+        }
+
+        // 4. CAD-R2-08 ②：同一宿主文件经硬链接置于两个含不同相对外参的目录 -> 绝不跨目录串库
+        {
+            const fs::path crossRoot = MiniCAD::Utf8ToPath(workDir) / "xref_cross_dir_test";
+            const fs::path dirA      = crossRoot / "proj_a";
+            const fs::path dirB      = crossRoot / "proj_b";
+            std::error_code ec;
+            fs::create_directories(dirA, ec);
+            fs::create_directories(dirB, ec);
+
+            auto writeChildAt = [](const fs::path& dst, int lineCount) -> bool {
+                MiniCAD::Scene cs;
+                for (int i = 0; i < lineCount; ++i)
+                    cs.AddEntity(std::make_unique<MiniCAD::LineEntity>(
+                        cs.NextObjectID(),
+                        MiniCAD::Math::Point3{ 0.0, i * 50.0, 0.0 },
+                        MiniCAD::Math::Point3{ 300.0, i * 50.0, 0.0 }));
+                const auto bytes = MiniCAD::ExportCad(cs, MiniCAD::CadFileKind::Dwg, MiniCAD::CadSaveVersion::R2018);
+                return !bytes.empty() && WriteBytesToUtf8Path(PathToUtf8(dst), bytes);
+            };
+            Check(writeChildAt(dirA / "sub_xref.dwg", 1) && writeChildAt(dirB / "sub_xref.dwg", 4),
+                  "CAD-R2-08: 在两个项目目录分别写入不同的相对外参（1 线 vs 4 线）");
+
+            const fs::path hostAFs = dirA / "host.dwg";
+            const fs::path hostBFs = dirB / "host.dwg";
+            {
+                MiniCAD::Scene hs;
+                MiniCAD::BlockTable& tbl = hs.GetBlockTable();
+                const MiniCAD::BlockID bid = tbl.Create("共享外参", { 0, 0, 0 });
+                MiniCAD::BlockEntity* blk  = tbl.Find(bid);
+                blk->SetFlags(MiniCAD::BlockEntity::XRef);
+                blk->SetXRefPath("sub_xref.dwg");
+                auto ins = std::make_unique<MiniCAD::InsertEntity>(
+                    hs.NextObjectID(), bid, "共享外参", MiniCAD::Math::Point3{ 0, 0, 0 });
+                ins->SetBlock(blk);
+                hs.AddEntity(std::move(ins));
+                const auto hostBytes = MiniCAD::ExportCad(hs, MiniCAD::CadFileKind::Dwg, MiniCAD::CadSaveVersion::R2018);
+                Check(!hostBytes.empty() && WriteBytesToUtf8Path(PathToUtf8(hostAFs), hostBytes),
+                      "CAD-R2-08: 写出 proj_a 宿主图");
+            }
+            fs::create_hard_link(hostAFs, hostBFs, ec);
+            Check(!ec && PathsReferToSameFile(PathToUtf8(hostAFs), PathToUtf8(hostBFs)),
+                  "CAD-R2-08: 创建 proj_b 硬链接指向同一宿主文件身份");
+
+            const std::string sharedDb = PathToUtf8(crossRoot / "shared_cache.sqlite");
+            ExportDbOptions optsA;
+            optsA.InputPath    = PathToUtf8(hostAFs);
+            optsA.OutputDbPath = sharedDb;
+            optsA.ReuseIfFresh = true;
+
+            ExportDbOptions optsB = optsA;
+            optsB.InputPath = PathToUtf8(hostBFs);
+
+            ExportDbResult rA{}, rB{}, rB2{};
+            std::string err;
+            Check(RunExportDbCommand(optsA, rA, &err) && !rA.Reused && rA.Counts.BlockEntities == 1,
+                  "CAD-R2-08: proj_a 首次导出读入 1 条外参线");
+            Check(RunExportDbCommand(optsB, rB, &err) && !rB.Reused && rB.Counts.BlockEntities == 4,
+                  "CAD-R2-08: 换 proj_b 同文件身份宿主调用复用时不串库，重算相对外参链并读入 4 条线");
+            Check(RunExportDbCommand(optsB, rB2, &err) && rB2.Reused && rB2.Counts.BlockEntities == 4,
+                  "CAD-R2-08: proj_b 再次调用复用稳定命中缓存");
+        }
     }
 
     // ── CAD-22：输出路径与输入/多输出冲突拦截（绝不覆盖原 DWG） ─────────────────
@@ -2040,6 +2305,23 @@ namespace
             scene.AddEntity(std::make_unique<MiniCAD::HatchEntity>(
                 scene.NextObjectID(), std::move(loops), MiniCAD::HatchPattern::MakeSolid()));
         }
+        // Hatch 3（CAD-R2-12）：大测绘坐标 (4e8, 3.5e9) 下 50×50 带 10×10 孔洞 => 净面积 2400
+        const double ox = 4.0e8, oy = 3.5e9;
+        {
+            std::vector<MiniCAD::Polyline> loops;
+            loops.push_back(makeRect(ox, oy, ox + 50.0, oy + 50.0));
+            loops.push_back(makeRect(ox + 20.0, oy + 20.0, ox + 30.0, oy + 30.0));
+            scene.AddEntity(std::make_unique<MiniCAD::HatchEntity>(
+                scene.NextObjectID(), std::move(loops), MiniCAD::HatchPattern::MakeSolid()));
+        }
+        // Hatch 4（CAD-R2-12）：大测绘坐标下部分相交的两个 10×10 方形（重叠 5×5=25）=> 奇偶净面积 150
+        {
+            std::vector<MiniCAD::Polyline> loops;
+            loops.push_back(makeRect(ox + 100.0, oy, ox + 110.0, oy + 10.0));
+            loops.push_back(makeRect(ox + 105.0, oy + 5.0, ox + 115.0, oy + 15.0));
+            scene.AddEntity(std::make_unique<MiniCAD::HatchEntity>(
+                scene.NextObjectID(), std::move(loops), MiniCAD::HatchPattern::MakeSolid()));
+        }
 
         MiniCAD::CadSemanticSnapshot snap;
         snap.Format = "DWG";
@@ -2056,8 +2338,12 @@ namespace
         {
             const double area1 = SqlDouble(db, "SELECT area FROM entities WHERE entity_type='HATCH' ORDER BY id LIMIT 1 OFFSET 0;");
             const double area2 = SqlDouble(db, "SELECT area FROM entities WHERE entity_type='HATCH' ORDER BY id LIMIT 1 OFFSET 1;");
+            const double area3 = SqlDouble(db, "SELECT area FROM entities WHERE entity_type='HATCH' ORDER BY id LIMIT 1 OFFSET 2;");
+            const double area4 = SqlDouble(db, "SELECT area FROM entities WHERE entity_type='HATCH' ORDER BY id LIMIT 1 OFFSET 3;");
             Check(Near(area1, 90.0, 1e-3), "CAD-23: 外环 100 减洞口 10 = 净面积 90");
             Check(Near(area2, 40.0, 1e-3), "CAD-23: 外环 100 减洞口 64 加洞内岛 4 = 净面积 40");
+            Check(Near(area3, 2400.0, 1e-4), "CAD-R2-12: SQLite 导出大坐标 (4e8, 3.5e9) 50×50 带 10×10 孔洞精确面积 2400");
+            Check(Near(area4, 150.0, 1e-4), "CAD-R2-12: SQLite 导出大坐标相交环奇偶净面积 150");
             sqlite3_close(db);
         }
     }

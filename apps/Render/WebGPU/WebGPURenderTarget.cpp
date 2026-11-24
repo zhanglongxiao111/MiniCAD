@@ -1,11 +1,14 @@
 #include "WebGPU/WebGPURenderTarget.h"
 #include "WebGPU/WebGPUCommon.h"
 #include <algorithm>
+#include <atomic>
 
 namespace MiniCAD
 {
     namespace
     {
+        std::atomic<uint64_t> s_nextTargetGeneration{ 0 };
+
         WGPUTexture CreateTexture(WGPUDevice device, int width, int height, WGPUTextureFormat format, WGPUTextureUsage usage, const char* label)
         {
             WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
@@ -50,12 +53,15 @@ namespace MiniCAD
         WGPUTextureView depthView = wgpuTextureCreateView(depth, nullptr);
 
         Release();
-        m_color     = color;
-        m_colorView = colorView;
-        m_depth     = depth;
-        m_depthView = depthView;
-        m_width     = width;
-        m_height    = height;
+        m_color      = color;
+        m_colorView  = colorView;
+        m_depth      = depth;
+        m_depthView  = depthView;
+        m_width      = width;
+        m_height     = height;
+        m_generation = (m_color && m_colorView)
+            ? (s_nextTargetGeneration.fetch_add(1, std::memory_order_relaxed) + 1)
+            : 0;
     }
 
     void WebGPURenderTarget::Release()
@@ -66,7 +72,8 @@ namespace MiniCAD
         m_depthView = nullptr;
         WebGPUCommon::DestroyTexture(m_color);
         WebGPUCommon::DestroyTexture(m_depth);
-        m_width  = 0;
-        m_height = 0;
+        m_width      = 0;
+        m_height     = 0;
+        m_generation = 0;
     }
 }

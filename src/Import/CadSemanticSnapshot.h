@@ -40,6 +40,23 @@ namespace MiniCAD
         };
         std::vector<DiagnosticItem> Diagnostics;
 
+        // ── 外部参照加载事实（导入器单趟记录，供 SQLite 缓存指纹直接消费）──
+        enum class XrefLoadStatus
+        {
+            Loaded,      // 已成功定位、读盘并导入宿主块
+            Missing,     // 磁盘上未能定位到目标外参文件
+            LoadFailed,  // 已定位文件（或无宿主路径/循环引用/超深度），但未成功读入
+        };
+        struct XrefLoadRecord
+        {
+            std::string    BlockName;
+            std::string    ParentDir;     // 本次解析使用的宿主/父外参所在目录（UTF-8）
+            std::string    RawPath;       // 图纸中保存的原始外参路径
+            std::string    ResolvedPath;  // 定位到的规范文件路径（UTF-8；Missing 时为空）
+            XrefLoadStatus Status = XrefLoadStatus::Missing;
+        };
+        std::vector<XrefLoadRecord> XrefLoads;
+
         // ── 图层原始分离标志（保留 is_on / is_frozen 原始语义）──────────
         struct LayerRawFlags
         {

@@ -1916,6 +1916,58 @@ CREATE INDEX idx_diff_tch_region ON diff_tch_changes(region_id);
 CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
 )SQL";
 
+        struct CoverageScopes
+        {
+            bool        PaperA       = false;
+            bool        PaperB       = false;
+            const char* LayoutSpace  = "model";
+            const char* LayoutSpaceA = "model";
+            const char* LayoutSpaceB = "model";
+            const char* TextScope    = "model_space";
+            const char* TextScopeA   = "model_space";
+            const char* TextScopeB   = "model_space";
+            const char* TchScope     = "model_space";
+            const char* TchScopeA    = "model_space";
+            const char* TchScopeB    = "model_space";
+        };
+
+        // 逐侧解析模型/纸张覆盖范围（供 diff_meta、JSON coverage、Warnings 与 CoverageNote 共享，CAD-R2-14）
+        CoverageScopes ResolveCoverageScopes(const DiffReport& r)
+        {
+            CoverageScopes s;
+            if (!r.IsPaperSpaceLayout)
+                return s;
+            const bool modelA = (r.SideA.Layout == "Model");
+            const bool modelB = (r.SideB.Layout == "Model");
+            s.PaperA       = !modelA;
+            s.PaperB       = !modelB;
+            s.LayoutSpaceA = s.PaperA ? "paper" : "model";
+            s.LayoutSpaceB = s.PaperB ? "paper" : "model";
+            s.TextScopeA   = s.PaperA ? "paper_space_only" : "model_space";
+            s.TextScopeB   = s.PaperB ? "paper_space_only" : "model_space";
+            s.TchScopeA    = s.TextScopeA;
+            s.TchScopeB    = s.TextScopeB;
+            if (s.PaperA && s.PaperB)
+            {
+                s.LayoutSpace = "paper";
+                s.TextScope   = "paper_space_only";
+                s.TchScope    = "paper_space_only";
+            }
+            else if (!s.PaperA && !s.PaperB)
+            {
+                s.LayoutSpace = "model";
+                s.TextScope   = "model_space";
+                s.TchScope    = "model_space";
+            }
+            else
+            {
+                s.LayoutSpace = "mixed";
+                s.TextScope   = "mixed";
+                s.TchScope    = "mixed";
+            }
+            return s;
+        }
+
         std::string MakeUniqueDiffTempPath(const std::string& outDbPath)
         {
             static std::atomic<uint64_t> s_seq{ 0 };
@@ -1979,12 +2031,15 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
                         && st.BindText(2, v, error)
                         && st.StepDone(error);
                 };
+                const CoverageScopes cov = ResolveCoverageScopes(report);
                 if (!putMeta("schema_version", report.SchemaVersion)
                     || !putMeta("source_a", report.SideA.Source)
                     || !putMeta("source_b", report.SideB.Source)
                     || !putMeta("layout_a", report.SideA.Layout)
                     || !putMeta("layout_b", report.SideB.Layout)
-                    || !putMeta("layout_space", report.IsPaperSpaceLayout ? "paper" : "model")
+                    || !putMeta("layout_space", cov.LayoutSpace)
+                    || !putMeta("layout_space_a", cov.LayoutSpaceA)
+                    || !putMeta("layout_space_b", cov.LayoutSpaceB)
                     || !putMeta("offset_dx", JsonDouble(report.OffsetBToA[0], 4))
                     || !putMeta("offset_dy", JsonDouble(report.OffsetBToA[1], 4))
                     || !putMeta("alignment_mode", report.Alignment.Mode)
@@ -1998,8 +2053,12 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
                     || !putMeta("b_only_pixels", std::to_string(report.BOnlyPixels))
                     || !putMeta("overlap_pixels", std::to_string(report.OverlapPixels))
                     || !putMeta("tch_available", report.TchAvailable ? "1" : "0")
-                    || !putMeta("text_scope", report.IsPaperSpaceLayout ? "paper_space_only" : "model_space")
-                    || !putMeta("tch_scope", report.IsPaperSpaceLayout ? "paper_space_only" : "model_space")
+                    || !putMeta("text_scope", cov.TextScope)
+                    || !putMeta("text_scope_a", cov.TextScopeA)
+                    || !putMeta("text_scope_b", cov.TextScopeB)
+                    || !putMeta("tch_scope", cov.TchScope)
+                    || !putMeta("tch_scope_a", cov.TchScopeA)
+                    || !putMeta("tch_scope_b", cov.TchScopeB)
                     || !putMeta("viewport_model_semantics_included", report.PaperViewportSemanticsExcluded ? "0" : "1")
                     || !putMeta("coverage_note", report.CoverageNote))
                 {
@@ -2413,23 +2472,50 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
                          snapB, spaceB, layNameB,
                          cropInA, dx, dy, opts.TchMatchTolMm, report.Regions, report);
 
-        // CAD-16：纸张布局模式下明确披露语义轨边界（仅覆盖纸面空间实体，未采集浮动视口内模型对象）
+        // CAD-16 / CAD-R2-14：区分双侧纸张与模型-纸张跨空间比较的语义轨覆盖边界，逐侧如实披露
         std::string paperBoundaryNote;
         if (isPaperSpace)
         {
-            if (report.PaperViewportCountA > 0 || report.PaperViewportCountB > 0)
+            const bool paperA = !layA.Model;
+            const bool paperB = !layB.Model;
+            if (paperA && paperB)
             {
-                report.Warnings.push_back(
-                    "纸张布局覆盖边界：检测到浮动视口（A=" + std::to_string(report.PaperViewportCountA)
-                    + "，B=" + std::to_string(report.PaperViewportCountB)
-                    + "），轨 1 视觉像素已包含视口内模型几何，但轨 2（text_diff）与轨 3（tch_diff）仅覆盖纸面空间实体、未采集浮动视口内模型对象；如需比对模型文字或天正语义请使用 --layout Model");
+                if (report.PaperViewportCountA > 0 || report.PaperViewportCountB > 0)
+                {
+                    report.Warnings.push_back(
+                        "纸张布局覆盖边界：检测到浮动视口（A=" + std::to_string(report.PaperViewportCountA)
+                        + "，B=" + std::to_string(report.PaperViewportCountB)
+                        + "），轨 1 视觉像素已包含视口内模型几何，但轨 2（text_diff）与轨 3（tch_diff）仅覆盖纸面空间实体、未采集浮动视口内模型对象；如需比对模型文字或天正语义请使用 --layout Model");
+                }
+                else
+                {
+                    report.Warnings.push_back(
+                        "纸张布局覆盖边界：轨 2（text_diff）与轨 3（tch_diff）仅覆盖纸面空间实体，未采集浮动视口内模型对象");
+                }
+                paperBoundaryNote = "纸张布局模式下 text_diff 与 tch_diff 语义轨仅覆盖纸面空间实体，未采集浮动视口内模型对象；";
             }
             else
             {
-                report.Warnings.push_back(
-                    "纸张布局覆盖边界：轨 2（text_diff）与轨 3（tch_diff）仅覆盖纸面空间实体，未采集浮动视口内模型对象");
+                const std::string scopeAZh = paperA ? "纸面空间实体（未采集浮动视口内模型对象）" : "模型空间语义对象";
+                const std::string scopeBZh = paperB ? "纸面空间实体（未采集浮动视口内模型对象）" : "模型空间语义对象";
+                const int paperVpCount = paperA ? report.PaperViewportCountA : report.PaperViewportCountB;
+                const char* paperSide = paperA ? "A" : "B";
+                if (paperVpCount > 0)
+                {
+                    report.Warnings.push_back(
+                        std::string("跨空间比对覆盖边界：") + paperSide + " 侧纸张布局检测到浮动视口（"
+                        + std::to_string(paperVpCount) + " 个），轨 1 视觉像素已包含视口内模型几何；轨 2（text_diff）与轨 3（tch_diff）中 A 侧覆盖"
+                        + scopeAZh + "，B 侧覆盖" + scopeBZh + "；如需双侧比对模型文字或天正语义请双侧均使用模型空间");
+                }
+                else
+                {
+                    report.Warnings.push_back(
+                        "跨空间比对覆盖边界：轨 2（text_diff）与轨 3（tch_diff）中 A 侧覆盖"
+                        + scopeAZh + "，B 侧覆盖" + scopeBZh);
+                }
+                paperBoundaryNote = "跨空间比对模式下 text_diff 与 tch_diff 语义轨 A 侧覆盖"
+                                  + scopeAZh + "、B 侧覆盖" + scopeBZh + "；";
             }
-            paperBoundaryNote = "纸张布局模式下 text_diff 与 tch_diff 语义轨仅覆盖纸面空间实体，未采集浮动视口内模型对象；";
         }
 
         report.CoverageNote = "在已覆盖范围与实际生效容差 ±" + JsonDouble(appliedToleranceMm, 2)
@@ -2717,12 +2803,19 @@ CREATE INDEX idx_diff_tch_cat ON diff_tch_changes(category, change_type);
         for (const auto& w : r.Warnings) j.String(w);
         j.EndArray();
 
+        const CoverageScopes cov = ResolveCoverageScopes(r);
         j.Key("coverage");
         j.BeginObject();
-        j.KeyString("layout_space", r.IsPaperSpaceLayout ? "paper" : "model");
+        j.KeyString("layout_space", cov.LayoutSpace);
+        j.KeyString("layout_space_a", cov.LayoutSpaceA);
+        j.KeyString("layout_space_b", cov.LayoutSpaceB);
         j.KeyBool("visual_includes_viewports", true);
-        j.KeyString("text_scope", r.IsPaperSpaceLayout ? "paper_space_only" : "model_space");
-        j.KeyString("tch_scope", r.IsPaperSpaceLayout ? "paper_space_only" : "model_space");
+        j.KeyString("text_scope", cov.TextScope);
+        j.KeyString("text_scope_a", cov.TextScopeA);
+        j.KeyString("text_scope_b", cov.TextScopeB);
+        j.KeyString("tch_scope", cov.TchScope);
+        j.KeyString("tch_scope_a", cov.TchScopeA);
+        j.KeyString("tch_scope_b", cov.TchScopeB);
         j.KeyInt("paper_viewport_count_a", r.PaperViewportCountA);
         j.KeyInt("paper_viewport_count_b", r.PaperViewportCountB);
         j.KeyBool("viewport_model_semantics_included", !r.PaperViewportSemanticsExcluded);

@@ -167,6 +167,11 @@ namespace MiniCAD
         void DropUnpickable();
         // 屏幕矩形 [x0,y0]-[x1,y1] 反投影为世界空间查询 AABB（z 取全范围）。
         AABB ScreenRectToWorldAABB(double x0, double y0, double x1, double y1) const;
+        // 屏幕空间水平可见带 [m_clipMinX, m_clipMaxX) 裁剪辅助（与卷帘分屏渲染保持单一口径）
+        bool ClipSegmentToClipX(const Math::Point2& a, const Math::Point2& b,
+                                Math::Point2& outA, Math::Point2& outB) const;
+        bool SegmentDistanceInClip(const Math::Point2& pt, const Math::Point2& a, const Math::Point2& b,
+                                   double& outDist) const;
 
     public:
         // 像素阈值：悬停 / 点选的命中半径（屏幕空间）的默认值，随拾取框改变（SetPickBox）。测试与诊断要用，故公开。

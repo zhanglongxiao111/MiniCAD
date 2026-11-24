@@ -23,24 +23,28 @@
    - `Viewport` 在同一通道内支持 `current`、`compare`、`blend`（三态差异叠图）、`split`（卷帘分屏）、`align-pick-base`、`align-pick-main`（三态实时跟随，对齐处重合线即时变灰）六种模式，双精度平差矩阵消除大坐标抖动，隐藏主图或卷帘副图侧时统一约束主图高亮/夹点与点击/框选拾取（同时保留全视口平移缩放），并支持在对比底图上做对象捕捉拾点。
    - 完整支持图纸空间（Layout）叠图：主图切换布局时对比底图自动按同名优先、同序号兜底跟随切换，也支持宿主通过 `compareLayoutIndex` 手动指定对比图的任意布局，并向宿主广播主图布局变化与对比图布局列表。
 2. **宿主嵌入与浏览/批注双模式**
-   - 支持的网址查询参数：`?webgl`（强制 WebGL2 后端）、`?lang=<code>`（界面语言）、`?open=<URL>`（可重复，拉取远程图纸，可配合 `window.MiniCADHost.fetch` / `window.MiniCADHost.findXrefs`）。
+   - 支持的网址查询参数：`?webgl`（强制 WebGL2 后端）、`?lang=<code>`（界面语言）、`?open=<URL>`（可重复，拉取远程图纸，可配合 `window.MiniCADHost.fetch` / `window.MiniCADHost.findXrefs`；拉取期间若发生换图、新建或关闭全部图纸，将通过 `MainDocumentIntentVersion` 自动丢弃过期响应、中止后续拉取并清理 `/remote/<id>` VFS 文件）。
    - 浏览（`0`）/ 批注（`1`）双模式通过 `MiniCADEmbed_SetMode(mode)` 切换至固定嵌入布局（`layouts.saembed`），启用命令白名单、工具白名单、撤销栈否决钩子与撤销/重做门禁（浏览态拦截直接撤销/重做入口）；批注模式下新对象落入 `SA-问题批注` 层并保护全部原图既有实体（含原图既有 `SA-问题批注` 层实体）。
    - 导出红色云线批注 DWG（自动沿用当前模型/图纸空间布局属性，校验坐标与顶点数上限并经 RAII 清理临时实体）、主图与对比图外部参照列举及按目录重载（嵌入态由宿主接管外参，不弹桌面缺失外参框）、嵌入态非阻塞报错回传。
    - **选中图元摘要导出接口**：通过 `MiniCADEmbed_GetSelectionVersion()` 轻量轮询当前主图 / 活动布局 / 选中集合的稳定版本号（无主图返回 `0`），并通过 `MiniCADEmbed_GetSelection(outPath, maxItems)`（`MainFrame::EmbedGetSelectionJson` + `src/Document/SaSelectionExport.h`）将选中图元按 `ObjectID` 升序导出为严格合法 UTF-8 JSON（非法字节序列替换为 `U+FFFD`）：
      - 顶层字段：`count`（准确总选中数，不受 50,000 扫描上限截断）、`scannedCount`（实际扫描并计入统计的数量）、`truncated`（布尔，`items.size() < count`）、`statsTruncated`（布尔，`scannedCount < count`）、`bounds`、`typeCounts`、`items`。
      - 单实体字段：`objectId`、`handle`（大写无 `0x` 前缀十六进制，经 `LookupCadEntityHandle` 查询并与 `SaDwgTool` SQLite `entities.handle` 一致）、`type`、`layer`、`blockName`、`text`、`length`、`area`（带孔 `HATCH` 按边界环包含关系/奇偶规则计算真实净面积）、`radius`、`bounds`。
 3. **WASM 就绪、回调与 VFS 文件寿命约定**
-   - **初始化就绪**：WebGPU 适配器/设备创建为异步流程，所有依赖 UI/平台的 `MiniCADEmbed_*` 导出入口均统一校验 `IsUiReady()`；宿主必须在轮询到 `MiniCADEmbed_IsReady() === 1` 后再调用业务接口（失败或未就绪时返回 `0` 并在 `errPath` 写入原因）。
+   - **初始化就绪与错误契约**：WebGPU 适配器/设备创建为异步流程，所有依赖 UI/平台的 `MiniCADEmbed_*` 导出入口均统一校验 `IsUiReady()`；宿主必须在轮询到 `MiniCADEmbed_IsReady() === 1` 后再调用业务接口。错误回传按接口区分：
+     - **仅** `MiniCADEmbed_ExportMarkupDwg(rects, count, labels, outPath, errPath)` 接受 `errPath` 参数，失败或未就绪时返回 `0` 并在 `errPath` 写入 UTF-8 原因；
+     - 异步开图失败原因经 `MiniCADEmbed_GetMainError(outPath)` / `MiniCADEmbed_GetCompareError(outPath)` 查询（有错误时写入 `outPath` 并返回 `1`，无错误返回 `0`）；
+     - 其余返回整型状态或计数的接口在未就绪或失败时统一返回 `0`（不接受 `errPath`），返回 `void` 的接口在未就绪时静默忽略。
    - **宿主 `Module` 回调**（在调用 `MiniCADEmbed_SetMode` / `MiniCADEmbed_StartPickPoint` 前挂载到 Emscripten `Module`）：
      - `Module.onAbort(message)`：图形设备初始化失败等致命错误通知。
      - `Module.onSaEmbedModeChanged(mode)`：用户在功能区切换浏览（`0`）/ 批注（`1`）选项卡后通知宿主。
      - `Module.onSaEmbedLayoutChanged(index, isPaper, name)`：主图活动布局变化后通知宿主。
-     - `Module.onSaEmbedPointPicked(seq, worldX, worldY)` / `Module.onSaEmbedPickCancelled(seq)`：拾点完成或用户取消后的异步安全回调（经拾点会话号与 `Document::InstanceID()` 过滤过期通知）。
+     - `Module.onSaEmbedPointPicked(seq, worldX, worldY)` / `Module.onSaEmbedPickCancelled(seq)`：拾点完成或用户/宿主显式取消（Esc、右键、`MiniCADEmbed_CancelPickPoint()`）后的异步安全回调；新请求顶替旧请求或换图/关图时旧会话静默作废，不再派发过期取消回调。
    - **实际导出的 `MiniCADEmbed_*` 接口清单**（见 `apps/Web/src/Host/WebApp.cpp`）：
      - 就绪与模式：`MiniCADEmbed_IsReady`、`MiniCADEmbed_SetMode`
      - 图纸与对比图生命周期：`MiniCADEmbed_OpenDrawing`、`MiniCADEmbed_IsOpening`、`MiniCADEmbed_GetMainError`、`MiniCADEmbed_OpenCompareDrawing`、`MiniCADEmbed_IsOpeningCompare`、`MiniCADEmbed_GetCompareError`、`MiniCADEmbed_CloseCompareDrawing`、`MiniCADEmbed_HasCompareDocument`、`MiniCADEmbed_CloseOtherDocuments`、`MiniCADEmbed_CloseAllDocuments`
      - 叠图与布局控制：`MiniCADEmbed_SetCompareState`、`MiniCADEmbed_GetMainLayout`、`MiniCADEmbed_ListCompareLayouts`、`MiniCADEmbed_ZoomAll`、`MiniCADEmbed_ZoomCompareAll`、`MiniCADEmbed_ZoomToWorld`、`MiniCADEmbed_GetViewWorld`、`MiniCADEmbed_WindowToWorld`、`MiniCADEmbed_WorldToWindow`
      - 拾点与外参：`MiniCADEmbed_StartPickPoint`、`MiniCADEmbed_CancelPickPoint`、`MiniCADEmbed_ListXrefs`、`MiniCADEmbed_ReloadXrefs`、`MiniCADEmbed_ListCompareXrefs`、`MiniCADEmbed_ReloadCompareXrefs`
+     - 批注脏态与基线：`MiniCADEmbed_HasMarkupChanges`（相对打开或上次 `MiniCADEmbed_MarkMarkupClean` 基线是否存在批注修改，撤销回基线返回 `0`，有真实新增/删除/修改返回 `1`）、`MiniCADEmbed_MarkMarkupClean`（将当前主文档批注态记为干净基线，供宿主导出云线 DWG 落盘成功后调用）
      - 数据与批注导出：`MiniCADEmbed_ExportText`、`MiniCADEmbed_GetSelectionVersion`、`MiniCADEmbed_GetSelection`、`MiniCADEmbed_ExportMarkupDwg`
    - **VFS 文件寿命约定**：
      - 宿主写入 Emscripten 内存文件系统（`FS.writeFile`）并传给 `MiniCADEmbed_OpenDrawing(fsPath)` / `MiniCADEmbed_OpenCompareDrawing(fsPath)` 的图纸文件，必须保持有效直至 `MiniCADEmbed_IsOpening()` / `MiniCADEmbed_IsOpeningCompare()` 返回 `0`（读取完成）；关闭全部或换图时在途异步加载会被代次机制自动作废。

@@ -192,6 +192,8 @@ namespace MiniCAD
             (void)mainLayer; (void)compareLayer; (void)style;
             return false;
         }
+        // 释放对比合成缓存绑定等对比专用资源（切 Off、关闭对比图、无对比帧或关闭最后一张主图时与 Viewport::ReleaseCompareLayers 成对调用）
+        virtual void ReleaseCompareResources() {}
 
         // 背景深浅（AutoCAD 的 7 号色语义）：浅色背景时纯白顶点画成纯黑，深色背景时纯黑画成纯白，
         // 白色的实体、图层颜色、十字光标在两种背景下都看得见。只影响线 / 三角形 / 文字，不影响光栅图像

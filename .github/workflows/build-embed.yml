@@ -65,6 +65,11 @@ jobs:
           cp "tests/Data/Dwg/sample_AC1027.dwg" "${verify_dir}/中文目录/测试图纸.dwg"
           node "${verify_dir}/${bundle}/node/SaDwgText.js" "${verify_dir}/中文目录/测试图纸.dwg" > "${verify_dir}/out.tsv"
           test -s "${verify_dir}/out.tsv"
+          tsv_lines=$(wc -l < "${verify_dir}/out.tsv")
+          if [ "${tsv_lines}" -lt 2 ]; then
+            echo "SaDwgText TSV output must contain header and at least one data row (got ${tsv_lines} lines)" >&2
+            exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -165,27 +170,47 @@ jobs:
             throw "Packaged diff failed"
           }
 
+          function Assert-ToolUsageError {
+            param(
+              [string]$Label,
+              [string[]]$ToolArgs,
+              [string]$ExpectedErrorCode
+            )
+            $prevEap = $ErrorActionPreference
+            $prevNativeVar = Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
+            $prevNative = if ($null -ne $prevNativeVar) { $prevNativeVar.Value } else { $null }
+            try {
+              $ErrorActionPreference = 'Continue'
+              if ($null -ne $prevNativeVar) {
+                $PSNativeCommandUseErrorActionPreference = $false
+              }
+              $global:LASTEXITCODE = 0
+              $rawOut = (& $exe @ToolArgs 2>$null) -join "`n"
+              $exitCode = $global:LASTEXITCODE
+            } finally {
+              $ErrorActionPreference = $prevEap
+              if ($null -ne $prevNativeVar) {
+                $PSNativeCommandUseErrorActionPreference = $prevNative
+              }
+            }
+            if ($exitCode -ne 2) {
+              throw "$Label should exit 2 (got $exitCode, output: $rawOut)"
+            }
+            $parsed = $rawOut | ConvertFrom-Json
+            if ($parsed.ok -ne $false -or $parsed.error_code -ne $ExpectedErrorCode) {
+              throw "$Label expected error_code '$ExpectedErrorCode' with ok=false (got: $rawOut)"
+            }
+          }
+
           $hashBefore = (Get-FileHash -Path $dwgA -Algorithm SHA256).Hash
-          $prevEap = $ErrorActionPreference
-          $ErrorActionPreference = 'Continue'
-          if ($null -ne (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue)) {
-            $PSNativeCommandUseErrorActionPreference = $false
-          }
-          & $exe export-db $dwgA $dwgA 2>&1 | Out-Null
-          $conflictCode = $LASTEXITCODE
-          & $exe render $dwgA (Join-Path $cnDir "bad_font.png") --fonts-dir (Join-Path $cnDir "不存在的字体目录") 2>&1 | Out-Null
-          $badFontCode = $LASTEXITCODE
-          $ErrorActionPreference = $prevEap
-          if ($conflictCode -ne 2) {
-            throw "Conflict guard should exit 2 when overwriting source DWG (got $conflictCode)"
-          }
-          if ($badFontCode -ne 2) {
-            throw "Invalid --fonts-dir should exit 2 (got $badFontCode)"
-          }
+          Assert-ToolUsageError -Label "Conflict guard" -ToolArgs @("export-db", $dwgA, $dwgA) -ExpectedErrorCode "OUTPUT_PATH_CONFLICT"
+          Assert-ToolUsageError -Label "Invalid --fonts-dir" -ToolArgs @("render", $dwgA, (Join-Path $fixtureDir "bad_font.png"), "--fonts-dir", (Join-Path $fixtureDir "不存在的字体目录")) -ExpectedErrorCode "INVALID_FONTS_DIR"
           $hashAfter = (Get-FileHash -Path $dwgA -Algorithm SHA256).Hash
           if ($hashBefore -ne $hashAfter) {
             throw "Source DWG was modified despite conflict guard"
           }
+          $global:LASTEXITCODE = 0
+          exit 0
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

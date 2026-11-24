@@ -57,6 +57,7 @@ namespace MiniCAD
         void  DrawLayer(IRenderTarget& layer) override;
         bool  CompositeCompareLayers(IRenderTarget& mainLayer, IRenderTarget& compareLayer,
                                      const CompareCompositeStyle& style) override;
+        void  ReleaseCompareResources() override;
         void  SetLightBackground(bool light) override { m_lightBackground = light; }
         void  SetPaintStyle(const PaintStyle& style) override { m_paintStyle = style; }
         void  SetScissorRect(const ScissorRect& rect) override;
@@ -134,8 +135,8 @@ namespace MiniCAD
         WGPURenderPipeline  m_comparePipeline   = nullptr;
         WGPUBuffer          m_compareUniformBuf = nullptr;
         WGPUBindGroup       m_compareBindGroup  = nullptr;
-        WGPUTextureView     m_compareMainView   = nullptr;
-        WGPUTextureView     m_compareOtherView  = nullptr;
+        uint64_t            m_compareMainGen    = 0;
+        uint64_t            m_compareOtherGen   = 0;
 
         FrameBuffer   m_uniforms;
         WGPUBindGroup m_uniformGroup = nullptr;

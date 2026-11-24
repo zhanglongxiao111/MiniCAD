@@ -294,14 +294,12 @@ namespace MiniCAD::SaTool
             int64_t     MtimeMs   = 0;
         };
 
-        std::vector<XrefDepRecord> CollectXrefDependencies(const Scene& scene, const std::string& sourcePath)
+        std::vector<XrefDepRecord> CollectXrefDependencies(const Scene& scene, const CadSemanticSnapshot& snap)
         {
-            namespace fs = std::filesystem;
             struct RawXrefBlk
             {
                 std::string Name;
                 std::string XRefPath;
-                uint16_t    Flags      = 0;
                 bool        Unresolved = false;
                 size_t      PipeDepth  = 0;
             };
@@ -316,7 +314,7 @@ namespace MiniCAD::SaTool
                 // 嵌套层中的叠加型（Overlay）外参不会被宿主加载，跳过
                 if (pipes > 0 && (blk.GetFlags() & BlockEntity::XRefOverlay))
                     return;
-                blks.push_back({ name, blk.GetXRefPath(), blk.GetFlags(), blk.IsUnresolvedXRef(), pipes });
+                blks.push_back({ name, blk.GetXRefPath(), blk.IsUnresolvedXRef(), pipes });
             });
 
             std::sort(blks.begin(), blks.end(), [](const RawXrefBlk& a, const RawXrefBlk& b) {
@@ -324,64 +322,66 @@ namespace MiniCAD::SaTool
                 return a.Name < b.Name;
             });
 
-            const fs::path hostDir = sourcePath.empty() ? fs::path() : Utf8ToPath(sourcePath).parent_path();
-            std::unordered_map<std::string, fs::path> resolvedDirByBlock;
+            // 直接消费导入器单趟记录的真实外参加载事实（CAD-R2-08 SSOT），不再事后重探磁盘
+            std::unordered_map<std::string, const CadSemanticSnapshot::XrefLoadRecord*> loadByBlock;
+            loadByBlock.reserve(snap.XrefLoads.size());
+            for (const auto& lr : snap.XrefLoads)
+                loadByBlock[lr.BlockName] = &lr;
+
             std::vector<XrefDepRecord> deps;
             deps.reserve(blks.size());
 
             for (const auto& b : blks)
             {
-                fs::path parentDir = hostDir;
-                if (b.PipeDepth > 0)
-                {
-                    const size_t lastPipe = b.Name.rfind('|');
-                    const std::string parentName = b.Name.substr(0, lastPipe);
-                    auto it = resolvedDirByBlock.find(parentName);
-                    if (it != resolvedDirByBlock.end())
-                        parentDir = it->second;
-                    else
-                        parentDir.clear();
-                }
-
                 XrefDepRecord rec;
                 rec.BlockName = b.Name;
-                rec.ParentDir = parentDir.empty() ? std::string() : PathToUtf8(parentDir);
                 rec.RawPath   = b.XRefPath;
 
-                if (b.XRefPath.empty() || parentDir.empty())
+                const auto it = loadByBlock.find(b.Name);
+                if (it == loadByBlock.end())
                 {
                     rec.Status = "unverifiable";
                     deps.push_back(std::move(rec));
                     continue;
                 }
 
-                const fs::path found = ResolveXrefPathOnDisk(parentDir, b.XRefPath);
-                if (!found.empty())
+                const CadSemanticSnapshot::XrefLoadRecord& lr = *it->second;
+                rec.ParentDir    = lr.ParentDir;
+                rec.RawPath      = lr.RawPath.empty() ? b.XRefPath : lr.RawPath;
+                rec.ResolvedPath = lr.ResolvedPath;
+
+                switch (lr.Status)
                 {
-                    std::error_code ec;
-                    const fs::path canon = fs::weakly_canonical(found, ec);
-                    const fs::path bestP = (!ec && !canon.empty()) ? canon : found;
-                    const std::string utf8Found = PathToUtf8(bestP);
+                case CadSemanticSnapshot::XrefLoadStatus::Loaded:
+                {
                     uint64_t sz = 0;
-                    int64_t mt = 0;
-                    bool mtOk = false;
-                    if (GetFileStats(utf8Found, sz, mt, nullptr, &mtOk) && mtOk)
+                    int64_t  mt = 0;
+                    bool     mtOk = false;
+                    // 仅当导入器成功加载且块非未解析状态、且取得有效文件大小与时间戳时才标记 resolved
+                    if (!b.Unresolved && !lr.ResolvedPath.empty()
+                        && GetFileStats(lr.ResolvedPath, sz, mt, nullptr, &mtOk) && mtOk)
                     {
-                        rec.Status       = "resolved";
-                        rec.ResolvedPath = utf8Found;
-                        rec.SizeBytes    = sz;
-                        rec.MtimeMs      = mt;
-                        resolvedDirByBlock[b.Name] = bestP.parent_path();
+                        rec.Status    = "resolved";
+                        rec.SizeBytes = sz;
+                        rec.MtimeMs   = mt;
                     }
                     else
                     {
                         rec.Status = "unverifiable";
                     }
+                    break;
                 }
-                else
-                {
-                    // 若加载期块内已有图元却在磁盘上无法定位源文件，视为不可确认（下次强制重导）
-                    rec.Status = b.Unresolved ? "missing" : "unverifiable";
+                case CadSemanticSnapshot::XrefLoadStatus::Missing:
+                    // 仅在缺失且具备有效解析目录与路径时记 missing，后续文件补齐可准确触发缓存失效
+                    rec.Status = (b.Unresolved && !rec.ParentDir.empty() && !rec.RawPath.empty())
+                               ? "missing"
+                               : "unverifiable";
+                    break;
+                case CadSemanticSnapshot::XrefLoadStatus::LoadFailed:
+                default:
+                    // 定位到文件但未成功读入（占用锁、损坏、循环引用等）一律不可验证，严禁污染复用缓存
+                    rec.Status = "unverifiable";
+                    break;
                 }
                 deps.push_back(std::move(rec));
             }
@@ -427,7 +427,7 @@ namespace MiniCAD::SaTool
             return jw.Take();
         }
 
-        bool ParseAndVerifyXrefDepsV1(const std::string& encoded)
+        bool ParseAndVerifyXrefDepsV1(const std::string& encoded, const std::filesystem::path& currentHostDir)
         {
             if (encoded.rfind("v1:", 0) != 0)
                 return false;
@@ -452,6 +452,10 @@ namespace MiniCAD::SaTool
             const unsigned long expectedCount = std::strtoul(lines[0].c_str() + 3, &endPtr, 10);
             if (!endPtr || *endPtr != '\0' || lines.size() != static_cast<size_t>(expectedCount) + 1)
                 return false;
+
+            // 按本次调用的 currentHostDir 逐级重算外参解析链（顶层相对外参以 currentHostDir 为根，
+            // 嵌套外参以其父块本次实际定位目录为根），防止同宿主文件跨目录硬链接/软链串库（CAD-R2-08）
+            std::unordered_map<std::string, std::filesystem::path> resolvedDirByBlock;
 
             for (size_t i = 1; i < lines.size(); ++i)
             {
@@ -480,17 +484,33 @@ namespace MiniCAD::SaTool
                 {
                     return false;
                 }
-                (void)blockName;
+                (void)parentDir;
 
                 if (status == "unverifiable")
                     return false;
 
-                const std::filesystem::path parentFs = parentDir.empty() ? std::filesystem::path() : Utf8ToPath(parentDir);
-                const std::filesystem::path nowFound = ResolveXrefPathOnDisk(parentFs, rawPath);
+                std::filesystem::path effectiveParentFs;
+                const size_t lastPipe = blockName.rfind('|');
+                if (lastPipe == std::string::npos)
+                {
+                    if (currentHostDir.empty())
+                        return false;
+                    effectiveParentFs = currentHostDir;
+                }
+                else
+                {
+                    const std::string parentName = blockName.substr(0, lastPipe);
+                    const auto it = resolvedDirByBlock.find(parentName);
+                    if (it == resolvedDirByBlock.end() || it->second.empty())
+                        return false;
+                    effectiveParentFs = it->second;
+                }
+
+                const std::filesystem::path nowFound = ResolveXrefPathOnDisk(effectiveParentFs, rawPath);
 
                 if (status == "missing")
                 {
-                    // 当初缺失的外参如今已补齐 -> 缓存失效
+                    // 当初缺失的外参如今已补齐（或本次调用目录下存在同名相对外参）-> 缓存失效
                     if (!nowFound.empty())
                         return false;
                     continue;
@@ -520,6 +540,7 @@ namespace MiniCAD::SaTool
                         return false;
                     if (curSize != expectedSize || curMtime != expectedMtime)
                         return false;
+                    resolvedDirByBlock[blockName] = nowFound.parent_path();
                     continue;
                 }
 
@@ -1386,14 +1407,23 @@ CREATE INDEX idx_tch_axes_label ON tch_axes(label);
                 NormalizePathForCompare(storedSourcePath) == NormalizePathForCompare(sourcePath)
                 || PathsReferToSameFile(storedSourcePath, sourcePath);
 
-            // CAD-21：校验 schema、导出选项（include_block_entities）、宿主文件指纹以及全部外参依赖指纹
+            std::filesystem::path currentHostDir;
+            if (!sourcePath.empty())
+            {
+                std::error_code hostEc;
+                const std::filesystem::path srcFs = Utf8ToPath(sourcePath);
+                const std::filesystem::path absSrc = srcFs.is_absolute() ? srcFs : std::filesystem::absolute(srcFs, hostEc);
+                currentHostDir = (!hostEc ? absSrc : srcFs).parent_path();
+            }
+
+            // CAD-21 / CAD-R2-08：校验 schema、导出选项（include_block_entities）、宿主文件指纹以及本次调用上下文下的全部外参依赖指纹
             const bool match =
                 getStr("schema_version") == "1.0" &&
                 getStr("include_block_entities") == (includeBlockEntities ? "1" : "0") &&
                 getStr("source_size_bytes") == std::to_string(sourceSizeBytes) &&
                 getStr("source_mtime_ms") == std::to_string(sourceMtimeMs) &&
                 sourcePathMatch &&
-                ParseAndVerifyXrefDepsV1(getStr("xref_deps_v1"));
+                ParseAndVerifyXrefDepsV1(getStr("xref_deps_v1"), currentHostDir);
 
             if (!match)
                 return false;
@@ -2468,8 +2498,8 @@ CREATE INDEX idx_tch_axes_label ON tch_axes(label);
             skippedJw.EndArray();
             xrefJw.EndArray();
 
-            // 10. 写入 meta 键值表（含 CAD-21 导出选项与外参依赖指纹）
-            const std::vector<XrefDepRecord> xrefDeps = CollectXrefDependencies(scene, sourcePath);
+            // 10. 写入 meta 键值表（含 CAD-21 / CAD-R2-08 导出选项与导入器单趟外参依赖指纹）
+            const std::vector<XrefDepRecord> xrefDeps = CollectXrefDependencies(scene, snap);
             const std::string xrefDepsV1   = SerializeXrefDepsV1(xrefDeps);
             const std::string xrefDepsJson = FormatXrefDepsJson(xrefDeps);
 

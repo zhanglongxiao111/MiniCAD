@@ -3,6 +3,7 @@
 #include "GUI/MainFrame.h"
 #include "Host/WebHost.h"
 #include "IGraphicsDevice.h"
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -45,8 +46,9 @@ namespace MiniCAD
         void OnFilePickCompleted(int requestId, const char* error);
         void OnFolderPicked(int requestId, const char* dir, const char* error);
         void OnFontFetched(const char* name);
-        void OnRemoteFetched(int requestId, const char* path, const char* url);
-        void OnRemoteFailed(int requestId, const char* name, int status, const char* message);
+        bool IsRemoteRequestActive(int requestId);
+        bool OnRemoteFetched(int requestId, const char* path, const char* url);
+        bool OnRemoteFailed(int requestId, const char* name, int status, const char* message);
         void OnRemoteCompleted(int requestId);
         void OnXrefsFetched(int requestId, const char* dir, const char* error);
         bool HasUnsavedDocuments() const;
@@ -96,6 +98,7 @@ namespace MiniCAD
         void ReportFailure(const char* what);
         void FetchLazyFont(const std::string& name);     // 下载网页旁 fonts/ 下的字体（每个只下一次），完成后 OnFontFetched
         void OpenStartupUrls();                          // 网址的 ?open=：取回后 OpenDrawings
+        void DiscardRemoteRequest(int requestId, const char* extraPath = nullptr); // 清理作废的 ?open= 状态、来源表与 /remote/<id> VFS 目录
 
     private:
         // 声明顺序即构造顺序，销毁时相反：输入层 → 界面（MainFrame）→ 内核 → 视口渲染目标 → 图形设备 → 画布（WebGL 上下文）
@@ -115,6 +118,7 @@ namespace MiniCAD
         std::unordered_map<int, std::function<void(const std::string&)>> m_folderRequests;   // PickFolder
         struct RemoteRequest
         {
+            uint64_t intentVersion = 0;
             std::vector<std::string> paths;
             std::string errors;
         };

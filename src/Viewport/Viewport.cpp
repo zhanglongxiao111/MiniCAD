@@ -124,7 +124,9 @@ namespace MiniCAD
     //   动态层 —— 每帧：先把缓存层整块复制过来，再画选中、叠加层（橡皮筋 / 悬停高亮）、
     //            夹点、框选框、捕捉标记、十字光标。鼠标移动只改这些，GPU 开销与场景规模无关。
     // 后端不支持缓存层（CreateLayerTarget 返回空）时，两层都画在目标上，结果相同。
-    Viewport::MainVisibleClip Viewport::ComputeMainVisibleClip(CompareDisplayMode mode, bool soloCompare, int splitX, int pixelWidth)
+    Viewport::MainVisibleClip Viewport::ComputeMainVisibleClip(
+        CompareDisplayMode mode, bool soloCompare, bool showMain, float overlapOpacity,
+        int splitX, int pixelWidth)
     {
         MainVisibleClip clip{};
         const int pw = std::max(pixelWidth, 0);
@@ -143,6 +145,17 @@ namespace MiniCAD
                 clip.MaxX = 0;
             }
             break;
+        case CompareDisplayMode::Blend:
+        {
+            const float effOverlap = std::isfinite(overlapOpacity) ? std::clamp(overlapOpacity, 0.0f, 1.0f) : 0.0f;
+            if (!showMain && effOverlap <= 1e-4f)
+            {
+                clip.Constrained = true;
+                clip.MinX = 0;
+                clip.MaxX = 0;
+            }
+            break;
+        }
         case CompareDisplayMode::Split:
         {
             const int sx = std::clamp(splitX, 0, pw);
@@ -164,7 +177,7 @@ namespace MiniCAD
     {
         if (!compare || !compare->State || compare->Mode == CompareDisplayMode::Off)
             return {};
-        return ComputeMainVisibleClip(compare->Mode, compare->SoloCompare, compare->SplitX, pixelWidth);
+        return ComputeMainVisibleClip(compare->Mode, compare->SoloCompare, compare->ShowMain, compare->OverlapOpacity, compare->SplitX, pixelWidth);
     }
 
     void Viewport::ReleaseCompareLayers()
@@ -270,7 +283,11 @@ namespace MiniCAD
         };
         if (!hasCompare)
         {
-            ReleaseCompareLayers();
+            if (HasCompareLayers())
+            {
+                renderer.ReleaseCompareResources();
+                ReleaseCompareLayers();
+            }
         }
         uint64_t compSceneVersion = 0;
         Math::Mat4 compVp = vpWorld, compVpLines = vpWorldLines, compVpSilhouettes = vpWorldSilhouettes;

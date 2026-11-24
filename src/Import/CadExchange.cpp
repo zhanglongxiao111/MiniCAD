@@ -101,7 +101,7 @@ namespace MiniCAD
         std::vector<std::uint8_t> Bytes;
         Dwg::CadFileFormat        Format  = Dwg::CadFileFormat::Unknown;
         Dwg::CadVersion           Version = Dwg::CadVersion::Unknown;
-        std::map<Object::ObjectID, Link>   Links;            // 模型空间：场景实体 → 原图实体
+        std::map<Object::ObjectID, Link>   Links;            // 模型与图纸空间：场景实体 → 原图实体
         std::map<std::string, std::string> LayerSignatures;  // 图层名 → 导入时的属性
         std::map<std::string, std::string> StyleSignatures;  // 文字样式名 → 导入时的属性
         int TchCount = 0;                                    // 模型空间的 TCH_* 对象（含无法显示的）
@@ -373,6 +373,7 @@ namespace MiniCAD
             std::vector<std::filesystem::path> SearchRoots;
             int                                Depth = 0;
             std::set<std::string>              Loading;
+            std::vector<CadSemanticSnapshot::XrefLoadRecord>* Records = nullptr;
         };
 
         // UTF-8 字符串 → 路径
@@ -506,9 +507,11 @@ namespace MiniCAD
                 ctx->SearchRoots.push_back(PathFromUtf8(root));
             if (!hostPath.empty())
             {
-                const std::filesystem::path self = PathFromUtf8(hostPath);
-                ctx->HostDir = self.parent_path();
                 std::error_code ec;
+                const std::filesystem::path self = PathFromUtf8(hostPath);
+                const std::filesystem::path absSelf = self.is_absolute() ? self : std::filesystem::absolute(self, ec);
+                ctx->HostDir = (!ec ? absSelf : self).parent_path();
+                ec.clear();
                 std::filesystem::path canonical = std::filesystem::weakly_canonical(self, ec);
                 if (ec) canonical = self;
                 ctx->Loading.insert(Lower(PathToUtf8(canonical)));
@@ -1144,6 +1147,14 @@ namespace MiniCAD
                     if (!m_xref)
                     {
                         LOG_WARN_TR("外部参照 {0}（{1}）：图纸没有路径，无法解析外部文件", name.c_str(), b->XRefPath.c_str());
+                        if (m_semantic != nullptr)
+                        {
+                            CadSemanticSnapshot::XrefLoadRecord rec;
+                            rec.BlockName = name;
+                            rec.RawPath   = b->XRefPath;
+                            rec.Status    = CadSemanticSnapshot::XrefLoadStatus::LoadFailed;
+                            m_semantic->XrefLoads.push_back(std::move(rec));
+                        }
                         return;
                     }
                     // 叠加型（Overlay）外部参照不随宿主再被别人参照时显示
@@ -1160,24 +1171,41 @@ namespace MiniCAD
                                  const std::string& xrefPath, BlockEntity& target)
             {
                 namespace fs = std::filesystem;
+                auto record = [&](CadSemanticSnapshot::XrefLoadStatus status, const std::string& resolvedUtf8 = {})
+                {
+                    if (parent.Records == nullptr)
+                        return;
+                    CadSemanticSnapshot::XrefLoadRecord rec;
+                    rec.BlockName    = name;
+                    rec.ParentDir    = parent.HostDir.empty() ? std::string() : PathToUtf8(parent.HostDir);
+                    rec.RawPath      = xrefPath;
+                    rec.ResolvedPath = resolvedUtf8;
+                    rec.Status       = status;
+                    parent.Records->push_back(std::move(rec));
+                };
+
                 const fs::path file = ResolveXrefPath(parent, xrefPath);
                 if (file.empty())
                 {
                     LOG_WARN_TR("外部参照 {0}：找不到文件 {1}（已在 {2} 下查找）", name.c_str(), xrefPath.c_str(), PathToUtf8(parent.HostDir).c_str());
+                    record(CadSemanticSnapshot::XrefLoadStatus::Missing);
                     return false;
                 }
                 std::error_code ec;
                 fs::path canonical = fs::weakly_canonical(file, ec);
                 if (ec) canonical = file;
-                const std::string key = Lower(PathToUtf8(canonical));
+                const std::string resolvedUtf8 = PathToUtf8(canonical);
+                const std::string key = Lower(resolvedUtf8);
                 if (parent.Loading.count(key))
                 {
                     LOG_WARN_TR("外部参照 {0}：{1} 正在被读取（循环引用），跳过", name.c_str(), PathToUtf8(file).c_str());
+                    record(CadSemanticSnapshot::XrefLoadStatus::LoadFailed, resolvedUtf8);
                     return false;
                 }
                 if (parent.Depth >= 8)
                 {
                     LOG_WARN_TR("外部参照 {0}：嵌套层数过多，跳过", name.c_str());
+                    record(CadSemanticSnapshot::XrefLoadStatus::LoadFailed, resolvedUtf8);
                     return false;
                 }
 
@@ -1185,13 +1213,21 @@ namespace MiniCAD
                 if (!in)
                 {
                     LOG_WARN_TR("外部参照 {0}：无法读取 {1}", name.c_str(), PathToUtf8(file).c_str());
+                    record(CadSemanticSnapshot::XrefLoadStatus::LoadFailed, resolvedUtf8);
                     return false;
                 }
                 const std::vector<std::uint8_t> bytes{ std::istreambuf_iterator<char>(in), {} };
+                if (in.bad())
+                {
+                    LOG_WARN_TR("外部参照 {0}：无法读取 {1}", name.c_str(), PathToUtf8(file).c_str());
+                    record(CadSemanticSnapshot::XrefLoadStatus::LoadFailed, resolvedUtf8);
+                    return false;
+                }
                 const Dwg::CadFileInfo info = Dwg::DetectFileFormat({ bytes.data(), std::min<size_t>(bytes.size(), 1024) });
                 if (info.format == Dwg::CadFileFormat::Unknown)
                 {
                     LOG_WARN_TR("外部参照 {0}：{1} 不是 DWG / DXF 文件", name.c_str(), PathToUtf8(file).c_str());
+                    record(CadSemanticSnapshot::XrefLoadStatus::LoadFailed, resolvedUtf8);
                     return false;
                 }
                 std::string firstError;
@@ -1199,8 +1235,11 @@ namespace MiniCAD
                 if (!db)
                 {
                     LOG_WARN_TR("外部参照 {0}：读取 {1} 失败：{2}", name.c_str(), PathToUtf8(file).c_str(), firstError.c_str());
+                    record(CadSemanticSnapshot::XrefLoadStatus::LoadFailed, resolvedUtf8);
                     return false;
                 }
+
+                record(CadSemanticSnapshot::XrefLoadStatus::Loaded, resolvedUtf8);
 
                 auto ctx = std::make_shared<XrefContext>();
                 ctx->HostDir     = file.parent_path();
@@ -1208,6 +1247,7 @@ namespace MiniCAD
                 ctx->Depth       = parent.Depth + 1;
                 ctx->Loading     = parent.Loading;
                 ctx->Loading.insert(key);
+                ctx->Records     = parent.Records;
                 Importer nested(*db, scene, nullptr);
                 nested.ImportAsXref(name + "|", target, std::move(ctx));
                 LOG_INFO_TR("外部参照 {0}：从 {1} 读入 {2} 个实体", name.c_str(), PathToUtf8(file).c_str(), target.GetEntities().size());
@@ -4816,10 +4856,9 @@ namespace MiniCAD
                 ExportBlocks();
 
                 if (m_source != nullptr)
-                    PatchModelSpace();
+                    PatchDrawingSpaces();
                 else
                 {
-                    Dwg::BlockRecord* model = m_db.ModelSpace();
                     m_scene.ForEachObject([&](const Object& o)
                     {
                         if (!o.IsKindOf<Entity>())
@@ -4828,24 +4867,9 @@ namespace MiniCAD
                         m_pendingClips.clear();
                         if (auto conv = Convert(ent))
                         {
-                            // 图纸空间实体挂到它所属布局的 *Paper_Space* 块记录上。
-                            // 写出侧按**所有者**判断是否写组码 67（IsPaperSpaceOwner），
-                            // 挂对了所有者，67 与 330 都会自动正确 —— 不需要额外字段。
-                            Dwg::BlockRecord* owner = model;
-                            if (const EntityAttr& a = ent.GetAttr(); a.InPaperSpace)
-                            {
-                                owner = PaperSpaceRecordFor(a.LayoutKey);
-                                if (owner == nullptr)
-                                    owner = model;   // 找不到对应布局时退回模型空间，至少不丢图元
-                            }
-
                             const std::vector<PendingClip> pending = std::move(m_pendingClips);
                             m_pendingClips.clear();
-                            Dwg::Entity* added = m_db.AddEntity(owner, std::move(conv));
-                            if (added != nullptr)
-                                for (const auto& c : pending)
-                                    AttachClipBoundary(c, added->ObjectHandle,
-                                                       dynamic_cast<Dwg::Insert*>(added));
+                            AddConvertedEntity(TargetSpaceRecordFor(ent), std::move(conv), pending);
                         }
                         m_pendingClips.clear();
                     });
@@ -4864,15 +4888,61 @@ namespace MiniCAD
             }
 
         private:
-            void PatchModelSpace()
+            // 待写回的块裁剪边界（Convert 阶段记下，实体入库拿到句柄后再建对象链）
+            struct PendingClip
+            {
+                std::vector<Dwg::XY> World;        // 边界（世界坐标）
+                Math::Mat4           BlockToWorld; // 插入变换（块坐标 → 世界坐标）
+            };
+
+            // 唯一空间路由：图纸空间实体挂到所属布局的 *Paper_Space* 块记录（找不到时回退模型空间）；
+            // 写出侧按所有者决定组码 67/330，重建与原图保留两条路径共用同一路由。
+            Dwg::BlockRecord* TargetSpaceRecordFor(const Entity& ent)
+            {
+                Dwg::BlockRecord* model = m_db.ModelSpace();
+                if (const EntityAttr& a = ent.GetAttr(); a.InPaperSpace)
+                {
+                    if (Dwg::BlockRecord* paper = PaperSpaceRecordFor(a.LayoutKey))
+                        return paper;
+                }
+                return model;
+            }
+
+            // 公共实体入库：写入数据库并挂接 Convert 期间暂存的 XCLIP 裁剪边界。
+            Dwg::Entity* AddConvertedEntity(Dwg::BlockRecord* owner,
+                                            std::unique_ptr<Dwg::Entity> conv,
+                                            const std::vector<PendingClip>& pendingClips)
+            {
+                if (!conv)
+                    return nullptr;
+                Dwg::Entity* added = m_db.AddEntity(owner, std::move(conv));
+                if (added != nullptr && !pendingClips.empty())
+                {
+                    if (auto* ins = dynamic_cast<Dwg::Insert*>(added))
+                    {
+                        for (const auto& c : pendingClips)
+                            AttachClipBoundary(c, added->ObjectHandle, ins);
+                    }
+                }
+                return added;
+            }
+
+            void PatchDrawingSpaces()
             {
                 Dwg::BlockRecord* model = m_db.ModelSpace();
                 if (model == nullptr)
                     return;
 
+                struct AppendedEntity
+                {
+                    Dwg::BlockRecord*            Owner = nullptr;
+                    std::unique_ptr<Dwg::Entity> Entity;
+                    std::vector<PendingClip>     PendingClips;
+                };
+
                 std::set<Object::ObjectID> alive;
                 std::set<Dwg::Handle> removed;
-                std::vector<std::unique_ptr<Dwg::Entity>> appended;
+                std::vector<AppendedEntity> appended;
                 int kept = 0, keptTch = 0, rewrittenTch = 0;
                 m_scene.ForEachObject([&](const Object& o)
                 {
@@ -4880,37 +4950,49 @@ namespace MiniCAD
                         return;
                     const auto& e = static_cast<const Entity&>(o);
                     alive.insert(e.GetID());
+                    Dwg::BlockRecord* targetOwner = TargetSpaceRecordFor(e);
+                    if (targetOwner == nullptr)
+                        return;
+
                     const auto link = m_source->Links.find(e.GetID());
                     const Dwg::Entity* original = link != m_source->Links.end()
                         ? m_db.FindAs<Dwg::Entity>(link->second.Handle) : nullptr;
-                    if (original != nullptr && !link->second.Signature.empty() && link->second.Signature == EntitySignature(e))
+                    if (original != nullptr
+                        && !link->second.Signature.empty()
+                        && link->second.Signature == EntitySignature(e)
+                        && original->OwnerHandle == targetOwner->ObjectHandle)
                     {
                         ++kept;
                         keptTch += IsTch(*original) ? 1 : 0;
                         return;
                     }
 
+                    m_pendingClips.clear();
                     auto conv = Convert(e);
+                    std::vector<PendingClip> pending = std::move(m_pendingClips);
+                    m_pendingClips.clear();
+
                     if (original == nullptr)
                     {
                         if (conv)
-                            appended.push_back(std::move(conv));
+                            appended.push_back({ targetOwner, std::move(conv), std::move(pending) });
                         return;
                     }
                     const Dwg::Handle h = link->second.Handle;
+                    const bool sameOwner = (original->OwnerHandle == targetOwner->ObjectHandle);
                     rewrittenTch += IsTch(*original) ? 1 : 0;
                     const bool custom = Dwg::RawDataOf(*original) != nullptr;
                     m_db.RemoveObject(h);
-                    if (conv && !custom)
+                    if (conv && !custom && sameOwner)
                     {
-                        conv->ObjectHandle = h;     // 位置不变：模型空间的实体列表里仍是这个句柄
-                        if (Dwg::Entity* added = m_db.AddEntity<Dwg::Entity>(nullptr, std::move(conv)))
-                            added->OwnerHandle = model->ObjectHandle;
+                        conv->ObjectHandle = h;     // 位置与空间不变：所属块记录的实体列表里仍是这个句柄
+                        if (Dwg::Entity* added = AddConvertedEntity(nullptr, std::move(conv), pending))
+                            added->OwnerHandle = targetOwner->ObjectHandle;
                         return;
                     }
                     removed.insert(h);
                     if (conv)
-                        appended.push_back(std::move(conv));
+                        appended.push_back({ targetOwner, std::move(conv), std::move(pending) });
                 });
 
                 for (const auto& [id, link] : m_source->Links)
@@ -4921,9 +5003,23 @@ namespace MiniCAD
                         removed.insert(link.Handle);
                     }
                 }
-                std::erase_if(model->Entities, [&](Dwg::Handle h) { return removed.count(h) != 0; });
-                for (auto& e : appended)
-                    m_db.AddEntity(model, std::move(e));
+                if (!removed.empty())
+                {
+                    std::erase_if(model->Entities, [&](Dwg::Handle h) { return removed.count(h) != 0; });
+                    if (const Dwg::CadTable* recs = m_db.BlockRecords())
+                    {
+                        for (Dwg::Handle rh : recs->Entries)
+                        {
+                            if (auto* rec = m_db.FindAs<Dwg::BlockRecord>(rh))
+                            {
+                                if (Lower(rec->Name).rfind("*paper_space", 0) == 0)
+                                    std::erase_if(rec->Entities, [&](Dwg::Handle h) { return removed.count(h) != 0; });
+                            }
+                        }
+                    }
+                }
+                for (auto& item : appended)
+                    AddConvertedEntity(item.Owner, std::move(item.Entity), item.PendingClips);
 
                 LOG_INFO_TR("DWG/DXF 导出：以原图为底，{0} 个未修改的实体原样写回（其中TCH对象 {1} 个）", kept, keptTch);
                 if (rewrittenTch > 0)
@@ -5239,13 +5335,9 @@ namespace MiniCAD
                     m_pendingClips.clear();
                     if (auto conv = Convert(*e))
                     {
-                        Dwg::Insert* ins = dynamic_cast<Dwg::Insert*>(conv.get());
                         const std::vector<PendingClip> pending = std::move(m_pendingClips);
                         m_pendingClips.clear();
-                        Dwg::Entity* added = m_db.AddEntity(rec, std::move(conv));
-                        if (added != nullptr && ins != nullptr)
-                            for (const auto& c : pending)
-                                AttachClipBoundary(c, added->ObjectHandle, static_cast<Dwg::Insert*>(added));
+                        AddConvertedEntity(rec, std::move(conv), pending);
                     }
                     m_pendingClips.clear();
                 }
@@ -5300,18 +5392,6 @@ namespace MiniCAD
                 const Math::Vec3& n = e.GetExtrusion();
                 return { n.x, n.y, n.z };
             }
-
-            // 块裁剪（XCLIP）写回：把待写对象暂存，等实体入库拿到句柄后再挂接。
-            //
-            // 为什么必须延后：SPATIAL_FILTER 的字典链要从**实体自己的句柄**挂起
-            // （d1->OwnerHandle = insertHandle、INSERT 的 XDictionaryHandle = d1），
-            // 而句柄是 m_db.AddEntity / Add 时才分配的，Convert 阶段还没有。
-            // 待写回的块裁剪边界（Convert 阶段记下，实体入库拿到句柄后再建对象链）
-            struct PendingClip
-            {
-                std::vector<Dwg::XY> World;        // 边界（世界坐标）
-                Math::Mat4           BlockToWorld; // 插入变换（块坐标 → 世界坐标）
-            };
 
             // 块裁剪（XCLIP）写回：把待写对象暂存，等实体入库拿到句柄后再挂接。
             //
@@ -6744,7 +6824,12 @@ namespace MiniCAD
         if (semantic) *semantic = CadSemanticSnapshot{};
         Importer importer(*db, scene, src.get(), stage(0.4f, 1.0f), semantic, info.format);
         if (!sourcePath.empty())
-            importer.SetXrefContext(HostXrefContext(sourcePath, {}));
+        {
+            auto xrefCtx = HostXrefContext(sourcePath, {});
+            if (semantic != nullptr)
+                xrefCtx->Records = &semantic->XrefLoads;
+            importer.SetXrefContext(std::move(xrefCtx));
+        }
         importer.Run();
         if (progress) progress(1.0f);
         auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };

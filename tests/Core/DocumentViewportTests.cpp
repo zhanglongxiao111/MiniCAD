@@ -58,6 +58,37 @@ namespace
             const auto it = slots.find(slot);
             return !textured && it != slots.end() && it->second.version == version;
         }
+
+        class LayerTarget final : public IRenderTarget
+        {
+        public:
+            void Create(int w, int h) override { Resize(w, h); }
+            void Resize(int w, int h) override { width = w; height = h; }
+            void Release() override { width = 0; height = 0; }
+            int GetWidth() const override { return width; }
+            int GetHeight() const override { return height; }
+            void* GetNativeHandle() const override { return nullptr; }
+            void* GetNativeShaderResource() const override { return nullptr; }
+            int width = 0, height = 0;
+        };
+
+        std::unique_ptr<IRenderTarget> CreateLayerTarget() override
+        {
+            return createLayers ? std::make_unique<LayerTarget>() : nullptr;
+        }
+        bool CompositeCompareLayers(IRenderTarget&, IRenderTarget&, const CompareCompositeStyle&) override
+        {
+            ++compositeCalls;
+            return true;
+        }
+        void ReleaseCompareResources() override
+        {
+            ++releaseCompareResourcesCalls;
+        }
+
+        bool createLayers = false;
+        int  compositeCalls = 0;
+        int  releaseCompareResourcesCalls = 0;
     };
 
     int g_failures = 0;
@@ -214,6 +245,38 @@ int RunDocumentViewportTests()
           "窗格里的文档都移走后窗格删掉");
     Check(!manager.MoveDocument(&d, pane) && manager.GetNewDocumentPane() == DocumentManager::kMainPane,
           "移进不存在的窗格不做什么；新文档的窗格不存在时放进主窗格");
+
+    // ── CAD-R2-05 / CAD-R2-06：ComputeMainVisibleClip 单一真相与无对比帧成对释放 ──
+    {
+        const auto blendHidden = Viewport::ComputeMainVisibleClip(CompareDisplayMode::Blend, false, false, 0.0f, 400, 800);
+        Check(blendHidden.IsHidden(), "Blend 下 !showMain 且 overlapOpacity=0 主图裁剪应为隐藏");
+        const auto blendTiny = Viewport::ComputeMainVisibleClip(CompareDisplayMode::Blend, false, false, 1e-5f, 400, 800);
+        Check(blendTiny.IsHidden(), "Blend 下 !showMain 且 overlapOpacity<=1e-4f 主图裁剪应为隐藏");
+        const auto blendWithOverlap = Viewport::ComputeMainVisibleClip(CompareDisplayMode::Blend, false, false, 0.25f, 400, 800);
+        Check(!blendWithOverlap.IsHidden() && !blendWithOverlap.Constrained, "Blend 下 !showMain 但 overlapOpacity>0 主图仍可见");
+        const auto blendShowMain = Viewport::ComputeMainVisibleClip(CompareDisplayMode::Blend, false, true, 0.0f, 400, 800);
+        Check(!blendShowMain.IsHidden() && !blendShowMain.Constrained, "Blend 下 showMain=true 即使 overlapOpacity=0 主图仍可见");
+        const auto splitClip = Viewport::ComputeMainVisibleClip(CompareDisplayMode::Split, false, true, 0.4f, 320, 800);
+        Check(splitClip.Constrained && !splitClip.IsHidden() && splitClip.MinX == 0 && splitClip.MaxX == 320,
+              "Split 下主图可见带为 [0, splitX)");
+
+        renderer.createLayers = true;
+        renderer.compositeCalls = 0;
+        renderer.releaseCompareResourcesCalls = 0;
+        ViewState vsMain = frame(e);
+        CompareRenderPass cp{};
+        cp.State          = &vsMain;
+        cp.Mode           = CompareDisplayMode::Blend;
+        cp.ShowMain       = true;
+        cp.ShowCompare    = true;
+        cp.OverlapOpacity = 0.4f;
+        mainVp.Render(renderer, target, vsMain, &cp);
+        Check(mainVp.HasCompareLayers() && renderer.compositeCalls >= 1, "Blend 帧创建双离屏对比底片并执行差异合成");
+        const int relBefore = renderer.releaseCompareResourcesCalls;
+        mainVp.Render(renderer, target, vsMain, nullptr);
+        Check(!mainVp.HasCompareLayers() && renderer.releaseCompareResourcesCalls == relBefore + 1,
+              "切回无对比帧时 Viewport 成对释放对比底片与渲染器对比资源");
+    }
 
     return g_failures;
 }

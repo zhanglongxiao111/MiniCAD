@@ -1099,112 +1099,25 @@ namespace MiniCAD
         HatchGradient           m_gradient;   // 渐变填充（未启用时为空，普通填充）
     };
 
-    namespace Detail
-    {
-        inline bool PointInPolygon2D(double px, double py, const std::vector<Math::Point3>& pts)
-        {
-            bool inside = false;
-            const std::size_t n = pts.size();
-            for (std::size_t i = 0, j = n - 1; i < n; j = i++)
-            {
-                const double xi = pts[i].x, yi = pts[i].y;
-                const double xj = pts[j].x, yj = pts[j].y;
-                if (((yi > py) != (yj > py)) &&
-                    (px < (xj - xi) * (py - yi) / (yj - yi) + xi))
-                {
-                    inside = !inside;
-                }
-            }
-            return inside;
-        }
-
-        // 用水平扫描线为任意简单多边形（含凹多边形）取一个严格内点，
-        // 避免把顶点落到外环边界上时射线法产生边界歧义。
-        inline bool FindPolygonInteriorPoint2D(const std::vector<Math::Point3>& pts, double& outX, double& outY)
-        {
-            const std::size_t n = pts.size();
-            if (n < 3)
-                return false;
-
-            std::vector<double> ys;
-            ys.reserve(n);
-            for (const auto& p : pts)
-                ys.push_back(p.y);
-            std::sort(ys.begin(), ys.end());
-            ys.erase(std::unique(ys.begin(), ys.end(),
-                     [](double a, double b) { return std::abs(a - b) <= 1e-9; }), ys.end());
-
-            if (ys.size() >= 2)
-            {
-                struct Band { double span; double ymid; };
-                std::vector<Band> bands;
-                bands.reserve(ys.size() - 1);
-                for (std::size_t k = 0; k + 1 < ys.size(); ++k)
-                {
-                    const double span = ys[k + 1] - ys[k];
-                    if (span > 1e-12)
-                        bands.push_back({ span, 0.5 * (ys[k] + ys[k + 1]) });
-                }
-                std::sort(bands.begin(), bands.end(),
-                          [](const Band& a, const Band& b) { return a.span > b.span; });
-
-                std::vector<double> xs;
-                for (const Band& band : bands)
-                {
-                    xs.clear();
-                    for (std::size_t i = 0, j = n - 1; i < n; j = i++)
-                    {
-                        const double yi = pts[i].y, yj = pts[j].y;
-                        if ((yi > band.ymid) != (yj > band.ymid))
-                        {
-                            const double t = (band.ymid - yi) / (yj - yi);
-                            xs.push_back(pts[i].x + (pts[j].x - pts[i].x) * t);
-                        }
-                    }
-                    std::sort(xs.begin(), xs.end());
-                    double bestWidth = 0.0;
-                    double bestX = 0.0;
-                    for (std::size_t k = 0; k + 1 < xs.size(); k += 2)
-                    {
-                        const double w = xs[k + 1] - xs[k];
-                        if (w > bestWidth)
-                        {
-                            bestWidth = w;
-                            bestX = 0.5 * (xs[k] + xs[k + 1]);
-                        }
-                    }
-                    if (bestWidth > 1e-12)
-                    {
-                        outX = bestX;
-                        outY = band.ymid;
-                        return true;
-                    }
-                }
-            }
-
-            double sx = 0.0, sy = 0.0;
-            for (const auto& p : pts) { sx += p.x; sy += p.y; }
-            outX = sx / static_cast<double>(n);
-            outY = sy / static_cast<double>(n);
-            return std::isfinite(outX) && std::isfinite(outY);
-        }
-    }
-
-    // 按边界环包含关系（奇偶规则：外环加、孔洞减、洞内岛加回）计算 HatchEntity 净面积。
-    // maxPoints > 0 时，若离散总顶点数超限返回 std::nullopt；无效或净面积 <= 0 返回 std::nullopt。
+    // 按「局部原点平移 + 奇偶水平条带积分」（与 HatchEntity::FillSolid 语义一致）计算 HatchEntity 净面积。
+    // 先将全部有效顶点平移至首个有效顶点局部坐标，消除大测绘坐标（10^8~10^9）有效位抵消；
+    // 边数 <= 2048 时将严格边-边交点 y 并入水平条带切分以精确计算相交环奇偶净面积；
+    // 顶点超限、交点超预算、超大边集条带内边序倒置或净面积 <= 0 时诚实返回 std::nullopt。
     inline std::optional<double> ComputeHatchNetArea(const HatchEntity& hatch, std::size_t maxPoints = 200000)
     {
-        struct LoopInfo
+        struct LocalEdge
         {
-            std::vector<Math::Point3> pts;
-            double area  = 0.0;
-            double minX  = 0.0, minY = 0.0, maxX = 0.0, maxY = 0.0;
-            double testX = 0.0, testY = 0.0;
+            double xLo = 0.0, yLo = 0.0;
+            double xHi = 0.0, yHi = 0.0;
+            double minX = 0.0, maxX = 0.0;
         };
 
-        std::vector<LoopInfo> loops;
+        std::vector<std::vector<std::pair<double, double>>> loops;
         loops.reserve(hatch.GetLoops().size());
         std::size_t totalPts = 0;
+        bool hasOrigin = false;
+        double originX = 0.0, originY = 0.0;
+        double minX = 0.0, maxX = 0.0, minY = 0.0, maxY = 0.0;
 
         for (const auto& loop : hatch.GetLoops())
         {
@@ -1215,75 +1128,199 @@ namespace MiniCAD
             if (raw.size() < 3)
                 continue;
 
-            std::vector<Math::Point3> pts;
+            std::vector<std::pair<double, double>> pts;
             pts.reserve(raw.size());
             for (const auto& p : raw)
             {
                 if (!std::isfinite(p.x) || !std::isfinite(p.y))
                     continue;
-                if (!pts.empty() && std::abs(p.x - pts.back().x) <= 1e-12 && std::abs(p.y - pts.back().y) <= 1e-12)
+                if (!hasOrigin)
+                {
+                    hasOrigin = true;
+                    originX = p.x;
+                    originY = p.y;
+                }
+                const double lx = p.x - originX;
+                const double ly = p.y - originY;
+                if (!std::isfinite(lx) || !std::isfinite(ly))
                     continue;
-                pts.push_back(p);
+                if (!pts.empty() && std::abs(lx - pts.back().first) <= 1e-12 && std::abs(ly - pts.back().second) <= 1e-12)
+                    continue;
+                pts.emplace_back(lx, ly);
             }
             while (pts.size() >= 2
-                   && std::abs(pts.back().x - pts.front().x) <= 1e-12
-                   && std::abs(pts.back().y - pts.front().y) <= 1e-12)
+                   && std::abs(pts.back().first - pts.front().first) <= 1e-12
+                   && std::abs(pts.back().second - pts.front().second) <= 1e-12)
             {
                 pts.pop_back();
             }
             if (pts.size() < 3)
                 continue;
 
-            double a2 = 0.0;
-            double minX = pts[0].x, maxX = pts[0].x;
-            double minY = pts[0].y, maxY = pts[0].y;
-            for (std::size_t i = 0; i < pts.size(); ++i)
+            for (const auto& [lx, ly] : pts)
             {
-                const auto& p = pts[i];
-                const auto& q = pts[(i + 1) % pts.size()];
-                a2 += p.x * q.y - q.x * p.y;
-                minX = std::min(minX, p.x); maxX = std::max(maxX, p.x);
-                minY = std::min(minY, p.y); maxY = std::max(maxY, p.y);
+                minX = std::min(minX, lx);
+                maxX = std::max(maxX, lx);
+                minY = std::min(minY, ly);
+                maxY = std::max(maxY, ly);
             }
-            const double area = std::abs(a2) * 0.5;
-            if (!std::isfinite(area) || area <= 1e-12)
-                continue;
-
-            LoopInfo info;
-            info.area = area;
-            info.minX = minX; info.minY = minY;
-            info.maxX = maxX; info.maxY = maxY;
-            if (!Detail::FindPolygonInteriorPoint2D(pts, info.testX, info.testY))
-                continue;
-            info.pts = std::move(pts);
-            loops.push_back(std::move(info));
+            loops.push_back(std::move(pts));
         }
 
         if (loops.empty())
             return std::nullopt;
 
-        double netArea = 0.0;
-        for (std::size_t i = 0; i < loops.size(); ++i)
+        const double spanX = maxX - minX;
+        const double spanY = maxY - minY;
+        if (!std::isfinite(spanX) || !std::isfinite(spanY) || spanX <= 1e-12 || spanY <= 1e-12)
+            return std::nullopt;
+
+        std::vector<LocalEdge> edges;
+        std::vector<double> ys;
+        for (const auto& pts : loops)
         {
-            const LoopInfo& cur = loops[i];
-            std::size_t depth = 0;
-            for (std::size_t j = 0; j < loops.size(); ++j)
+            const std::size_t n = pts.size();
+            for (std::size_t i = 0; i < n; ++i)
             {
-                if (i == j)
+                const auto& a = pts[i];
+                const auto& b = pts[(i + 1) % n];
+                ys.push_back(a.second);
+                if (a.second == b.second)
                     continue;
-                const LoopInfo& other = loops[j];
-                const double tol = 1e-9 * std::max({ 1.0, cur.area, other.area });
-                const bool canContain = (other.area > cur.area + tol)
-                                     || (std::abs(other.area - cur.area) <= tol && j < i);
-                if (!canContain)
-                    continue;
-                if (cur.testX < other.minX || cur.testX > other.maxX
-                    || cur.testY < other.minY || cur.testY > other.maxY)
-                    continue;
-                if (Detail::PointInPolygon2D(cur.testX, cur.testY, other.pts))
-                    ++depth;
+                LocalEdge e;
+                if (a.second < b.second)
+                {
+                    e.xLo = a.first; e.yLo = a.second;
+                    e.xHi = b.first; e.yHi = b.second;
+                }
+                else
+                {
+                    e.xLo = b.first; e.yLo = b.second;
+                    e.xHi = a.first; e.yHi = a.second;
+                }
+                e.minX = std::min(e.xLo, e.xHi);
+                e.maxX = std::max(e.xLo, e.xHi);
+                edges.push_back(e);
             }
-            netArea += (depth % 2 == 0) ? cur.area : -cur.area;
+        }
+        if (edges.size() < 2 || ys.size() < 2)
+            return std::nullopt;
+
+        constexpr std::size_t kMaxIntersectEdges = 2048;
+        constexpr std::size_t kMaxIntersections  = 65536;
+        const bool splitIntersections = (edges.size() <= kMaxIntersectEdges);
+        if (splitIntersections)
+        {
+            std::size_t intersections = 0;
+            constexpr double kParamEps = 1e-12;
+            for (std::size_t i = 0; i < edges.size(); ++i)
+            {
+                const LocalEdge& a = edges[i];
+                const double adx = a.xHi - a.xLo;
+                const double ady = a.yHi - a.yLo;
+                const double aLen = std::hypot(adx, ady);
+                for (std::size_t j = i + 1; j < edges.size(); ++j)
+                {
+                    const LocalEdge& b = edges[j];
+                    if (a.yHi <= b.yLo || b.yHi <= a.yLo)
+                        continue;
+                    if (a.maxX < b.minX || b.maxX < a.minX)
+                        continue;
+                    const double bdx = b.xHi - b.xLo;
+                    const double bdy = b.yHi - b.yLo;
+                    const double denom = adx * bdy - ady * bdx;
+                    const double detScale = aLen * std::hypot(bdx, bdy);
+                    if (std::abs(denom) <= 1e-12 * std::max(1.0, detScale))
+                        continue;
+                    const double rx = b.xLo - a.xLo;
+                    const double ry = b.yLo - a.yLo;
+                    const double t  = (rx * bdy - ry * bdx) / denom;
+                    const double u  = (rx * ady - ry * adx) / denom;
+                    if (t > kParamEps && t < 1.0 - kParamEps && u > kParamEps && u < 1.0 - kParamEps)
+                    {
+                        const double yi = a.yLo + t * ady;
+                        if (std::isfinite(yi))
+                        {
+                            if (++intersections > kMaxIntersections)
+                                return std::nullopt;
+                            ys.push_back(yi);
+                        }
+                    }
+                }
+            }
+        }
+
+        std::sort(ys.begin(), ys.end());
+        ys.erase(std::unique(ys.begin(), ys.end()), ys.end());
+        if (ys.size() < 2)
+            return std::nullopt;
+
+        std::vector<std::size_t> byLow(edges.size());
+        for (std::size_t i = 0; i < edges.size(); ++i)
+            byLow[i] = i;
+        std::sort(byLow.begin(), byLow.end(), [&](std::size_t a, std::size_t b) {
+            return edges[a].yLo < edges[b].yLo;
+        });
+
+        auto xAt = [](const LocalEdge& g, double y) -> double {
+            return g.xLo + (g.xHi - g.xLo) * ((y - g.yLo) / (g.yHi - g.yLo));
+        };
+
+        const double orderTol = 1e-7 * std::max(1.0, spanX);
+        std::vector<std::size_t> active;
+        std::size_t nextEdge = 0;
+        std::vector<std::pair<double, std::size_t>> crossings;
+        double netArea = 0.0;
+
+        for (std::size_t b = 0; b + 1 < ys.size(); ++b)
+        {
+            const double y0 = ys[b];
+            const double y1 = ys[b + 1];
+            const double dy = y1 - y0;
+            const double ymid = 0.5 * (y0 + y1);
+            if (!(ymid > y0 && ymid < y1))
+                continue;
+
+            while (nextEdge < byLow.size() && edges[byLow[nextEdge]].yLo < ymid)
+                active.push_back(byLow[nextEdge++]);
+
+            crossings.clear();
+            std::size_t w = 0;
+            for (const std::size_t ei : active)
+            {
+                const LocalEdge& g = edges[ei];
+                if (ymid >= g.yHi)
+                    continue;
+                active[w++] = ei;
+                crossings.emplace_back(xAt(g, ymid), ei);
+            }
+            active.resize(w);
+
+            if (crossings.size() < 2)
+                continue;
+            if ((crossings.size() & 1u) != 0u)
+                return std::nullopt;
+
+            std::sort(crossings.begin(), crossings.end());
+
+            // 超大边集未做 O(E^2) 求交，检验相邻活动边在条带上下端顺序；发现交叉倒置即诚实返回不可用
+            if (!splitIntersections)
+            {
+                for (std::size_t k = 0; k + 1 < crossings.size(); ++k)
+                {
+                    const LocalEdge& eL = edges[crossings[k].second];
+                    const LocalEdge& eR = edges[crossings[k + 1].second];
+                    if (xAt(eL, y0) > xAt(eR, y0) + orderTol || xAt(eL, y1) > xAt(eR, y1) + orderTol)
+                        return std::nullopt;
+                }
+            }
+
+            for (std::size_t k = 0; k + 1 < crossings.size(); k += 2)
+            {
+                const double width = crossings[k + 1].first - crossings[k].first;
+                if (width > 0.0)
+                    netArea += width * dy;
+            }
         }
 
         if (std::isfinite(netArea) && netArea > 1e-12)

@@ -113,6 +113,16 @@ namespace MiniCAD
 
         void EmitTransformedPrimitive(const Entity& src, const Math::Mat4& m, std::vector<std::unique_ptr<Entity>>& out)
         {
+            if (out.size() >= kMaxBlockLeaves)
+                return;
+            auto pushLeaf = [&](std::unique_ptr<Entity> leaf) -> bool
+            {
+                if (!leaf || out.size() >= kMaxBlockLeaves)
+                    return false;
+                out.push_back(std::move(leaf));
+                return true;
+            };
+
             const Math::Vec3 ux = m.TransformVector({ 1.0, 0.0, 0.0 });
             const Math::Vec3 uy = m.TransformVector({ 0.0, 1.0, 0.0 });
             const double lx = std::hypot(ux.x, ux.y);
@@ -124,19 +134,19 @@ namespace MiniCAD
 
             if (src.IsKindOf<PointEntity>())
             {
-                out.push_back(std::make_unique<PointEntity>(Object::InvalidID, m * static_cast<const PointEntity&>(src).GetPoint().Position));
+                pushLeaf(std::make_unique<PointEntity>(Object::InvalidID, m * static_cast<const PointEntity&>(src).GetPoint().Position));
                 return;
             }
             if (src.IsKindOf<LineEntity>())
             {
                 const auto& l = static_cast<const LineEntity&>(src).GetLine();
-                out.push_back(std::make_unique<LineEntity>(Object::InvalidID, m * l.Start, m * l.End));
+                pushLeaf(std::make_unique<LineEntity>(Object::InvalidID, m * l.Start, m * l.End));
                 return;
             }
             if (src.IsKindOf<RectangleEntity>())
             {
                 const auto& r = static_cast<const RectangleEntity&>(src).GetRectangle();
-                out.push_back(std::make_unique<PolylineEntity>(Object::InvalidID,
+                pushLeaf(std::make_unique<PolylineEntity>(Object::InvalidID,
                     std::vector<Math::Point3>{ m * r.P1, m * r.P2, m * r.P3, m * r.P4, m * r.P1 }));
                 return;
             }
@@ -155,14 +165,14 @@ namespace MiniCAD
                     std::vector<double> bulges = pl.Bulges;
                     if (hasArc && crossZ < 0.0)
                         for (double& b : bulges) b = -b;
-                    out.push_back(std::make_unique<PolylineEntity>(Object::InvalidID, std::move(pts), std::move(bulges)));
+                    pushLeaf(std::make_unique<PolylineEntity>(Object::InvalidID, std::move(pts), std::move(bulges)));
                 }
                 else
                 {
                     auto tess = pl.Tessellate();
                     for (auto& p : tess) p = m * p;
                     if (tess.size() >= 2)
-                        out.push_back(std::make_unique<PolylineEntity>(Object::InvalidID, std::move(tess)));
+                        pushLeaf(std::make_unique<PolylineEntity>(Object::InvalidID, std::move(tess)));
                 }
                 return;
             }
@@ -171,11 +181,14 @@ namespace MiniCAD
                 const auto& c = static_cast<const CircleEntity&>(src).GetCircle();
                 if (uniformXY)
                 {
-                    out.push_back(std::make_unique<CircleEntity>(Object::InvalidID, m * c.Center, c.Radius * lx));
+                    pushLeaf(std::make_unique<CircleEntity>(Object::InvalidID, m * c.Center, c.Radius * lx));
                 }
                 else if (lx > 1e-12 && ly > 1e-12)
                 {
-                    out.push_back(std::make_unique<PointEntity>(Object::InvalidID, m * c.Center));
+                    if (!pushLeaf(std::make_unique<PointEntity>(Object::InvalidID, m * c.Center)))
+                        return;
+                    if (out.size() >= kMaxBlockLeaves)
+                        return;
                     std::vector<Math::Point3> pts;
                     pts.reserve(65);
                     for (int k = 0; k <= 64; ++k)
@@ -183,7 +196,7 @@ namespace MiniCAD
                         const double a = Math::TwoPI * k / 64.0;
                         pts.push_back(m * Math::Point3{ c.Center.x + c.Radius * std::cos(a), c.Center.y + c.Radius * std::sin(a), c.Center.z });
                     }
-                    out.push_back(std::make_unique<PolylineEntity>(Object::InvalidID, std::move(pts)));
+                    pushLeaf(std::make_unique<PolylineEntity>(Object::InvalidID, std::move(pts)));
                 }
                 return;
             }
@@ -194,29 +207,35 @@ namespace MiniCAD
                 {
                     if (auto wa = Arc::FromThreePoints(m * arc.StartPoint(), m * arc.MidPoint(), m * arc.EndPoint()))
                     {
-                        out.push_back(std::make_unique<ArcEntity>(Object::InvalidID, wa->Center, wa->Radius, wa->StartAngle, wa->EndAngle));
+                        pushLeaf(std::make_unique<ArcEntity>(Object::InvalidID, wa->Center, wa->Radius, wa->StartAngle, wa->EndAngle));
                         return;
                     }
                 }
-                out.push_back(std::make_unique<PointEntity>(Object::InvalidID, m * arc.Center));
+                if (!pushLeaf(std::make_unique<PointEntity>(Object::InvalidID, m * arc.Center)))
+                    return;
+                if (out.size() >= kMaxBlockLeaves)
+                    return;
                 const double sweep = arc.SweepAngle();
                 const int segs = std::max(8, static_cast<int>(std::ceil(std::abs(sweep) / (Math::TwoPI / 64.0))));
                 std::vector<Math::Point3> pts;
                 pts.reserve(static_cast<size_t>(segs) + 1);
                 for (int k = 0; k <= segs; ++k)
                     pts.push_back(m * arc.PointAt(arc.StartAngle + sweep * k / segs));
-                out.push_back(std::make_unique<PolylineEntity>(Object::InvalidID, std::move(pts)));
+                pushLeaf(std::make_unique<PolylineEntity>(Object::InvalidID, std::move(pts)));
                 return;
             }
             if (src.IsKindOf<MLineEntity>())
             {
                 for (const auto& el : static_cast<const MLineEntity&>(src).ComputeGeometry().Elements)
                 {
+                    if (out.size() >= kMaxBlockLeaves)
+                        return;
                     if (el.size() < 2) continue;
                     std::vector<Math::Point3> pts;
                     pts.reserve(el.size());
                     for (const auto& p : el) pts.push_back(m * p);
-                    out.push_back(std::make_unique<PolylineEntity>(Object::InvalidID, std::move(pts)));
+                    if (!pushLeaf(std::make_unique<PolylineEntity>(Object::InvalidID, std::move(pts))))
+                        return;
                 }
                 return;
             }
@@ -225,7 +244,7 @@ namespace MiniCAD
                 const auto& xl = static_cast<const XLineEntity&>(src).GetXLine();
                 const Math::Vec3 d = m.TransformVector(xl.Direction);
                 if (d.LengthSq() > 1e-24)
-                    out.push_back(std::make_unique<XLineEntity>(Object::InvalidID, m * xl.Origin, d.Normalized()));
+                    pushLeaf(std::make_unique<XLineEntity>(Object::InvalidID, m * xl.Origin, d.Normalized()));
                 return;
             }
             if (src.IsKindOf<RayEntity>())
@@ -233,7 +252,7 @@ namespace MiniCAD
                 const auto& r = static_cast<const RayEntity&>(src).GetRay();
                 const Math::Vec3 d = m.TransformVector(r.Direction);
                 if (d.LengthSq() > 1e-24)
-                    out.push_back(std::make_unique<RayEntity>(Object::InvalidID, m * r.Origin, d.Normalized()));
+                    pushLeaf(std::make_unique<RayEntity>(Object::InvalidID, m * r.Origin, d.Normalized()));
                 return;
             }
         }

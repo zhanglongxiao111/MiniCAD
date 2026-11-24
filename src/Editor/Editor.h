@@ -53,6 +53,7 @@ namespace MiniCAD
     {
     public:
         Editor();
+        ~Editor();
 
         // ── 绑定 / 解绑文档与视口 ────────────────────────────
         // 每个文档有自己的 Editor（DocumentManager 按文档持有），显示数据、选择集、工具状态都随文档保留，
@@ -505,6 +506,9 @@ namespace MiniCAD
         ConstraintEngine m_constraintEngine;
         InputResolver    m_resolver;        // 输入解析器
         CommandLine      m_commandLine;     // 命令行提示与回显缓冲
+
+        // 存活哨兵（供工具取消回调重入销毁 Editor 时即时感知，避免 UAF）
+        std::shared_ptr<bool>  m_alive = std::make_shared<bool>(true);
 
         // 工具
         std::unique_ptr<ITool> m_tool;

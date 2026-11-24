@@ -72,7 +72,9 @@ namespace MiniCAD
             int  MaxX        = 0;
             bool IsHidden() const { return Constrained && MinX >= MaxX; }
         };
-        static MainVisibleClip ComputeMainVisibleClip(CompareDisplayMode mode, bool soloCompare, int splitX, int pixelWidth);
+        static MainVisibleClip ComputeMainVisibleClip(CompareDisplayMode mode, bool soloCompare,
+                                                      bool showMain, float overlapOpacity,
+                                                      int splitX, int pixelWidth);
         static MainVisibleClip ComputeMainVisibleClip(const CompareRenderPass* compare, int pixelWidth);
 
         // 显式释放双离屏三态对比底片渲染目标（关闭对比会话时立即回收显存）
