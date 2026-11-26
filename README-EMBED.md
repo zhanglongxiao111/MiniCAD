@@ -55,6 +55,7 @@
    - **三项硬预算与退出码契约**：默认单次导出施加三项硬预算——最多展开 `250,000` 个阵列单元（`MaxArrayCells`）、最多输出 `100,000` 行文字（`MaxRows`）、最多输出 `16 MiB` 字节（`MaxBytes`）。因采用流式写 `stdout`，当触发任一硬预算（退出码 `3`）、读图失败或写 `stdout` 失败（退出码 `1`，参数错误退出码 `2`）时，`stdout` 可能已包含已刷出的部分 TSV；调用方**必须校验进程退出码为 `0`** 后再消费完整 TSV 输出（错误原因见 `stderr`）。
 5. **通用修复**
    - 修复 `SnapEngine` 节点捕捉 `y1 = x1` 笔误、块交点捕捉叶节点与最近曲线预算上限（64 条）以及斜切仿射正交性校验。
+   - 修复网页嵌入版 `WebInput` 在跨源 iframe 拖出丢 `mouseup`、窗口失焦、页面隐藏或 `pointercancel` 时鼠标拖拽粘连的问题：补齐指针捕获、`mousemove` 按 W3C `e.buttons` 实时核对补发抬起、侧键过滤、`PointerCancel` 与 `Module.MiniGUIWebInput.cancelPointer()` 清理链路。
 
 ## 编译构建
 

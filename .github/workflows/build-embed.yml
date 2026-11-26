@@ -42,6 +42,7 @@ jobs:
           node tests/Web/FilePickerTests.cjs
           node tests/Web/FolderPickerTests.cjs
           node tests/Web/RemoteOpenTests.cjs
+          node tests/Web/WebInputTests.cjs
 
       - name: Configure
         run: emcmake cmake -S . -B out/web -G Ninja -DCMAKE_BUILD_TYPE=Release

@@ -12,7 +12,7 @@ namespace MiniGUI
         WebInput* g_input = nullptr;
 
         // 鼠标事件类型（与下面的 JavaScript 一致）
-        enum MouseType { MouseMove = 0, MouseDown = 1, MouseUp = 2, MouseLeave = 3 };
+        enum MouseType { MouseMove = 0, MouseDown = 1, MouseUp = 2, MouseLeave = 3, MouseCancel = 4 };
         // 输入法事件类型
         enum CompositionType { CompStart = 0, CompUpdate = 1, CompEnd = 2 };
 
@@ -90,13 +90,55 @@ namespace MiniGUI
         const mods = (e) => (e.shiftKey ? 1 : 0) | ((e.ctrlKey || e.metaKey) ? 2 : 0) | (e.altKey ? 4 : 0);
         const local = (e) => { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
         const withString = (s, fn) => { const p = stringToNewUTF8(s); fn(p); _free(p); };
+        const isTrackedButton = (b) => b === 0 || b === 1 || b === 2;
+        // W3C MouseEvent.buttons 位掩码：左=1，右=2，中=4（中/右顺序与 MouseEvent.button 相反）
+        const domMaskForButton = (b) => (b === 0 ? 1 : (b === 1 ? 4 : (b === 2 ? 2 : 0)));
         let buttons = 0;
+        let capturedPointerId = null;
 
-        const state = { canvas: canvas, ta: ta, listeners: [] };
+        const releaseCapture = () => {
+            if (capturedPointerId === null) return;
+            try {
+                if (canvas.hasPointerCapture && canvas.hasPointerCapture(capturedPointerId))
+                    canvas.releasePointerCapture(capturedPointerId);
+            } catch (_) {}
+            capturedPointerId = null;
+        };
+        const cancelPointer = (m, ts) => {
+            const hadButtons = buttons !== 0;
+            buttons = 0;
+            releaseCapture();
+            if (hadButtons) _MiniGUIWeb_OnMouse(4, 0, 0, -1, m || 0, ts || 0);
+        };
+        const reconcileButtons = (e, x, y) => {
+            if (buttons === 0 || typeof e.buttons !== "number") return;
+            for (let b = 0; b <= 2; ++b) {
+                if ((buttons & (1 << b)) !== 0 && (e.buttons & domMaskForButton(b)) === 0) {
+                    buttons &= ~(1 << b);
+                    _MiniGUIWeb_OnMouse(2, x, y, b, mods(e), e.timeStamp);
+                }
+            }
+            if (buttons === 0) releaseCapture();
+        };
+
+        const state = {
+            canvas: canvas,
+            ta: ta,
+            listeners: [],
+            cancelPointer: () => { buttons = 0; releaseCapture(); _MiniGUIWeb_OnMouse(4, 0, 0, -1, 0, 0); }
+        };
         const on = (target, type, fn, opts) => { target.addEventListener(type, fn, opts); state.listeners.push([target, type, fn, opts]); };
 
         // ── 鼠标 ───────────────────────────────────────────
+        on(canvas, "pointerdown", (e) => {
+            if (e.pointerType === "touch" || !isTrackedButton(e.button)) return;
+            if (typeof e.pointerId === "number" && canvas.setPointerCapture) {
+                try { canvas.setPointerCapture(e.pointerId); capturedPointerId = e.pointerId; } catch (_) {}
+            }
+        });
+        on(window, "pointercancel", (e) => { cancelPointer(mods(e), e.timeStamp); });
         on(canvas, "mousedown", (e) => {
+            if (!isTrackedButton(e.button)) return;
             buttons |= (1 << e.button);
             const [x, y] = local(e);
             _MiniGUIWeb_OnMouse(1, x, y, e.button, mods(e), e.timeStamp);
@@ -104,13 +146,15 @@ namespace MiniGUI
         });
         on(window, "mousemove", (e) => {
             const [x, y] = local(e);
+            reconcileButtons(e, x, y);
             const r = canvas.getBoundingClientRect();
             if (buttons === 0 && (x < 0 || y < 0 || x >= r.width || y >= r.height)) return;
             _MiniGUIWeb_OnMouse(0, x, y, -1, mods(e), e.timeStamp);
         });
         on(window, "mouseup", (e) => {
-            if (!(buttons & (1 << e.button))) return;
+            if (!isTrackedButton(e.button) || !(buttons & (1 << e.button))) return;
             buttons &= ~(1 << e.button);
+            if (buttons === 0) releaseCapture();
             const [x, y] = local(e);
             _MiniGUIWeb_OnMouse(2, x, y, e.button, mods(e), e.timeStamp);
         });
@@ -166,8 +210,9 @@ namespace MiniGUI
             ta.value = "";
         });
 
-        // ── 失去焦点 ───────────────────────────────────────
-        on(window, "blur", () => { buttons = 0; _MiniGUIWeb_OnFocusLost(); });
+        // ── 失去焦点 / 页面隐藏 ────────────────────────────
+        on(window, "blur", () => { buttons = 0; releaseCapture(); _MiniGUIWeb_OnFocusLost(); });
+        on(document, "visibilitychange", () => { if (document.hidden) { buttons = 0; releaseCapture(); _MiniGUIWeb_OnFocusLost(); } });
 
         Module["MiniGUIWebInput"] = state;
     });
@@ -319,11 +364,12 @@ namespace MiniGUI
         bool handled = false;
         switch (type)
         {
-        case MouseMove:  handled = m_context->PointerMove(pos, mods); break;
-        case MouseDown:  handled = m_context->PointerDown(pos, ToButton(button), mods, static_cast<uint32_t>(timeMs)); break;
-        case MouseUp:    handled = m_context->PointerUp(pos, ToButton(button), mods); break;
-        case MouseLeave: m_context->PointerLeave(); break;
-        default:         break;
+        case MouseMove:   handled = m_context->PointerMove(pos, mods); break;
+        case MouseDown:   handled = m_context->PointerDown(pos, ToButton(button), mods, static_cast<uint32_t>(timeMs)); break;
+        case MouseUp:     handled = m_context->PointerUp(pos, ToButton(button), mods); break;
+        case MouseLeave:  m_context->PointerLeave(); break;
+        case MouseCancel: m_context->PointerCancel(); break;
+        default:          break;
         }
         ApplyCursor();
         return handled;
@@ -388,7 +434,9 @@ namespace MiniGUI
 
     void WebInput::OnFocusLost()
     {
+        m_context->PointerCancel();
         m_context->KeyboardFocusLost();
+        ApplyCursor();
     }
 
     void WebInput::Sync()
